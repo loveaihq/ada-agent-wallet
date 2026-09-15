@@ -73,6 +73,7 @@ npm run roundtrip deny      # GET /premium  6 tADA, over perTxMax -> denied, not
 npm run balance             # BUYER_ADDRESS / SELLER_ADDRESS balances, to see the faucet land
 npm run concurrency         # regression check for the spend-cap race (spends nothing)
 npm run walletctl -- preflight   # deployment checks; see "Before mainnet"
+npm run verify:vendor            # sha256 of vendor/; runs automatically before npm test
 ```
 
 `npm run concurrency` starts a throwaway signerd with a cap that fits one payment, fires several
@@ -144,9 +145,13 @@ Naming these is the point; none is fixed by more policy code.
   no hardware-wallet or KMS path here. Run it as its own user, on an encrypted disk, and keep the
   balance to what you would accept losing outright — the daily cap bounds an agent, not an attacker
   who can read the file.
-- **`vendor/` is a self-built `@x402/cardano`**, not a published package. For mainnet, rebuild it
-  from a pinned upstream commit and record the checksum, or wait for npm. Unreviewed vendored code
-  signing real transactions is a supply-chain decision, not a convenience.
+- **`vendor/` is unreviewed code, now at least a known quantity.** Both tarballs are pinned by
+  sha256 (`npm test` checks them) and traced to upstream `fdeda56`, verified by recovering their
+  TypeScript from the shipped source maps and diffing it against that commit — see
+  [vendor/PROVENANCE.md](vendor/PROVENANCE.md). Note what the version number is not: upstream's
+  released `2.25.0` contains no Cardano package at all, and the vendored `@x402/core` differs from
+  the published `@x402/core@2.25.0` in 25 files. Pinning is not review; this is unpublished code
+  signing real transactions, so someone should still read it or wait for a real release.
 - **Nothing is monitored.** `denied`, `policy_error`, `nonce_collision`, `approval_timeout` and
   `overBudget` are the audit signals worth alerting on; nothing here emits them anywhere.
 - **Rotating `audit.jsonl` can raise the cap.** The ledger is a replay of it, windowed to 24h, so

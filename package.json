@@ -14,7 +14,9 @@
     "dev:resource": "tsx dev/resource.ts",
     "roundtrip": "tsx dev/roundtrip.ts",
     "balance": "tsx dev/balance.ts",
-    "concurrency": "tsx dev/concurrency.ts"
+    "concurrency": "tsx dev/concurrency.ts",
+    "verify:vendor": "node scripts/verify-vendor.mjs",
+    "pretest": "node scripts/verify-vendor.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
