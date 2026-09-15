@@ -718,12 +718,26 @@ function preflight() {
     const anyPayee = ap.allowedPayees.includes("*");
     add(anyPayee ? "warn" : "ok", `${where}: payee allowlist`,
       anyPayee ? '["*"] accepts any payee' : `${ap.allowedPayees.length} payee(s)`);
-    add(ap.allowedResources ? "ok" : "warn", `${where}: resource allowlist`,
-      ap.allowedResources ? `${ap.allowedResources.length} pattern(s)` : "absent; this agent may buy from any URL it is pointed at");
-    add(ap.approvalAbove ? "ok" : "warn", `${where}: human approval`,
-      ap.approvalAbove
-        ? Object.entries(ap.approvalAbove).map(([a, v]) => `${a} > ${v}`).join(", ")
-        : "no threshold; nothing this agent does ever reaches a human");
+    // `["*"]` is exactly as permissive as leaving it out, so reporting it as a configured
+    // allowlist tells the operator they are covered when they are not.
+    const anyResource = !ap.allowedResources || ap.allowedResources.includes("*");
+    add(anyResource ? "warn" : "ok", `${where}: resource allowlist`,
+      !ap.allowedResources
+        ? "absent; this agent may buy from any URL it is pointed at"
+        : ap.allowedResources.includes("*")
+          ? '["*"] accepts any URL, which is the same as having no list'
+          : `${ap.allowedResources.length} pattern(s)`);
+
+    // An empty object is truthy and would have passed. So would a threshold covering one asset out
+    // of several, silently leaving the rest with no gate at all.
+    const thresholds = Object.entries(ap.approvalAbove ?? {});
+    const ungated = Object.keys(ap.perTxMax).filter(a => !(a in (ap.approvalAbove ?? {})));
+    add(thresholds.length === 0 ? "warn" : ungated.length ? "warn" : "ok", `${where}: human approval`,
+      thresholds.length === 0
+        ? "no threshold; nothing this agent does ever reaches a human"
+        : ungated.length
+          ? `${thresholds.map(([a, v]) => `${a} > ${v}`).join(", ")}; no threshold for ${ungated.join(", ")}`
+          : thresholds.map(([a, v]) => `${a} > ${v}`).join(", "));
     const methods = ap.allowedAssetTransferMethods ?? ["default"];
     add(methods.includes("masumi") ? "warn" : "ok", `${where}: asset transfer methods`,
       methods.includes("masumi")

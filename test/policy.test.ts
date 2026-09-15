@@ -160,3 +160,8 @@ test("parsePolicy rejects a cap for an asset that is never allowed", () => {
   );
   assert.doesNotThrow(() => parsePolicy({ agents: { a: { ...base, dailyMax: { lovelace: "9" } } } }));
 });
+test("a zero amount is denied", () => {
+  // signerd's wire validation allows "0" through, so this is the rule that stops it.
+  assert.equal(decide(policy, [], req({ amount: 0n })).rule, "amount");
+  assert.equal(decide(policy, [], req({ amount: -1n })).rule, "amount");
+});

@@ -13,6 +13,7 @@
 import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
+import { toClientCardanoSigner } from "@x402/cardano";
 import { encryptMnemonic, decryptMnemonic, assertKeystore } from "../src/keystore.js";
 
 const argv = process.argv.slice(2);
@@ -27,6 +28,26 @@ const die = (msg: string): never => {
   process.exit(1);
 };
 
+const NETWORK = process.env.CARDANO_NETWORK ?? "cardano:preprod";
+
+/**
+ * Derives the wallet address, offline, which is also the only real check that a mnemonic is the
+ * right one: 24 words with a typo is still 24 words, and the SDK rejects a bad BIP-39 checksum.
+ * Without this the tool would happily encrypt a mistyped mnemonic, tell you to delete the
+ * plaintext, and hand you a keystore for a wallet that has never held anything.
+ */
+function addressOf(mnemonic: string): string {
+  try {
+    return toClientCardanoSigner({
+      mnemonic,
+      network: NETWORK,
+      provider: { koios: { baseUrl: NETWORK.endsWith("mainnet") ? "https://api.koios.rest/api/v1" : "https://preprod.koios.rest/api/v1" } },
+    }).getAddress();
+  } catch (e) {
+    die(`that is not a usable mnemonic: ${e instanceof Error ? e.message : e}`);
+  }
+}
+
 switch (command) {
   case "create": {
     const out = flag("out") ?? die("create needs --out <path>");
@@ -39,6 +60,7 @@ switch (command) {
     const mnemonic = (mnemonicFile ? readFileSync(mnemonicFile, "utf8") : readFileSync(0, "utf8")).trim();
     const words = mnemonic.split(/\s+/).filter(Boolean);
     if (words.length !== 24) die(`expected a 24-word mnemonic, got ${words.length} word(s)`);
+    const address = addressOf(mnemonic);
 
     const passphrase = await prompt("passphrase: ");
     if (passphrase.length < 12) die("use at least 12 characters; this is the only thing standing between a copied file and the wallet");
@@ -55,10 +77,13 @@ switch (command) {
     writeFileSync(out, JSON.stringify(keystore, null, 2) + "\n", { mode: 0o600 });
     chmodSync(out, 0o600);
     console.log(`wrote ${resolve(out)} (mode 600)`);
+    console.log(`  network ${NETWORK}`);
+    console.log(`  address ${address}`);
     console.log(`\nPoint signerd at it:`);
     console.log(`  WALLET_KEYSTORE_FILE=${resolve(out)}`);
     console.log(`  WALLET_PASSPHRASE_FILE=<somewhere the keystore is not>   # or leave unset to be prompted`);
-    console.log(`\nThen remove the plaintext mnemonic — once you are certain the passphrase is recoverable.`);
+    console.log(`\nCheck that address against "walletctl status" before removing the plaintext mnemonic,`);
+    console.log(`and only once you are certain the passphrase is recoverable.`);
     if (mnemonicFile) console.log(`  ${resolve(mnemonicFile)}`);
     break;
   }
@@ -81,8 +106,10 @@ switch (command) {
       die(String(e instanceof Error ? e.message : e));
     }
     const words = mnemonic.split(/\s+/).filter(Boolean);
-    // Word count and nothing else: printing any of them would defeat the file's whole purpose.
-    console.log(`ok — opens, and contains a ${words.length}-word mnemonic`);
+    // The address, never the words: "it opens" is not the question, "onto which wallet" is.
+    console.log(`ok — opens onto a ${words.length}-word mnemonic`);
+    console.log(`  network ${NETWORK}`);
+    console.log(`  address ${addressOf(mnemonic)}`);
     break;
   }
 
