@@ -113,8 +113,9 @@ the same budget chain, or Blockfrost.
   what the checkpoint already holds
 - `npm run concurrency`: the cap holds under simultaneous requests, and two agents sharing one
   wallet contend for its UTXO without either being handed a transaction that cannot settle
-- `npm run approvals`: approved, denied and timed out all give the held budget back, and two
-  queued payments cannot promise the same budget twice
+- `npm run approvals`: approved, denied and timed out all give the held budget back, two queued
+  payments cannot promise the same budget twice, and a limit tightened while one waits is applied
+  to it rather than bypassed by the approval
 - `npm run assets`: caps and 24h windows are per asset, the hourly rate is shared across them, and
   an asset the wallet does not hold is refused as `insufficient_funds` rather than as a fault.
   Not covered: an actual native-asset settlement, which needs a wallet holding one.

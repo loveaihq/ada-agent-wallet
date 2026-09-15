@@ -14,7 +14,7 @@
  *                  yet, which on a single-UTXO wallet any second payment hits. Retryable.
  *                  409 insufficient_funds: the wallet does not hold the asset. Not retryable.
  *   GET  /pending                      -> approval queue
- *   POST /approve  {id}                -> signs the queued request
+ *   POST /approve  {id}                -> signs the queued request, if the policy still allows it
  *   POST /deny     {id}
  *
  * Neither POLICY_FILE nor AUDIT_FILE may be writable by the agent's user: between them they are
@@ -300,6 +300,11 @@ function pruneLedger(now = Date.now()) {
 const reserved = new Map<string, SpendRecord>();
 const effectiveLedger = (): readonly SpendRecord[] =>
   reserved.size === 0 ? ledger : [...ledger, ...reserved.values()];
+/** Everything except one request's own reservation, for judging that request again. */
+const ledgerExcluding = (id: string): readonly SpendRecord[] => [
+  ...ledger,
+  ...[...reserved].filter(([held]) => held !== id).map(([, spend]) => spend),
+];
 
 const auditFd = openSync(AUDIT_FILE, "a");
 /** Every record passes through here, so it is also where they are counted for /metrics. */
@@ -464,6 +469,8 @@ interface Pending {
   createdAt: number;
   agentId: string;
   reason: string;
+  /** Kept so the policy can be re-applied at approval time, `allowedResources` included. */
+  resource?: string;
   input: ClientCardanoSignInput;
   /** Cleared when the request resolves, so a settled approval stops holding the event loop open. */
   timer: NodeJS.Timeout;
@@ -563,7 +570,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
               resolve({ denied: "approval timed out" });
             }
           }, approvalWindow(input) * 1000);
-          pending.set(id, { id, createdAt: Date.now(), agentId, reason, input, timer, resolve });
+          pending.set(id, { id, createdAt: Date.now(), agentId, reason, resource: typeof resource === "string" ? resource : undefined, input, timer, resolve });
         });
         return { kind: "queued", id, settled };
       }
@@ -607,6 +614,35 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       p.resolve({ denied: "denied by operator" });
       return json(res, 200, { ok: true });
     }
+    // The policy that governs is the one in force now, not the one in force when the request was
+    // queued. Without this, tightening a limit while something waits in the queue leaves a way to
+    // sign past it: approval is a gate inside the policy, not a way around it. An operator who
+    // means to allow it can raise the limit, which is a decision that leaves a trace.
+    let verdict: ReturnType<typeof decide> | undefined;
+    try {
+      verdict = decide(refreshPolicy(), ledgerExcluding(p.id), {
+        agentId: p.agentId,
+        payTo: p.input.payTo,
+        asset: p.input.asset,
+        amount: BigInt(p.input.amount),
+        reason: p.reason,
+        assetTransferMethod: typeof p.input.extra?.assetTransferMethod === "string" ? p.input.extra.assetTransferMethod : undefined,
+        resource: p.resource,
+      });
+    } catch (e) {
+      verdict = { verdict: "deny", rule: "policy_unreadable", detail: String(e instanceof Error ? e.message : e) };
+    }
+    if (verdict.verdict === "deny") {
+      reserved.delete(p.id);
+      audit("approval_stale", { id: p.id, agentId: p.agentId, rule: verdict.rule, detail: verdict.detail });
+      p.resolve({ denied: `the policy no longer allows this: ${verdict.rule}` });
+      return json(res, 409, {
+        error: "policy_changed",
+        rule: verdict.rule,
+        detail: `${verdict.detail}. The policy changed while this was queued; raise the limit if you mean to allow it.`,
+      });
+    }
+
     try {
       // Drop the reservation only after signing has recorded the real spend.
       const out = await withAgentLock(p.agentId, () => sign(p.agentId, p.reason, p.input));

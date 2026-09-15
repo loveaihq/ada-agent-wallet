@@ -61,6 +61,7 @@ const TERMINAL_EVENTS = new Set([
   "approval_timeout",
   "shutdown_denied",
   "approval_sign_error",
+  "approval_stale",
   "pending_abandoned",
 ]);
 

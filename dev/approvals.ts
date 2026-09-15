@@ -39,27 +39,30 @@ const check = (condition: boolean, description: string) => {
 
 const dir = mkdtempSync(join(tmpdir(), "ada-wallet-approvals-"));
 const auditFile = join(dir, "audit.jsonl");
-writeFileSync(
-  join(dir, "policy.json"),
-  JSON.stringify({
-    network: NETWORK,
-    agents: {
-      default: {
-        perTxMax: { lovelace: "5000000" },
-        dailyMax: { lovelace: "10000000" },
-        allowedPayees: ["*"],
-        approvalAbove: { lovelace: "1000000" }, // anything worth testing needs a human
-        maxPerHour: 60,
+const policyFile = join(dir, "policy.json");
+const writePolicy = (dailyMax: string) =>
+  writeFileSync(
+    policyFile,
+    JSON.stringify({
+      network: NETWORK,
+      agents: {
+        default: {
+          perTxMax: { lovelace: "5000000" },
+          dailyMax: { lovelace: dailyMax },
+          allowedPayees: ["*"],
+          approvalAbove: { lovelace: "1000000" }, // anything worth testing needs a human
+          maxPerHour: 60,
+        },
       },
-    },
-  }),
-);
+    }),
+  );
+writePolicy("10000000");
 
 const child: ChildProcess = spawn(process.execPath, ["--import", "tsx", SIGNERD], {
   env: {
     ...process.env,
     SIGNERD_PORT: String(PORT),
-    POLICY_FILE: join(dir, "policy.json"),
+    POLICY_FILE: policyFile,
     AUDIT_FILE: auditFile,
     LEDGER_FILE: join(dir, "ledger.json"),
   },
@@ -106,12 +109,29 @@ try {
   check(timedOut.status === 403 && /timed out/.test(String(timedOut.data.detail)), "the caller was told it timed out");
   check(await spentIs("1500000"), `the reservation was released (dailySpent ${await dailySpent()}, expected 1500000)`);
 
+  // --- the policy in force at approval time is the one that governs -----------------------------
+  console.log("\n5. tighten the policy while a payment waits in the queue");
+  const stale = sign("queued under a policy that is about to change");
+  await settle(() => pending().then(p => p.length === 1), "queued");
+  writePolicy("2000000"); // 1500000 already signed, so this one no longer fits
+  const staleId = (await pending())[0].id;
+  const refused = await post("/approve", { id: staleId });
+  check(refused.status === 409, `approving it is refused (HTTP ${refused.status})`);
+  check(refused.data.error === "policy_changed" && refused.data.rule === "daily_max", `and says which limit now blocks it (${refused.data.rule})`);
+  check((await stale).status === 403, "the waiting caller is told, rather than left hanging");
+  check(await spentIs("1500000"), `the reservation was released (dailySpent ${await dailySpent()}, expected 1500000)`);
+  writePolicy("10000000"); // put it back, so the audit check below reads a normal state
+
   const events = auditEvents();
-  for (const e of ["pending", "approval_denied", "approved", "approval_timeout"]) {
+  for (const e of ["pending", "approval_denied", "approved", "approval_timeout", "approval_stale"]) {
     check(events.includes(e), `the audit records ${e}`);
   }
 
-  console.log(problems.length ? `\nFAIL — ${problems.length} check(s) failed` : "\nPASS — every way out of the queue gives the budget back");
+  console.log(
+    problems.length
+      ? `\nFAIL — ${problems.length} check(s) failed`
+      : "\nPASS — every way out of the queue gives the budget back, and none of them outruns the policy",
+  );
   process.exitCode = problems.length ? 1 : 0;
 } finally {
   child.kill();
