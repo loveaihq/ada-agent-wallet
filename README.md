@@ -84,6 +84,7 @@ npm run walletctl -- preflight   # deployment checks; see "Before mainnet"
 npm run verify:vendor            # sha256 of vendor/; runs automatically before npm test
 npm run integrity                # proves no single deletion resets the spend cap
 npm run approvals                # every way out of the approval queue gives the budget back
+npm run assets                   # per-asset caps and windows, and the rate they share
 npm run keystore -- create ...   # encrypt the mnemonic at rest
 ```
 
@@ -114,6 +115,9 @@ the same budget chain, or Blockfrost.
   wallet contend for its UTXO without either being handed a transaction that cannot settle
 - `npm run approvals`: approved, denied and timed out all give the held budget back, and two
   queued payments cannot promise the same budget twice
+- `npm run assets`: caps and 24h windows are per asset, the hourly rate is shared across them, and
+  an asset the wallet does not hold is refused as `insufficient_funds` rather than as a fault.
+  Not covered: an actual native-asset settlement, which needs a wallet holding one.
 - mcp: tool listing and `wallet_status` through a real MCP client
 - deny path, end to end: MCP `x402_fetch` → 402 → gated signer → signerd → `per_tx_max` →
   structured verdict back at the tool, `denied` in `audit.jsonl`

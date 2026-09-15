@@ -10,8 +10,9 @@
  *   GET  /preflight                    -> the checks worth passing before real money is involved
  *   GET  /metrics                      -> Prometheus exposition, same bearer token
  *   POST /sign     {agentId, reason, resource?, input}  -> {transaction, nonce} | 4xx
- *                  409 utxo_busy is retryable: the wallet's UTXO is committed to a payment that
- *                  has not settled yet, which on a single-UTXO wallet any second payment hits
+ *                  409 utxo_busy: the wallet's UTXO is committed to a payment that has not settled
+ *                  yet, which on a single-UTXO wallet any second payment hits. Retryable.
+ *                  409 insufficient_funds: the wallet does not hold the asset. Not retryable.
  *   GET  /pending                      -> approval queue
  *   POST /approve  {id}                -> signs the queued request
  *   POST /deny     {id}
@@ -424,9 +425,28 @@ const approvalWindow = (input: ClientCardanoSignInput) =>
  */
 class UtxoBusy extends Error {}
 
+/**
+ * The wallet does not hold enough of the asset to build this payment. Also not a failure of the
+ * daemon: an x402 endpoint priced in an asset this wallet has never held reaches here, and
+ * "something broke" is the wrong thing to tell an agent that needs to stop asking.
+ *
+ * Matched on the builder's message because the SDK gives it no code of its own. If that message
+ * ever changes the condition falls back to a plain 500, which is what it was before.
+ */
+class InsufficientFunds extends Error {}
+const isCoinSelectionFailure = (e: unknown) =>
+  e instanceof Error && /coin selection failed/i.test(`${e.message} ${String((e as { cause?: unknown }).cause ?? "")}`);
+
 async function sign(agentId: string, reason: string, input: ClientCardanoSignInput) {
   return withWalletLock(async () => {
-    const res = await signer.buildAndSignPaymentTransaction(input);
+    let res: Awaited<ReturnType<typeof signer.buildAndSignPaymentTransaction>>;
+    try {
+      res = await signer.buildAndSignPaymentTransaction(input);
+    } catch (e) {
+      if (!isCoinSelectionFailure(e)) throw e;
+      audit("insufficient_funds", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount });
+      throw new InsufficientFunds(`the wallet cannot fund ${input.amount} of ${input.asset}`);
+    }
     if (!claimNonce(res.nonce, Math.min(approvalWindow(input), NONCE_HOLD_SECONDS))) {
       audit("nonce_collision", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce });
       throw new UtxoBusy(`utxo ${res.nonce} is already committed to an unsettled payment; retry once it settles`);
@@ -558,12 +578,13 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
     if (outcome.kind === "deny") return json(res, 403, { error: "policy_denied", rule: outcome.rule, detail: outcome.detail });
     if (outcome.kind === "error") {
-      const busy = outcome.error instanceof UtxoBusy;
-      return json(res, busy ? 409 : 500, {
-        error: busy ? "utxo_busy" : "sign_failed",
-        detail: String(outcome.error instanceof Error ? outcome.error.message : outcome.error),
-        ...(busy ? { retryable: true } : {}),
-      });
+      const e = outcome.error;
+      const detail = String(e instanceof Error ? e.message : e);
+      // Two of these are states, not faults, and an agent can act on the difference: wait, or stop.
+      if (e instanceof UtxoBusy) return json(res, 409, { error: "utxo_busy", detail, retryable: true });
+      if (e instanceof InsufficientFunds)
+        return json(res, 409, { error: "insufficient_funds", detail, retryable: false, asset: input.asset, amount: input.amount });
+      return json(res, 500, { error: "sign_failed", detail });
     }
     if (outcome.kind === "signed") return json(res, 200, outcome.out);
 

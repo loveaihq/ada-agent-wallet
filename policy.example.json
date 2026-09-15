@@ -2,12 +2,21 @@
   "network": "cardano:preprod",
   "agents": {
     "default": {
-      "perTxMax":                    { "lovelace": "5000000" },
-      "dailyMax":                    { "lovelace": "20000000" },
-      "allowedPayees":               ["*"],
-      "allowedResources":            ["https://api.example.com/v1/*"],
-      "maxPerHour":                  20,
-      "approvalAbove":               { "lovelace": "3000000" },
+      "perTxMax": {
+        "lovelace": "5000000",
+        "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d": "2000000"
+      },
+      "dailyMax": {
+        "lovelace": "20000000",
+        "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d": "10000000"
+      },
+      "approvalAbove": {
+        "lovelace": "3000000",
+        "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d": "1000000"
+      },
+      "allowedPayees": ["*"],
+      "allowedResources": ["https://api.example.com/v1/*"],
+      "maxPerHour": 20,
       "allowedAssetTransferMethods": ["default"]
     }
   }
