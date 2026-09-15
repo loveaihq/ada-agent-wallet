@@ -50,6 +50,8 @@ export async function createGatedSigner(cfg: GatedSignerConfig): Promise<ClientC
         cfg.onDenied?.(denied);
         throw denied;
       }
+      if (typeof data.transaction !== "string" || typeof data.nonce !== "string")
+        throw new Error(`signerd returned a 200 with no transaction: ${JSON.stringify(data).slice(0, 200)}`);
       return { transaction: data.transaction, nonce: data.nonce };
     },
   };

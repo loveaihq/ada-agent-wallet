@@ -10,6 +10,8 @@
  *   GET  /preflight                    -> the checks worth passing before real money is involved
  *   GET  /metrics                      -> Prometheus exposition, same bearer token
  *   POST /sign     {agentId, reason, resource?, input}  -> {transaction, nonce} | 4xx
+ *                  409 utxo_busy is retryable: the wallet's UTXO is committed to a payment that
+ *                  has not settled yet, which on a single-UTXO wallet any second payment hits
  *   GET  /pending                      -> approval queue
  *   POST /approve  {id}                -> signs the queued request
  *   POST /deny     {id}
@@ -415,12 +417,19 @@ function claimNonce(nonce: string, ttlSeconds: number): boolean {
 const approvalWindow = (input: ClientCardanoSignInput) =>
   Math.max(30, Math.min(input.maxTimeoutSeconds ?? 300, MAX_APPROVAL_SECONDS));
 
+/**
+ * Not a failure: the wallet's UTXO is committed to a payment that has not settled yet, and the
+ * same request will work once it does. Worth its own type so the caller is told to retry rather
+ * than handed a 500 that reads as "something is broken".
+ */
+class UtxoBusy extends Error {}
+
 async function sign(agentId: string, reason: string, input: ClientCardanoSignInput) {
   return withWalletLock(async () => {
     const res = await signer.buildAndSignPaymentTransaction(input);
     if (!claimNonce(res.nonce, Math.min(approvalWindow(input), NONCE_HOLD_SECONDS))) {
       audit("nonce_collision", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce });
-      throw new Error(`utxo ${res.nonce} is already committed to an unsettled payment; retry once it settles`);
+      throw new UtxoBusy(`utxo ${res.nonce} is already committed to an unsettled payment; retry once it settles`);
     }
     ledger.push({ ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
     pruneLedger();
@@ -548,7 +557,14 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     });
 
     if (outcome.kind === "deny") return json(res, 403, { error: "policy_denied", rule: outcome.rule, detail: outcome.detail });
-    if (outcome.kind === "error") return json(res, 500, { error: "sign_failed", detail: String(outcome.error) });
+    if (outcome.kind === "error") {
+      const busy = outcome.error instanceof UtxoBusy;
+      return json(res, busy ? 409 : 500, {
+        error: busy ? "utxo_busy" : "sign_failed",
+        detail: String(outcome.error instanceof Error ? outcome.error.message : outcome.error),
+        ...(busy ? { retryable: true } : {}),
+      });
+    }
     if (outcome.kind === "signed") return json(res, 200, outcome.out);
 
     const verdict = await outcome.settled; // waited for outside the lock
