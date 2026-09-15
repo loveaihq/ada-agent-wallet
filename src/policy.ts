@@ -6,12 +6,13 @@
  *
  * Decision flow for one payment request:
  *   1. agent must exist in policy
- *   2. asset must be allowed
- *   3. payee must be allowed ("*" = any)
- *   4. amount <= perTxMax[asset]
- *   5. spent-today + amount <= dailyMax[asset]   (rolling 24h window)
- *   6. payments in the last hour < maxPerHour
- *   7. amount > approvalAbove[asset]  → "needs_approval" (a human must approve via walletctl)
+ *   2. the asset transfer method must be allowed (default: only "default")
+ *   3. asset must be allowed
+ *   4. payee must be allowed ("*" = any)
+ *   5. amount <= perTxMax[asset]
+ *   6. spent-today + amount <= dailyMax[asset]   (rolling 24h window)
+ *   7. payments in the last hour < maxPerHour
+ *   8. amount > approvalAbove[asset]  → "needs_approval" (a human must approve via walletctl)
  *   otherwise → "allow"
  *
  * The ledger of past spends is injected so the same engine runs in the signer daemon
@@ -31,6 +32,15 @@ export interface AgentPolicy {
   maxPerHour?: number;
   /** Above this amount (per asset) a human must approve. Missing => never. */
   approvalAbove?: AmountMap;
+  /**
+   * Cardano asset transfer methods this agent may use. Defaults to ["default"].
+   *
+   * "masumi" is not in the default set because its cost is not only `amount`: the escrow also
+   * locks buyer collateral, which no field here can see and which stays locked until the
+   * contract's submit_result_time. Enabling it means accepting a lovelace charge on top of the
+   * payment, bounded by signerd's MASUMI_MAX_COLLATERAL_LOVELACE rather than by this policy.
+   */
+  allowedAssetTransferMethods?: string[];
 }
 
 export interface Policy {
@@ -50,6 +60,8 @@ export interface PaymentRequest {
   asset: string;
   amount: bigint;
   reason: string;
+  /** From the 402's `extra.assetTransferMethod`; absent means the "default" address-to-address flow. */
+  assetTransferMethod?: string;
   now?: number;
 }
 
@@ -60,6 +72,16 @@ export type Decision =
 
 const DAY = 24 * 60 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
+const TRANSFER_METHODS = ["default", "masumi", "script"];
+const AGENT_POLICY_KEYS = [
+  "perTxMax",
+  "dailyMax",
+  "allowedPayees",
+  "maxPerHour",
+  "approvalAbove",
+  "allowedAssetTransferMethods",
+];
+const DEFAULT_TRANSFER_METHODS = ["default"];
 
 export function parsePolicy(raw: unknown): Policy {
   if (typeof raw !== "object" || raw === null || typeof (raw as Policy).agents !== "object") {
@@ -67,6 +89,14 @@ export function parsePolicy(raw: unknown): Policy {
   }
   const agents = (raw as Policy).agents;
   for (const [id, p] of Object.entries(agents)) {
+    // Reject unknown keys rather than ignoring them. Every field here either forbids something or
+    // bounds it, so a misspelled one does not degrade to a stricter policy — it degrades to no
+    // policy at all: `approvalabove` is not a typo that trips an error, it is a threshold that
+    // silently never fires.
+    for (const key of Object.keys(p)) {
+      if (!AGENT_POLICY_KEYS.includes(key))
+        throw new Error(`policy: agent ${id} has unknown field "${key}" (known: ${AGENT_POLICY_KEYS.join(", ")})`);
+    }
     if (!p.perTxMax || typeof p.perTxMax !== "object") throw new Error(`policy: agent ${id} needs perTxMax`);
     if (!Array.isArray(p.allowedPayees) || p.allowedPayees.length === 0)
       throw new Error(`policy: agent ${id} needs allowedPayees (use ["*"] for any)`);
@@ -80,6 +110,14 @@ export function parsePolicy(raw: unknown): Policy {
     }
     if (p.maxPerHour !== undefined && (!Number.isInteger(p.maxPerHour) || p.maxPerHour < 1))
       throw new Error(`policy: agent ${id} maxPerHour must be a positive integer`);
+    if (p.allowedAssetTransferMethods !== undefined) {
+      if (!Array.isArray(p.allowedAssetTransferMethods) || p.allowedAssetTransferMethods.length === 0)
+        throw new Error(`policy: agent ${id} allowedAssetTransferMethods must be a non-empty array`);
+      for (const m of p.allowedAssetTransferMethods) {
+        if (!TRANSFER_METHODS.includes(m))
+          throw new Error(`policy: agent ${id} unknown assetTransferMethod "${m}" (known: ${TRANSFER_METHODS.join(", ")})`);
+      }
+    }
   }
   return raw as Policy;
 }
@@ -91,6 +129,15 @@ export function decide(policy: Policy, ledger: readonly SpendRecord[], req: Paym
   if (req.amount <= 0n) return { verdict: "deny", rule: "amount", detail: "amount must be positive" };
   if (!req.reason || req.reason.trim().length < 3)
     return { verdict: "deny", rule: "reason", detail: "a reason is required for the audit log" };
+
+  const method = req.assetTransferMethod ?? "default";
+  const allowedMethods = ap.allowedAssetTransferMethods ?? DEFAULT_TRANSFER_METHODS;
+  if (!allowedMethods.includes(method))
+    return {
+      verdict: "deny",
+      rule: "asset_transfer_method",
+      detail: `assetTransferMethod "${method}" not allowed for ${req.agentId} (allowed: ${allowedMethods.join(", ")})`,
+    };
 
   const perTx = ap.perTxMax[req.asset];
   if (perTx === undefined)
@@ -129,18 +176,39 @@ export function decide(policy: Policy, ledger: readonly SpendRecord[], req: Paym
   return { verdict: "allow" };
 }
 
-/** Human-readable remaining budget, for wallet_status. */
+/**
+ * Human-readable remaining budget, for wallet_status.
+ *
+ * `dailyRemaining` is clamped at zero because a negative budget is not a thing you can spend,
+ * but the clamp must not be the only number reported: a cap that was exceeded and a cap that was
+ * exactly consumed both read as zero, and those are very different facts for an operator. So
+ * `dailySpent`, `dailyMax` and an explicit `overBudget` are reported alongside it.
+ */
 export function remaining(policy: Policy, ledger: readonly SpendRecord[], agentId: string, now = Date.now()) {
   const ap = policy.agents[agentId];
   if (!ap) return null;
-  const out: Record<string, { perTxMax: string; dailyRemaining: string }> = {};
+  const out: Record<
+    string,
+    { perTxMax: string; dailyMax: string; dailySpent: string; dailyRemaining: string; overBudget: boolean }
+  > = {};
   for (const [asset, perTx] of Object.entries(ap.perTxMax)) {
     const cap = BigInt(ap.dailyMax?.[asset] ?? perTx);
     const spent = ledger
       .filter(r => r.agentId === agentId && r.asset === asset && now - r.ts < DAY)
       .reduce((s, r) => s + r.amount, 0n);
-    out[asset] = { perTxMax: perTx, dailyRemaining: (cap - spent < 0n ? 0n : cap - spent).toString() };
+    out[asset] = {
+      perTxMax: perTx,
+      dailyMax: cap.toString(),
+      dailySpent: spent.toString(),
+      dailyRemaining: (cap - spent < 0n ? 0n : cap - spent).toString(),
+      overBudget: spent > cap,
+    };
   }
   const lastHour = ledger.filter(r => r.agentId === agentId && now - r.ts < HOUR).length;
-  return { assets: out, paymentsLastHour: lastHour, maxPerHour: ap.maxPerHour ?? 60 };
+  return {
+    assets: out,
+    paymentsLastHour: lastHour,
+    maxPerHour: ap.maxPerHour ?? 60,
+    allowedAssetTransferMethods: ap.allowedAssetTransferMethods ?? DEFAULT_TRANSFER_METHODS,
+  };
 }

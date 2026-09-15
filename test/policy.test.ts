@@ -14,6 +14,11 @@ const policy = parsePolicy({
       approvalAbove: { lovelace: "3000000" },
     },
     open: { perTxMax: { lovelace: "1000000" }, allowedPayees: ["*"] },
+    escrow: {
+      perTxMax: { lovelace: "5000000" },
+      allowedPayees: ["*"],
+      allowedAssetTransferMethods: ["default", "masumi"],
+    },
   },
 });
 const T0 = 1_700_000_000_000;
@@ -62,10 +67,45 @@ test("remaining budget", () => {
   const ledger: SpendRecord[] = [{ ts: T0 - 1000, agentId: "scanner", asset: "lovelace", amount: 4_000_000n }];
   const r = remaining(policy, ledger, "scanner", T0)!;
   assert.equal(r.assets.lovelace.dailyRemaining, "8000000");
+  assert.equal(r.assets.lovelace.dailySpent, "4000000");
+  assert.equal(r.assets.lovelace.dailyMax, "12000000");
+  assert.equal(r.assets.lovelace.overBudget, false);
   assert.equal(r.paymentsLastHour, 1);
+});
+test("remaining budget does not hide an overspend behind a clamped zero", () => {
+  const ledger: SpendRecord[] = [{ ts: T0 - 1000, agentId: "scanner", asset: "lovelace", amount: 15_000_000n }];
+  const r = remaining(policy, ledger, "scanner", T0)!;
+  assert.equal(r.assets.lovelace.dailyRemaining, "0"); // a negative budget is not spendable
+  assert.equal(r.assets.lovelace.dailySpent, "15000000"); // but the breach is still legible
+  assert.equal(r.assets.lovelace.overBudget, true);
+});
+test("masumi is denied unless the agent opts in", () => {
+  // The escrow locks buyer collateral on top of `amount`, which no field in the policy can see.
+  assert.equal(decide(policy, [], req({ assetTransferMethod: "masumi" })).rule, "asset_transfer_method");
+  assert.equal(decide(policy, [], req({ assetTransferMethod: "script" })).rule, "asset_transfer_method");
+  assert.equal(decide(policy, [], req({ assetTransferMethod: "default" })).verdict, "allow");
+  assert.equal(decide(policy, [], req()).verdict, "allow"); // absent means "default"
+});
+test("masumi allowed for an agent that lists it", () => {
+  const as_escrow = req({ agentId: "escrow", assetTransferMethod: "masumi" });
+  assert.equal(decide(policy, [], as_escrow).verdict, "allow");
+  assert.equal(decide(policy, [], req({ agentId: "escrow", assetTransferMethod: "script" })).rule, "asset_transfer_method");
 });
 test("parsePolicy rejects bad input", () => {
   assert.throws(() => parsePolicy({ agents: { a: { perTxMax: { lovelace: "1.5" }, allowedPayees: ["*"] } } }));
   assert.throws(() => parsePolicy({ agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: [] } } }));
   assert.throws(() => parsePolicy({ agents: { a: { perTxMax: { ADA: "1" }, allowedPayees: ["*"] } } }));
+  assert.throws(() =>
+    parsePolicy({ agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: ["*"], allowedAssetTransferMethods: ["masumi2"] } } }),
+  );
+  assert.throws(() =>
+    parsePolicy({ agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: ["*"], allowedAssetTransferMethods: [] } } }),
+  );
+});
+test("parsePolicy rejects a misspelled field instead of ignoring it", () => {
+  // `approvalabove` would otherwise parse as "this agent never needs approval".
+  assert.throws(
+    () => parsePolicy({ agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: ["*"], approvalabove: { lovelace: "1" } } } }),
+    /unknown field "approvalabove"/,
+  );
 });
