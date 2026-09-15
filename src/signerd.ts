@@ -1000,7 +1000,14 @@ function shutdown(signal: string) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
+const LOOPBACK = ["127.0.0.1", "::1"];
 server.listen(PORT, "127.0.0.1", () => {
+  // The key lives in this process. The listen address is one token in one line, and getting it
+  // wrong publishes the wallet to whatever the host is reachable on, so it is worth asking the
+  // socket what it actually bound rather than trusting the line above it.
+  const bound = server.address();
+  if (typeof bound !== "object" || bound === null || !LOOPBACK.includes(bound.address))
+    fail(`refusing to serve on ${typeof bound === "object" && bound ? bound.address : String(bound)}: signerd holds the key and belongs on the loopback`);
   console.error(`signerd listening on 127.0.0.1:${PORT}  network=${NETWORK}  address=${address}`);
   console.error(`policy: ${resolvePath(POLICY_FILE)}`);
   console.error(`audit:  ${resolvePath(AUDIT_FILE)}  (chain at #${auditSeq}, ${replayedSkipped} records older than the window)`);

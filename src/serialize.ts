@@ -1,6 +1,8 @@
 /**
- * Async mutexes. A task that rejects must not wedge the ones queued behind it, so the chain
- * continues through failures while the rejection still reaches its own caller.
+ * Async mutexes. Pure logic: no chain, no keys, no I/O.
+ *
+ * A task that rejects must not wedge the ones queued behind it, so the chain continues through
+ * failures while the rejection still reaches its own caller.
  */
 const noop = () => {};
 

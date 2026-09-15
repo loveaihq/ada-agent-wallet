@@ -62,6 +62,13 @@ try {
     console.log("\n2. a token per agent");
     const own = await sign(SCANNER_TOKEN, undefined, "900000");
     check(own.status === 200, `scanner's token signs within scanner's cap (HTTP ${own.status})`);
+    // "the agent never sees a key" is a claim about this response and nothing else. A signed
+    // transaction carries a signature and a public key, which are meant to leave; anything else
+    // appearing here would be something nobody decided to send.
+    check(
+      Object.keys(own.data).sort().join() === "nonce,transaction",
+      `a signed payment comes back as exactly {transaction, nonce} (${Object.keys(own.data).sort().join(", ")})`,
+    );
 
     const overOwnCap = await sign(SCANNER_TOKEN, undefined, "4000000");
     check(overOwnCap.data.rule === "per_tx_max", `and is held to scanner's cap (${overOwnCap.data.rule})`);

@@ -86,11 +86,19 @@ async function pollPending() {
 }
 
 const started = Date.now();
-const out = await client.callTool(
-  { name: "x402_fetch", arguments: { url: `${RESOURCE_URL}${path}`, reason } },
-  undefined,
-  { timeout: 15 * 60 * 1000 },
-);
+const call = () =>
+  client.callTool({ name: "x402_fetch", arguments: { url: `${RESOURCE_URL}${path}`, reason } }, undefined, { timeout: 15 * 60 * 1000 });
+
+let out = await call();
+// `utxo_busy` is signerd saying "come back", and this wallet has one UTXO, so any check that ran
+// just before this one is holding it. Honouring the retryable flag is both what an agent should do
+// and what keeps these suites from failing each other when run back to back.
+if (/"rule":\s*"utxo_busy"/.test(text(out))) {
+  const wait = Number(process.env.NONCE_HOLD_SECONDS ?? 120) + 5;
+  step(`the wallet's UTXO is held by an unsettled payment; waiting ${wait}s and trying once more`);
+  await new Promise(r => setTimeout(r, wait * 1000));
+  out = await call();
+}
 clearInterval(watching);
 step(`x402_fetch returned after ${((Date.now() - started) / 1000).toFixed(1)}s:`);
 console.log(text(out));

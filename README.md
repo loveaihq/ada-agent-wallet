@@ -110,8 +110,12 @@ facilitator client 115s so the wait is not cut off one level up. Anything talkin
 the same budget chain, or Blockfrost.
 
 ## Verified
-- `npm test`: 59 unit tests over the policy engine, the startup replay, the locks, the keystore and
+- `npm test`: 62 unit tests over the policy engine, the startup replay, the locks, the keystore and
   the signed-transaction check, plus the vendor checksums, which gate the rest. None needs a chain.
+- the modules that say "no chain, no keys, no I/O" are checked to import nothing that would make
+  that false, and to still say it — the first run of that check found one that had stopped
+- signerd asks the socket what address it bound and refuses anything but the loopback, so the one
+  line that decides whether the wallet is on the network is not taken on trust
 - every signature is read back before it is handed over: an output pays the authorised payee at
   least the authorised amount, the nonce is spent, and nothing else is paid at all
 - `npm run integrity`: no single deletion resets the spend cap, and restarting does not re-count
