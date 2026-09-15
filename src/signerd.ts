@@ -17,16 +17,17 @@
  *   POST /approve  {id}                -> signs the queued request, if the policy still allows it
  *   POST /deny     {id}
  *
- * Neither POLICY_FILE nor AUDIT_FILE may be writable by the agent's user: between them they are
- * the limits and the spending they are measured against. See README, "Before mainnet".
+ * None of POLICY_FILE, AUDIT_FILE or LEDGER_FILE may be writable by the agent's user: between them
+ * they are the limits, the spending they are measured against, and the checkpoint the cap is
+ * computed from. See README, "Before mainnet".
  *
  * Env:
- *   WALLET_KEYSTORE_FILE    passphrase-encrypted mnemonic (preferred; see scripts/keystore.mjs)
+ *   WALLET_KEYSTORE_FILE    passphrase-encrypted mnemonic (preferred; see scripts/keystore.ts)
  *   WALLET_PASSPHRASE_FILE  where to read its passphrase; otherwise prompted on a terminal
  *   WALLET_MNEMONIC_FILE    plaintext mnemonic on disk
  *   WALLET_MNEMONIC         plaintext mnemonic in the environment (worst of the three)
  *   MAX_HOT_BALANCE_LOVELACE  what this wallet should never exceed; preflight fails without it
- *   CARDANO_NETWORK   cardano:preprod | cardano:mainnet   (default preprod)
+ *   CARDANO_NETWORK   cardano:preprod | cardano:preview | cardano:mainnet   (default preprod)
  *   BLOCKFROST_PROJECT_ID   optional; without it the daemon uses Koios (free, no key)
  *   KOIOS_TOKEN             optional
  *   POLICY_FILE       default ./policy.json
@@ -67,6 +68,7 @@ import { createKeyedLock, createLock } from "./serialize.js";
 import { replayAudit, sha256, type Checkpoint } from "./replay.js";
 import { mismatch } from "./verifyTx.js";
 import { decryptMnemonic, assertKeystore } from "./keystore.js";
+import { blockfrostBaseUrl, koiosBaseUrl, networkName, sameNetwork } from "./network.js";
 
 const PORT = Number(process.env.SIGNERD_PORT ?? 7402);
 const TOKEN = process.env.SIGNERD_TOKEN;
@@ -80,7 +82,6 @@ const AGENT_TOKENS_FILE = process.env.AGENT_TOKENS_FILE;
 const KEYSTORE_FILE = process.env.WALLET_KEYSTORE_FILE;
 const PASSPHRASE_FILE = process.env.WALLET_PASSPHRASE_FILE;
 const MAX_HOT_BALANCE = process.env.MAX_HOT_BALANCE_LOVELACE ? BigInt(process.env.MAX_HOT_BALANCE_LOVELACE) : undefined;
-const IS_MAINNET = NETWORK.endsWith("mainnet");
 const MAX_BODY_BYTES = 1 << 20;
 /**
  * Caps on the free text a caller can put into the audit log.
@@ -97,6 +98,11 @@ const MAX_AGENT_ID = 64;
 // Cardano address is about 103 characters; a canonical asset id is at most 121.
 const MAX_PAY_TO = 200;
 const MAX_ASSET = 130;
+/**
+ * The longest a queued `/sign` is held open. The caller's HTTP client sets the real ceiling: Node's
+ * fetch gives up waiting for response headers after 300s, and when a caller goes away the request
+ * is withdrawn from the queue rather than signed into the void (see `closePending`).
+ */
 const MAX_APPROVAL_SECONDS = 900;
 // Long enough to cover one settle attempt (facilitator awaitTx 100s inside a 115s client timeout
 // in dev/), short enough that a failed settlement does not strand the wallet.
@@ -111,6 +117,16 @@ function fail(msg: string): never {
 }
 
 if (!TOKEN) fail("SIGNERD_TOKEN is required");
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) fail(`SIGNERD_PORT must be a port number, got "${process.env.SIGNERD_PORT}"`);
+// Resolved once, so "is this mainnet" is a fact about a known chain and not a suffix match that
+// would read `cardano:preview` as mainnet's opposite and point it at mainnet's providers.
+const IS_MAINNET = (() => {
+  try {
+    return networkName(NETWORK) === "mainnet";
+  } catch (e) {
+    return fail(`CARDANO_NETWORK: ${e instanceof Error ? e.message : e}`);
+  }
+})();
 
 /** Keystore, then plaintext file, then environment — best to worst. See README, "The key". */
 async function loadMnemonic(): Promise<string> {
@@ -372,6 +388,9 @@ if (openPending.length)
 // Now, not at the next payment: an idle wallet would otherwise sit with no checkpoint at all, and
 // so with nothing protecting the cap.
 writeCheckpoint();
+// After the write, so a first start has a file to check. The cap is computed from this checkpoint,
+// and an agent that can rewrite it rewrites its own spend.
+checkFileMode("ledger", LEDGER_FILE);
 
 const signer: ClientCardanoSigner = toClientCardanoSigner({
   mnemonic,
@@ -384,11 +403,10 @@ const signer: ClientCardanoSigner = toClientCardanoSigner({
     : {}),
 });
 function providerConfig() {
-  const preprod = NETWORK.endsWith("preprod");
   if (process.env.BLOCKFROST_PROJECT_ID) {
-    return { blockfrost: { baseUrl: `https://cardano-${preprod ? "preprod" : "mainnet"}.blockfrost.io/api/v0`, projectId: process.env.BLOCKFROST_PROJECT_ID } };
+    return { blockfrost: { baseUrl: blockfrostBaseUrl(NETWORK), projectId: process.env.BLOCKFROST_PROJECT_ID } };
   }
-  return { koios: { baseUrl: preprod ? "https://preprod.koios.rest/api/v1" : "https://api.koios.rest/api/v1", token: process.env.KOIOS_TOKEN } };
+  return { koios: { baseUrl: koiosBaseUrl(NETWORK), token: process.env.KOIOS_TOKEN } };
 }
 const address = signer.getAddress();
 
@@ -405,17 +423,16 @@ async function refreshBalance() {
   if (balanceInFlight) return; // a slow provider must not stack up one request per interval
   balanceInFlight = true;
   try {
-    const preprod = NETWORK.endsWith("preprod");
     let lovelace: bigint;
     if (process.env.BLOCKFROST_PROJECT_ID) {
-      const r = await fetch(`https://cardano-${preprod ? "preprod" : "mainnet"}.blockfrost.io/api/v0/addresses/${address}`, {
+      const r = await fetch(`${blockfrostBaseUrl(NETWORK)}/addresses/${address}`, {
         headers: { project_id: process.env.BLOCKFROST_PROJECT_ID },
       });
       if (!r.ok) throw new Error(`blockfrost ${r.status}`);
       const body = (await r.json()) as { amount?: Array<{ unit: string; quantity: string }> };
       lovelace = BigInt(body.amount?.find(a => a.unit === "lovelace")?.quantity ?? "0");
     } else {
-      const r = await fetch(`${preprod ? "https://preprod.koios.rest" : "https://api.koios.rest"}/api/v1/address_info`, {
+      const r = await fetch(`${koiosBaseUrl(NETWORK)}/address_info`, {
         method: "POST",
         headers: { "content-type": "application/json", ...(process.env.KOIOS_TOKEN ? { authorization: `Bearer ${process.env.KOIOS_TOKEN}` } : {}) },
         body: JSON.stringify({ _addresses: [address] }),
@@ -459,16 +476,25 @@ function claimNonce(nonce: string, ttlSeconds: number): boolean {
   return true;
 }
 
-/** `maxTimeoutSeconds` comes from the seller's 402: unclamped, zero times out every approval. */
-const approvalWindow = (input: ClientCardanoSignInput) =>
-  Math.max(30, Math.min(input.maxTimeoutSeconds ?? 300, MAX_APPROVAL_SECONDS));
+/**
+ * `maxTimeoutSeconds` comes from the seller's 402: unclamped, zero times out every approval, and
+ * a non-number would make the timer NaN — which fires at once — and the nonce hold NaN, which
+ * never expires.
+ */
+const approvalWindow = (input: ClientCardanoSignInput) => {
+  const asked = typeof input.maxTimeoutSeconds === "number" && Number.isFinite(input.maxTimeoutSeconds) ? input.maxTimeoutSeconds : 300;
+  return Math.max(30, Math.min(asked, MAX_APPROVAL_SECONDS));
+};
+
+/** A failure that has already written its own audit record, so `sign_error` need not repeat it. */
+class AuditedError extends Error {}
 
 /**
  * Not a failure: the wallet's UTXO is committed to a payment that has not settled yet, and the
  * same request will work once it does. Worth its own type so the caller is told to retry rather
  * than handed a 500 that reads as "something is broken".
  */
-class UtxoBusy extends Error {}
+class UtxoBusy extends AuditedError {}
 
 /**
  * The wallet does not hold enough of the asset to build this payment. Also not a failure of the
@@ -478,7 +504,7 @@ class UtxoBusy extends Error {}
  * Matched on the builder's message because the SDK gives it no code of its own. If that message
  * ever changes the condition falls back to a plain 500, which is what it was before.
  */
-class InsufficientFunds extends Error {}
+class InsufficientFunds extends AuditedError {}
 const isCoinSelectionFailure = (e: unknown) =>
   e instanceof Error && /coin selection failed/i.test(`${e.message} ${String((e as { cause?: unknown }).cause ?? "")}`);
 
@@ -511,7 +537,7 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
     }
     if (wrong) {
       audit("transaction_mismatch", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, detail: wrong });
-      throw new Error(`refusing to hand over a transaction that does not match what was authorised: ${wrong}`);
+      throw new AuditedError(`refusing to hand over a transaction that does not match what was authorised: ${wrong}`);
     }
 
     if (!claimNonce(res.nonce, Math.min(approvalWindow(input), NONCE_HOLD_SECONDS))) {
@@ -540,6 +566,19 @@ interface Pending {
 }
 const pending = new Map<string, Pending>();
 
+/**
+ * Takes a request out of the queue and gives its budget back. Every exit goes through here, so no
+ * exit can forget the reservation, the timer, or the caller still waiting on the answer.
+ */
+function closePending(p: Pending, event: string, verdict: string, extra: Record<string, unknown> = {}) {
+  if (!pending.delete(p.id)) return false;
+  clearTimeout(p.timer);
+  reserved.delete(p.id);
+  audit(event, { id: p.id, agentId: p.agentId, reason: p.reason, ...extra });
+  p.resolve({ denied: verdict });
+  return true;
+}
+
 type Settled = { transaction: string; nonce: string } | { denied: string };
 type SignOutcome =
   | { kind: "deny"; rule: string; detail: string }
@@ -548,6 +587,26 @@ type SignOutcome =
   | { kind: "queued"; id: string; settled: Promise<Settled> };
 
 let shuttingDown = false;
+
+class BadRequest extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+/** The JSON object a POST carries, or a 4xx: a body that does not parse is the caller's fault. */
+async function readJsonObject(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readBody(req);
+  if (!raw) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new BadRequest(400, "body is not valid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new BadRequest(400, "body must be a JSON object");
+  return parsed as Record<string, unknown>;
+}
 
 async function handle(req: IncomingMessage, res: ServerResponse) {
   const caller = identify(req.headers.authorization);
@@ -559,7 +618,16 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   const operatorOnly = caller.kind === "operator";
   if (shuttingDown) return json(res, 503, { error: "shutting_down" });
   const url = new URL(req.url ?? "/", "http://localhost");
-  const body = req.method === "POST" ? JSON.parse((await readBody(req)) || "{}") : {};
+  let body: Record<string, unknown> = {};
+  if (req.method === "POST") {
+    try {
+      body = await readJsonObject(req);
+    } catch (e) {
+      badRequests++;
+      if (e instanceof BadRequest) return json(res, e.status, { error: "bad_request", detail: e.message });
+      throw e;
+    }
+  }
 
   if (req.method === "GET" && url.pathname === "/status") {
     let current: Policy;
@@ -602,13 +670,21 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const agentId = caller.kind === "agent" ? caller.agentId : claimed;
     if (caller.kind === "agent" && claimed !== undefined && claimed !== agentId)
       return json(res, 403, { error: "agent_mismatch", detail: `this token signs for ${agentId}, not ${claimed}` });
-    if (!agentId || !input?.payTo || !input?.asset || !input?.amount)
+    if (!agentId || typeof input !== "object" || input === null || !input.payTo || !input.asset || !input.amount)
       return json(res, 400, { error: "agentId, reason, input{payTo,asset,amount} required" });
     // Otherwise BigInt() turns the caller's mistake into a 500.
     if (typeof input.amount !== "string" || !/^[0-9]+$/.test(input.amount))
       return json(res, 400, { error: "input.amount must be a decimal integer string" });
     if (typeof input.payTo !== "string" || typeof input.asset !== "string")
       return json(res, 400, { error: "input.payTo and input.asset must be strings" });
+    // The policy reads `reason` as text; anything else would fail inside the lock, as a 500.
+    if (reason !== undefined && typeof reason !== "string") return json(res, 400, { error: "reason must be a string" });
+    if (input.maxTimeoutSeconds !== undefined && (typeof input.maxTimeoutSeconds !== "number" || !Number.isFinite(input.maxTimeoutSeconds)))
+      return json(res, 400, { error: "input.maxTimeoutSeconds must be a number" });
+    // The SDK refuses to sign for another chain, but only after the decision has been made and
+    // audited as a `sign_error`; a 402 for the wrong network is not an incident, it is a 400.
+    if (typeof input.network !== "string" || !sameNetwork(input.network, NETWORK))
+      return json(res, 400, { error: "network_mismatch", detail: `this wallet signs for ${NETWORK}, not "${String(input.network)}"` });
     // Refused before anything is written, because writing is the cost being bounded.
     const tooLong =
       (typeof reason === "string" && reason.length > MAX_REASON && `reason (${reason.length} > ${MAX_REASON})`) ||
@@ -654,14 +730,24 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         reserved.set(id, { ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
         audit("pending", { id, agentId, reason, resource, payTo: input.payTo, asset: input.asset, amount: input.amount, detail: d.detail });
         const settled = new Promise<Settled>(resolve => {
-          const timer = setTimeout(() => {
-            if (pending.delete(id)) {
-              reserved.delete(id);
-              audit("approval_timeout", { id, agentId, reason, asset: input.asset, amount: input.amount });
-              resolve({ denied: "approval timed out" });
-            }
-          }, approvalWindow(input) * 1000);
-          pending.set(id, { id, createdAt: Date.now(), agentId, reason, resource: typeof resource === "string" ? resource : undefined, input, timer, resolve });
+          const entry: Pending = {
+            id,
+            createdAt: Date.now(),
+            agentId,
+            reason,
+            resource: typeof resource === "string" ? resource : undefined,
+            input,
+            timer: setTimeout(() => closePending(entry, "approval_timeout", "approval timed out", { asset: input.asset, amount: input.amount }), approvalWindow(input) * 1000),
+            resolve,
+          };
+          pending.set(id, entry);
+          // The answer has one recipient: the request that is still open. Node's fetch stops waiting
+          // for headers after 300s, and an approval signed after the caller has gone records a spend
+          // for a transaction nobody will ever broadcast — so a caller that leaves takes its request
+          // with it, and its budget comes back.
+          res.on("close", () => {
+            if (!res.writableFinished) closePending(entry, "pending_abandoned", "the caller stopped waiting", { detail: "connection closed while queued" });
+          });
         });
         return { kind: "queued", id, settled };
       }
@@ -669,7 +755,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       try {
         return { kind: "signed", out: await sign(agentId, reason, input) };
       } catch (e) {
-        audit("sign_error", { agentId, reason, error: String(e) });
+        if (!(e instanceof AuditedError)) audit("sign_error", { agentId, reason, error: String(e) });
         return { kind: "error", error: e };
       }
     });
@@ -687,6 +773,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     if (outcome.kind === "signed") return json(res, 200, outcome.out);
 
     const verdict = await outcome.settled; // waited for outside the lock
+    if (res.destroyed || res.socket?.destroyed) return; // the caller left; the queue entry went with it
     if ("denied" in verdict) return json(res, 403, { error: "approval_denied", detail: verdict.denied, id: outcome.id });
     return json(res, 200, verdict);
   }
@@ -695,58 +782,65 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     return json(res, 200, [...pending.values()].map(p => ({ id: p.id, createdAt: p.createdAt, agentId: p.agentId, reason: p.reason, payTo: p.input.payTo, asset: p.input.asset, amount: p.input.amount })));
   }
   if (req.method === "POST" && (url.pathname === "/approve" || url.pathname === "/deny")) {
-    const p = pending.get(body.id);
+    const p = typeof body.id === "string" ? pending.get(body.id) : undefined;
     if (!p) return json(res, 404, { error: "no such pending id" });
-    pending.delete(p.id);
-    clearTimeout(p.timer);
     if (url.pathname === "/deny") {
-      reserved.delete(p.id);
-      audit("approval_denied", { id: p.id, agentId: p.agentId });
-      p.resolve({ denied: "denied by operator" });
+      closePending(p, "approval_denied", "denied by operator");
       return json(res, 200, { ok: true });
     }
-    // The policy that governs is the one in force now, not the one in force when the request was
-    // queued. Without this, tightening a limit while something waits in the queue leaves a way to
-    // sign past it: approval is a gate inside the policy, not a way around it. An operator who
-    // means to allow it can raise the limit, which is a decision that leaves a trace.
-    let verdict: ReturnType<typeof decide> | undefined;
-    try {
-      verdict = decide(refreshPolicy(), ledgerExcluding(p.id), {
-        agentId: p.agentId,
-        payTo: p.input.payTo,
-        asset: p.input.asset,
-        amount: BigInt(p.input.amount),
-        reason: p.reason,
-        assetTransferMethod: typeof p.input.extra?.assetTransferMethod === "string" ? p.input.extra.assetTransferMethod : undefined,
-        resource: p.resource,
-      });
-    } catch (e) {
-      verdict = { verdict: "deny", rule: "policy_unreadable", detail: String(e instanceof Error ? e.message : e) };
-    }
-    if (verdict.verdict === "deny") {
-      reserved.delete(p.id);
-      audit("approval_stale", { id: p.id, agentId: p.agentId, rule: verdict.rule, detail: verdict.detail });
-      p.resolve({ denied: `the policy no longer allows this: ${verdict.rule}` });
+    // Under the agent's lock, like any other decision: the re-check and the signature it admits
+    // must see one ledger, or a payment for the same agent could land between them.
+    const outcome = await withAgentLock(p.agentId, async () => {
+      // A caller that left while this was on its way to the lock has already been closed out.
+      if (!pending.has(p.id)) return { kind: "gone" as const };
+      // The policy that governs is the one in force now, not the one in force when the request was
+      // queued. Without this, tightening a limit while something waits in the queue leaves a way to
+      // sign past it: approval is a gate inside the policy, not a way around it. An operator who
+      // means to allow it can raise the limit, which is a decision that leaves a trace.
+      let verdict: ReturnType<typeof decide>;
+      try {
+        verdict = decide(refreshPolicy(), ledgerExcluding(p.id), {
+          agentId: p.agentId,
+          payTo: p.input.payTo,
+          asset: p.input.asset,
+          amount: BigInt(p.input.amount),
+          reason: p.reason,
+          assetTransferMethod: typeof p.input.extra?.assetTransferMethod === "string" ? p.input.extra.assetTransferMethod : undefined,
+          resource: p.resource,
+        });
+      } catch (e) {
+        verdict = { verdict: "deny", rule: "policy_unreadable", detail: String(e instanceof Error ? e.message : e) };
+      }
+      if (verdict.verdict === "deny") {
+        closePending(p, "approval_stale", `the policy no longer allows this: ${verdict.rule}`, { rule: verdict.rule, detail: verdict.detail });
+        return { kind: "stale" as const, verdict };
+      }
+      // Off the queue before signing, so a second approve of the same id finds nothing; the
+      // reservation stays until the signature has recorded the real spend, then goes.
+      pending.delete(p.id);
+      clearTimeout(p.timer);
+      try {
+        const out = await sign(p.agentId, p.reason, p.input);
+        reserved.delete(p.id);
+        audit("approved", { id: p.id, agentId: p.agentId });
+        p.resolve(out);
+        return { kind: "signed" as const, out };
+      } catch (e) {
+        reserved.delete(p.id);
+        audit("approval_sign_error", { id: p.id, agentId: p.agentId, error: String(e) });
+        p.resolve({ denied: `sign failed: ${String(e)}` });
+        return { kind: "error" as const, error: e };
+      }
+    });
+    if (outcome.kind === "gone") return json(res, 404, { error: "no such pending id", detail: "the caller stopped waiting before it was approved" });
+    if (outcome.kind === "stale")
       return json(res, 409, {
         error: "policy_changed",
-        rule: verdict.rule,
-        detail: `${verdict.detail}. The policy changed while this was queued; raise the limit if you mean to allow it.`,
+        rule: outcome.verdict.rule,
+        detail: `${outcome.verdict.detail}. The policy changed while this was queued; raise the limit if you mean to allow it.`,
       });
-    }
-
-    try {
-      // Drop the reservation only after signing has recorded the real spend.
-      const out = await withAgentLock(p.agentId, () => sign(p.agentId, p.reason, p.input));
-      reserved.delete(p.id);
-      audit("approved", { id: p.id, agentId: p.agentId });
-      p.resolve(out);
-      return json(res, 200, { ok: true, nonce: out.nonce });
-    } catch (e) {
-      reserved.delete(p.id);
-      audit("approval_sign_error", { id: p.id, agentId: p.agentId, error: String(e) });
-      p.resolve({ denied: `sign failed: ${String(e)}` });
-      return json(res, 500, { error: String(e) });
-    }
+    if (outcome.kind === "error") return json(res, 500, { error: String(outcome.error) });
+    return json(res, 200, { ok: true, nonce: outcome.out.nonce });
   }
   json(res, 404, { error: "not found" });
 }
@@ -763,7 +857,7 @@ function metrics(): string {
   };
   const one = (name: string, help: string, type: "counter" | "gauge", value: string | number) =>
     series(name, help, type, [["", value]]);
-  const esc = (v: string) => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const esc = (v: string) => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
 
   one("ada_wallet_up", "1 when signerd is serving.", "gauge", 1);
   series("ada_wallet_audit_events_total", "Audit records written since this process started, by event.", "counter",
@@ -972,8 +1066,10 @@ function readBody(req: IncomingMessage) {
     req.on("data", c => {
       size += c.length;
       if (size > MAX_BODY_BYTES) {
-        req.destroy();
-        reject(new Error(`request body exceeds ${MAX_BODY_BYTES} bytes`));
+        // Not destroyed here: the 413 has to reach the caller, and the socket closes with it.
+        req.removeAllListeners("data");
+        req.resume();
+        reject(new BadRequest(413, `request body exceeds ${MAX_BODY_BYTES} bytes`));
         return;
       }
       s += c;
@@ -1004,14 +1100,7 @@ function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.error(`signerd: ${signal} received, shutting down`);
-  server.close();
-  for (const p of pending.values()) {
-    clearTimeout(p.timer);
-    reserved.delete(p.id);
-    audit("shutdown_denied", { id: p.id, agentId: p.agentId, reason: p.reason });
-    p.resolve({ denied: "signerd shut down before this request was approved" });
-  }
-  pending.clear();
+  for (const p of [...pending.values()]) closePending(p, "shutdown_denied", "signerd shut down before this request was approved");
   let finished = false;
   const finish = () => {
     if (finished) return;
@@ -1023,8 +1112,8 @@ function shutdown(signal: string) {
   // Let the verdicts just handed to waiting callers reach the wire, and any signature in progress
   // finish — neither allowed to hang the shutdown.
   server.close(() => void withWalletLock(async () => {}).then(finish));
-  server.closeIdleConnections?.();
-  setTimeout(finish, 10_000);
+  server.closeIdleConnections();
+  setTimeout(finish, 10_000).unref();
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -1044,6 +1133,6 @@ server.listen(PORT, "127.0.0.1", () => {
   console.error(`agents: ${Object.keys(policy.agents).join(", ")}`);
   console.error(`key:    ${KEYSTORE_FILE ? "encrypted keystore" : "plaintext mnemonic"}`);
   for (const note of permissionNotes) console.error(`  ${note.level === "warn" ? "WARNING " : ""}${note.detail}`);
-  console.error(`neither the policy nor the audit file may be writable by the agent's user`);
+  console.error(`none of the policy, audit or ledger files may be writable by the agent's user`);
   console.error(`run "walletctl preflight" before pointing this at real money`);
 });

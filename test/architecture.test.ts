@@ -7,12 +7,12 @@ import { fileURLToPath } from "node:url";
 const SRC = resolve(dirname(fileURLToPath(import.meta.url)), "../src");
 
 /**
- * Five files say "Pure logic: no chain, no keys, no I/O" in their headers, and nothing made that
+ * Six files say "Pure logic: no chain, no keys, no I/O" in their headers, and nothing made that
  * true beyond nobody having broken it yet. These are the modules whose testability, and whose
  * usefulness as the place the rules live, depends on it — a `readFileSync` in policy.ts would not
  * fail anything, it would just quietly move a decision out of reach of the unit suite.
  */
-const PURE = ["policy.ts", "serialize.ts", "keystore.ts", "replay.ts", "verifyTx.ts"];
+const PURE = ["policy.ts", "serialize.ts", "keystore.ts", "replay.ts", "verifyTx.ts", "network.ts"];
 /** Computation, not I/O. Everything else a pure module needs, it should be given. */
 const ALLOWED = new Set(["node:crypto"]);
 

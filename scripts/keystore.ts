@@ -15,6 +15,7 @@ import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { toClientCardanoSigner } from "@x402/cardano";
 import { encryptMnemonic, decryptMnemonic, assertKeystore } from "../src/keystore.js";
+import { koiosBaseUrl } from "../src/network.js";
 
 const argv = process.argv.slice(2);
 const command = argv[0];
@@ -23,10 +24,12 @@ const flag = (name: string) => {
   return i === -1 ? undefined : argv[i + 1];
 };
 
-const die = (msg: string): never => {
+// A declaration rather than a const arrow: TypeScript only treats a call as `never` (so that the
+// code after it is known not to run) when the callee's type is declared, not inferred.
+function die(msg: string): never {
   console.error(`keystore: ${msg.replace(/^keystore: /, "")}`);
   process.exit(1);
-};
+}
 
 const NETWORK = process.env.CARDANO_NETWORK ?? "cardano:preprod";
 
@@ -41,7 +44,7 @@ function addressOf(mnemonic: string): string {
     return toClientCardanoSigner({
       mnemonic,
       network: NETWORK,
-      provider: { koios: { baseUrl: NETWORK.endsWith("mainnet") ? "https://api.koios.rest/api/v1" : "https://preprod.koios.rest/api/v1" } },
+      provider: { koios: { baseUrl: koiosBaseUrl(NETWORK) } },
     }).getAddress();
   } catch (e) {
     die(`that is not a usable mnemonic: ${e instanceof Error ? e.message : e}`);

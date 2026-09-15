@@ -43,8 +43,16 @@ export async function createGatedSigner(cfg: GatedSignerConfig): Promise<ClientC
         method: "POST",
         headers,
         body: JSON.stringify({ agentId: cfg.agentId, reason: cfg.reason(), resource: cfg.resource?.(), input }),
+      }).catch(e => {
+        // A queued payment holds this request open until a human answers, and Node's fetch stops
+        // waiting for headers after 300s. signerd withdraws the request when the connection drops,
+        // so nothing was signed — but "fetch failed" would not tell the agent that.
+        const code = (e as { cause?: { code?: string } })?.cause?.code;
+        if (code === "UND_ERR_HEADERS_TIMEOUT")
+          throw new Error("signerd did not answer within the client's 300s wait; a payment queued for approval was withdrawn unsigned, so ask again once it can be approved promptly");
+        throw new Error(`signerd is not answering at ${cfg.signerdUrl}: ${e instanceof Error ? e.message : e}`);
       });
-      const data = (await r.json()) as Record<string, string>;
+      const data = (await r.json().catch(() => ({}))) as Record<string, string>;
       if (!r.ok) {
         const denied = new PolicyDenied(data.rule ?? data.error ?? "error", data.detail ?? "", data.id);
         cfg.onDenied?.(denied);

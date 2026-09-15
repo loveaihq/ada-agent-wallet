@@ -77,7 +77,7 @@ export interface PaymentRequest {
 }
 
 export type Decision =
-  | { verdict: "allow" }
+  | { verdict: "allow"; rule?: undefined; detail?: undefined }
   | { verdict: "needs_approval"; rule: string; detail: string }
   | { verdict: "deny"; rule: string; detail: string };
 
@@ -185,7 +185,7 @@ export function decide(policy: Policy, ledger: readonly SpendRecord[], req: Paym
   const ap = policy.agents[req.agentId];
   if (!ap) return { verdict: "deny", rule: "unknown_agent", detail: `no policy for agent "${req.agentId}"` };
   if (req.amount <= 0n) return { verdict: "deny", rule: "amount", detail: "amount must be positive" };
-  if (!req.reason || req.reason.trim().length < 3)
+  if (typeof req.reason !== "string" || req.reason.trim().length < 3)
     return { verdict: "deny", rule: "reason", detail: "a reason is required for the audit log" };
 
   const method = req.assetTransferMethod ?? "default";

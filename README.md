@@ -37,18 +37,22 @@ npm install
 cp policy.example.json policy.json            # edit the limits; amounts are in the asset's smallest unit
 export SIGNERD_TOKEN=$(openssl rand -hex 16)
 export WALLET_MNEMONIC_FILE=~/.ada-agent-wallet/mnemonic   # 24 words, chmod 600
-export CARDANO_NETWORK=cardano:preprod                     # Koios, no API key needed
+export CARDANO_NETWORK=cardano:preprod                     # or cardano:preview; Koios, no API key needed
 npm run signerd                                            # prints the address → fund it from the preprod faucet
 ```
 The policy file declares the network it was written for, and signerd refuses to start on a mismatch.
 A plaintext mnemonic is fine for a faucet wallet; for anything else see "The key" below.
 
-**Where the policy and audit files live is part of the security model.** The daily cap is enforced
-from a ledger rebuilt by replaying `audit.jsonl`, and the limits themselves are re-read from
-`policy.json` on every decision. An agent that can write either file raises its own budget without
-going near the key: deleting the audit file alone resets the day's spend to zero. Put both where
-the agent's user cannot write, and run signerd as a different user. signerd prints both absolute
-paths at startup so this is checkable rather than assumed.
+**Where the policy, audit and ledger files live is part of the security model.** The daily cap is
+computed from `ledger.json`, rebuilt where needed by replaying `audit.jsonl`, and the limits
+themselves are re-read from `policy.json` on every decision. An agent that can write any of the
+three raises its own budget without going near the key. Put all of them where the agent's user
+cannot write, and run signerd as a different user. signerd prints the absolute paths at startup so
+this is checkable rather than assumed.
+
+The example policy's `allowedResources` names the local dev endpoint (`http://127.0.0.1:7401/*`)
+alongside a placeholder, so the round-trip below works from a fresh copy; drop the dev entry before
+the file governs anything real.
 
 Two defaults in `policy.example.json` are deliberately conservative and worth a look before you
 widen them: `allowedPayees: ["*"]` accepts any payee, which is only reasonable while the agent is
@@ -63,6 +67,13 @@ MCP registration (Claude Desktop / Code / Cowork):
   "env": { "SIGNERD_TOKEN": "<same token>", "AGENT_ID": "default" } } } }
 ```
 Human approval: `npm run walletctl -- pending` → `npm run walletctl -- approve <id>`.
+
+A queued payment holds the agent's `/sign` request open while the human decides, and that request
+is the only place the signed transaction can go. Node's `fetch` stops waiting for a response after
+five minutes; when the caller's connection drops, signerd withdraws the request from the queue,
+gives the budget back and logs `pending_abandoned`, so an approval that comes after that signs
+nothing rather than recording a spend for a transaction nobody will broadcast. Approve within five
+minutes, or expect the agent to have to ask again.
 
 ## Dev stack (a whole 402 round-trip, locally)
 `dev/` runs the seller side so the loop can be closed without an external endpoint. Three shells:
@@ -110,8 +121,10 @@ facilitator client 115s so the wait is not cut off one level up. Anything talkin
 the same budget chain, or Blockfrost.
 
 ## Verified
-- `npm test`: 62 unit tests over the policy engine, the startup replay, the locks, the keystore and
-  the signed-transaction check, plus the vendor checksums, which gate the rest. None needs a chain.
+- `npm test`: 66 unit tests over the policy engine, the startup replay, the locks, the keystore, the
+  network table and the signed-transaction check, plus the vendor checksums, which gate the rest.
+  None needs a chain. `npm run typecheck` covers `dev/`, `test/` and `scripts/` too, which `tsx`
+  runs without checking.
 - the modules that say "no chain, no keys, no I/O" are checked to import nothing that would make
   that false, and to still say it — the first run of that check found one that had stopped
 - signerd asks the socket what address it bound and refuses anything but the loopback, so the one
@@ -165,10 +178,10 @@ against 10,000 faucet tADA says exactly the same thing to a wallet holding real 
 on each choice that is yours rather than a bug — a payee allowlist of `["*"]`, a missing resource
 allowlist, no approval threshold, masumi enabled, Koios as the provider.
 
-On mainnet signerd additionally refuses to start when the policy or audit file is group- or
+On mainnet signerd additionally refuses to start when the policy, audit or ledger file is group- or
 world-writable, because "the agent cannot raise its own limits" stops being true the moment the
-agent's user can write either one. On Windows the mode bits do not carry that meaning, so the check
-reports that it could not run rather than passing: verify the ACL yourself.
+agent's user can write any of them. On Windows the mode bits do not carry that meaning, so the
+check reports that it could not run rather than passing: verify the ACL yourself.
 
 `allowedResources` bounds which URLs an agent may buy from. It is checked against a URL the agent
 process reports, because the reference `@x402/cardano` client does not pass the resource through to

@@ -6,6 +6,7 @@
   "private": true,
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.check.json",
     "test": "node --test --import tsx test/*.test.ts",
     "signerd": "tsx src/signerd.ts",
     "mcp": "tsx src/mcp.ts",

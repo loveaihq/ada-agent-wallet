@@ -28,7 +28,13 @@ const req = (over: Partial<Parameters<typeof decide>[2]> = {}) => ({
 
 test("allow within all limits", () => assert.equal(decide(policy, [], req()).verdict, "allow"));
 test("unknown agent denied", () => assert.equal(decide(policy, [], req({ agentId: "nope" })).rule, "unknown_agent"));
-test("reason required", () => assert.equal(decide(policy, [], req({ reason: "" })).rule, "reason"));
+test("reason required", () => {
+  assert.equal(decide(policy, [], req({ reason: "" })).rule, "reason");
+  assert.equal(decide(policy, [], req({ reason: "  " })).rule, "reason");
+  // A number or an object is what an untyped caller sends; `.trim` on it was a crash, not a denial.
+  assert.equal(decide(policy, [], req({ reason: 42 as unknown as string })).rule, "reason");
+  assert.equal(decide(policy, [], req({ reason: undefined as unknown as string })).rule, "reason");
+});
 test("asset not listed denied", () => assert.equal(decide(policy, [], req({ asset: "0".repeat(56) + ".00" })).rule, "asset"));
 test("payee allowlist", () => {
   assert.equal(decide(policy, [], req({ payTo: "addr1other" })).rule, "payee");

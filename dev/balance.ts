@@ -1,5 +1,7 @@
-/** Prints the buyer and seller preprod balances, so you can tell when the faucet has landed. */
-const KOIOS = process.env.KOIOS_BASE_URL ?? "https://preprod.koios.rest/api/v1";
+/** Prints the buyer and seller balances, so you can tell when the faucet has landed. */
+import { koiosBaseUrl } from "../src/network.js";
+
+const KOIOS = process.env.KOIOS_BASE_URL ?? koiosBaseUrl(process.env.CARDANO_NETWORK ?? "cardano:preprod");
 
 const addrs = [
   ["buyer (agent wallet)", process.env.BUYER_ADDRESS],

@@ -56,7 +56,10 @@ const server = new McpServer({ name: "ada-agent-wallet", version: "0.1.0" });
 
 server.tool("wallet_status", "Wallet address, per-agent remaining budget (rolling 24h), pending approvals.", {}, async () => {
   try {
-    const s = await fetch(`${SIGNERD_URL}/status`, { headers }).then(r => r.json());
+    const r = await fetch(`${SIGNERD_URL}/status`, { headers });
+    const s = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+    // A 401 or a 503 body is not a status; an agent told "here is your wallet" would read it as one.
+    if (!r.ok) return { content: [{ type: "text", text: `wallet unavailable: signerd returned ${r.status} ${JSON.stringify(s)}` }], isError: true };
     return { content: [{ type: "text", text: JSON.stringify({ agentId: AGENT_ID, ...s }, null, 2) }] };
   } catch (e) {
     // An agent can act on "the daemon is not running"; it cannot act on a fetch stack trace.

@@ -31,7 +31,7 @@ function derive(passphrase: string, salt: Buffer, params: Keystore["kdfparams"])
   });
 }
 
-export function encryptMnemonic(mnemonic: string, passphrase: string, kdf = DEFAULT_KDF): Keystore {
+export function encryptMnemonic(mnemonic: string, passphrase: string, kdf: Omit<Keystore["kdfparams"], "salt"> = DEFAULT_KDF): Keystore {
   if (!passphrase) throw new Error("keystore: a passphrase is required");
   const salt = randomBytes(32);
   const iv = randomBytes(12);

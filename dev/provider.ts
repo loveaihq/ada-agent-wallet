@@ -1,5 +1,6 @@
 /** Shared Koios/Blockfrost provider config for the dev x402 stack. */
 import type { CardanoProviderConfig } from "@x402/cardano";
+import { blockfrostBaseUrl, koiosBaseUrl } from "../src/network.js";
 
 /**
  * `requestTimeoutMs` bounds every provider call, `awaitTx` included. Without an evidence hook
@@ -9,21 +10,14 @@ import type { CardanoProviderConfig } from "@x402/cardano";
  * pass a budget that covers one; the ceiling the SDK accepts is 120_000.
  */
 export function cardanoProvider(network: string, requestTimeoutMs?: number): CardanoProviderConfig {
-  const preprod = network.endsWith("preprod");
   if (process.env.BLOCKFROST_PROJECT_ID) {
     return {
-      blockfrost: {
-        baseUrl: `https://cardano-${preprod ? "preprod" : "mainnet"}.blockfrost.io/api/v0`,
-        projectId: process.env.BLOCKFROST_PROJECT_ID,
-      },
+      blockfrost: { baseUrl: blockfrostBaseUrl(network), projectId: process.env.BLOCKFROST_PROJECT_ID },
       ...(requestTimeoutMs ? { requestTimeoutMs } : {}),
     };
   }
   return {
-    koios: {
-      baseUrl: preprod ? "https://preprod.koios.rest/api/v1" : "https://api.koios.rest/api/v1",
-      token: process.env.KOIOS_TOKEN,
-    },
+    koios: { baseUrl: koiosBaseUrl(network), token: process.env.KOIOS_TOKEN },
     ...(requestTimeoutMs ? { requestTimeoutMs } : {}),
   };
 }
