@@ -38,13 +38,27 @@
  *   NONCE_HOLD_SECONDS              how long a handed-out UTXO is treated as in flight
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { readFileSync, writeFileSync, renameSync, existsSync, statSync, openSync, writeSync, fsyncSync, closeSync, createReadStream } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  existsSync,
+  statSync,
+  openSync,
+  readSync,
+  writeSync,
+  fsyncSync,
+  ftruncateSync,
+  closeSync,
+  createReadStream,
+} from "node:fs";
 import { createInterface } from "node:readline";
 import { resolve as resolvePath, dirname } from "node:path";
-import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { toClientCardanoSigner, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
 import { decide, parsePolicy, remaining, type Policy, type SpendRecord } from "./policy.js";
 import { createKeyedLock, createLock } from "./serialize.js";
+import { replayAudit, sha256, type Checkpoint } from "./replay.js";
 import { decryptMnemonic, assertKeystore } from "./keystore.js";
 
 const PORT = Number(process.env.SIGNERD_PORT ?? 7402);
@@ -179,20 +193,12 @@ if (PASSPHRASE_FILE) checkFileMode("passphrase", PASSPHRASE_FILE);
  * checkpoint records where in that chain it was written, so each can detect the other's loss:
  * `npm run integrity` is the executable version of what that does and does not cover.
  */
-interface Checkpoint {
-  version: 1;
-  seq: number;
-  hash: string;
-  updatedAt: number;
-  spends: Array<{ ts: number; agentId: string; asset: string; amount: string }>;
-}
-
-const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 const ledger: SpendRecord[] = [];
 let auditSeq = 0;
 let auditPrevHash = "";
 let replayedSkipped = 0;
 const openPending: Array<{ id: string; agentId: string; reason?: string }> = [];
+const AUDIT_TAIL_BYTES = 1 << 16;
 
 function readCheckpoint(): Checkpoint | undefined {
   if (!existsSync(LEDGER_FILE)) return undefined;
@@ -219,93 +225,60 @@ function writeCheckpoint() {
   renameSync(tmp, LEDGER_FILE);
 }
 
+/**
+ * A crash during an append leaves a line with no terminating newline, and the next record would be
+ * written onto the end of it — merging two records into one line that never parses again, so a
+ * committed spend becomes invisible to every later replay. The partial line was never completed,
+ * so cutting it off loses nothing that was written.
+ */
+function repairTornAppend() {
+  if (!existsSync(AUDIT_FILE)) return;
+  const size = statSync(AUDIT_FILE).size;
+  if (size === 0) return;
+  const fd = openSync(AUDIT_FILE, "r+");
+  try {
+    const want = Math.min(size, AUDIT_TAIL_BYTES);
+    const tail = Buffer.alloc(want);
+    const read = readSync(fd, tail, 0, want, size - want);
+    if (read === 0 || tail[read - 1] === 0x0a) return;
+    const lastNewline = tail.subarray(0, read).lastIndexOf(0x0a);
+    if (lastNewline === -1 && size > want) return; // a single line longer than the tail: leave it
+    const keep = lastNewline === -1 ? 0 : size - read + lastNewline + 1;
+    ftruncateSync(fd, keep);
+    console.error(`signerd: audit ended mid-record; dropped ${size - keep} unterminated byte(s)`);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+repairTornAppend();
 {
   const checkpoint = readCheckpoint();
-  const cutoff = Date.now() - LEDGER_WINDOW_MS;
-  const afterCheckpoint: SpendRecord[] = [];
-  const terminated = new Set<string>();
-  const pendingSeen = new Map<string, { id: string; agentId: string; reason?: string }>();
-  let sawCheckpointRecord = checkpoint === undefined || checkpoint.seq === 0;
-  let auditHasRecords = false;
-  let chainBroken: number | undefined;
-  let malformedTail: number | undefined;
+  const lines = existsSync(AUDIT_FILE)
+    ? createInterface({ input: createReadStream(AUDIT_FILE, "utf8"), crlfDelay: Infinity })
+    : [];
+  const replay = await replayAudit(lines, { checkpoint, windowMs: LEDGER_WINDOW_MS });
 
-  if (existsSync(AUDIT_FILE)) {
-    const lines = createInterface({ input: createReadStream(AUDIT_FILE, "utf8"), crlfDelay: Infinity });
-    let lineNo = 0;
-    for await (const line of lines) {
-      lineNo++;
-      if (!line.trim()) continue;
-      // Tolerated only as the last line, which is what a crash mid-append looks like.
-      if (malformedTail !== undefined) fail(`audit ${resolvePath(AUDIT_FILE)} line ${malformedTail} is malformed`);
-      let e: Record<string, unknown>;
-      try {
-        e = JSON.parse(line);
-      } catch {
-        malformedTail = lineNo;
-        continue;
-      }
-      auditHasRecords = true;
-      // Records predating the chain carry no seq and no prev, so they are simply not verified.
-      const seq = typeof e.seq === "number" ? e.seq : undefined;
-      if (seq !== undefined) {
-        if (chainBroken === undefined && typeof e.prev === "string" && e.prev !== auditPrevHash) chainBroken = lineNo;
-        auditSeq = seq;
-      }
-      auditPrevHash = sha256(line);
-      if (checkpoint && seq === checkpoint.seq && auditPrevHash === checkpoint.hash) sawCheckpointRecord = true;
-
-      const event = e.event;
-      // Only recent approvals: one cannot outlive MAX_APPROVAL_SECONDS, so anything older is
-      // settled whatever the log says. Tracking every id ever seen would grow without bound on a
-      // long-lived audit, which is the one thing the 24h window exists to avoid.
-      const recent = typeof e.ts === "number" && e.ts >= cutoff;
-      if (event === "pending") {
-        if (recent) pendingSeen.set(String(e.id), { id: String(e.id), agentId: String(e.agentId), reason: e.reason as string });
-      } else if (
-        event === "approved" ||
-        event === "approval_denied" ||
-        event === "approval_timeout" ||
-        event === "shutdown_denied" ||
-        event === "approval_sign_error" ||
-        event === "pending_abandoned"
-      ) {
-        if (recent) terminated.add(String(e.id));
-      } else if (event === "signed" && typeof e.ts === "number") {
-        if (e.ts < cutoff) replayedSkipped++;
-        // Only what the checkpoint cannot already hold. No seq means it predates the chain, so it
-        // is older than the checkpoint by construction; counting it again inflated spend on every
-        // restart, without bound.
-        else if (checkpoint === undefined || (seq !== undefined && seq > checkpoint.seq))
-          afterCheckpoint.push({ ts: e.ts, agentId: String(e.agentId), asset: String(e.asset), amount: BigInt(String(e.amount)) });
-      }
-    }
-    if (malformedTail !== undefined)
-      console.error(`signerd: audit ends in a truncated record (line ${malformedTail}); ignoring it`);
+  const where = resolvePath(AUDIT_FILE);
+  const escape = "Set ALLOW_UNVERIFIED_AUDIT=1 to start anyway.";
+  if (!ALLOW_UNVERIFIED_AUDIT) {
+    if (replay.malformedAt !== undefined) fail(`audit ${where} line ${replay.malformedAt} is malformed. ${escape}`);
+    if (replay.chainBrokenAt !== undefined)
+      fail(`audit ${where} line ${replay.chainBrokenAt} does not follow the record before it; the log has been rewritten. ${escape}`);
+    if (checkpoint && !replay.sawCheckpoint)
+      fail(
+        `audit ${where} no longer contains record #${checkpoint.seq}, which the ledger checkpoint was written against. ` +
+          `Rotation must keep everything from the last checkpointed record onward. ${escape} Recorded spends come from the checkpoint either way.`,
+      );
   }
-
-  if (chainBroken !== undefined && !ALLOW_UNVERIFIED_AUDIT)
-    fail(`audit ${resolvePath(AUDIT_FILE)} line ${chainBroken} does not follow the record before it; the log has been rewritten`);
-
-  if (checkpoint && !sawCheckpointRecord && !ALLOW_UNVERIFIED_AUDIT)
-    fail(
-      `audit ${resolvePath(AUDIT_FILE)} no longer contains record #${checkpoint.seq}, which the ledger checkpoint was written against. ` +
-        `Rotation must keep everything from the last checkpointed record onward. Set ALLOW_UNVERIFIED_AUDIT=1 if the gap is one you made on purpose; recorded spends come from the checkpoint either way.`,
-    );
-
-  if (checkpoint) {
-    for (const spend of checkpoint.spends) {
-      if (spend.ts >= cutoff) ledger.push({ ts: spend.ts, agentId: spend.agentId, asset: spend.asset, amount: BigInt(spend.amount) });
-    }
-    auditSeq = Math.max(auditSeq, checkpoint.seq);
-  } else if (auditHasRecords) {
+  if (!checkpoint && replay.hasRecords)
     console.error(`signerd: no ledger checkpoint yet; rebuilding the 24h window from the audit log`);
-  }
-  // Anything logged after the checkpoint: a crash between the two.
-  ledger.push(...afterCheckpoint);
-  ledger.sort((a, b) => a.ts - b.ts);
 
-  for (const [id, entry] of pendingSeen) if (!terminated.has(id)) openPending.push(entry);
+  auditSeq = replay.lastSeq;
+  auditPrevHash = replay.lastHash;
+  replayedSkipped = replay.skipped;
+  ledger.push(...replay.spends);
+  openPending.push(...replay.openApprovals);
 }
 
 /** Appended in time order, so what has expired is always a prefix. */
