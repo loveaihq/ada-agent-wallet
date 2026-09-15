@@ -21,7 +21,11 @@
  * the mode bits at startup and refuses to run on mainnet if they are loose.
  *
  * Env:
- *   WALLET_MNEMONIC   24 words (required)   — or WALLET_MNEMONIC_FILE
+ *   WALLET_KEYSTORE_FILE    passphrase-encrypted mnemonic (preferred; see scripts/keystore.mjs)
+ *   WALLET_PASSPHRASE_FILE  where to read its passphrase; otherwise prompted on a terminal
+ *   WALLET_MNEMONIC_FILE    plaintext mnemonic on disk
+ *   WALLET_MNEMONIC         plaintext mnemonic in the environment (worst of the three)
+ *   MAX_HOT_BALANCE_LOVELACE  what this wallet should never exceed; preflight fails without it
  *   CARDANO_NETWORK   cardano:preprod | cardano:mainnet   (default preprod)
  *   BLOCKFROST_PROJECT_ID   optional; without it the daemon uses Koios (free, no key)
  *   KOIOS_TOKEN             optional
@@ -39,11 +43,12 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFileSync, writeFileSync, renameSync, existsSync, statSync, openSync, writeSync, fsyncSync, closeSync, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { resolve as resolvePath } from "node:path";
+import { resolve as resolvePath, dirname } from "node:path";
 import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { toClientCardanoSigner, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
 import { decide, parsePolicy, remaining, type Policy, type SpendRecord } from "./policy.js";
 import { createKeyedLock, createLock } from "./serialize.js";
+import { decryptMnemonic, assertKeystore } from "./keystore.js";
 
 const PORT = Number(process.env.SIGNERD_PORT ?? 7402);
 const TOKEN = process.env.SIGNERD_TOKEN;
@@ -53,6 +58,9 @@ const AUDIT_FILE = process.env.AUDIT_FILE ?? "./audit.jsonl";
 const LEDGER_FILE = process.env.LEDGER_FILE ?? "./ledger.json";
 const ALLOW_UNVERIFIED_AUDIT = process.env.ALLOW_UNVERIFIED_AUDIT === "1";
 const MNEMONIC_FILE = process.env.WALLET_MNEMONIC_FILE;
+const KEYSTORE_FILE = process.env.WALLET_KEYSTORE_FILE;
+const PASSPHRASE_FILE = process.env.WALLET_PASSPHRASE_FILE;
+const MAX_HOT_BALANCE = process.env.MAX_HOT_BALANCE_LOVELACE ? BigInt(process.env.MAX_HOT_BALANCE_LOVELACE) : undefined;
 const IS_MAINNET = NETWORK.endsWith("mainnet");
 const MAX_BODY_BYTES = 1 << 20;
 const MAX_APPROVAL_SECONDS = 900;
@@ -69,9 +77,60 @@ function fail(msg: string): never {
 }
 
 if (!TOKEN) fail("SIGNERD_TOKEN is required");
-const mnemonic =
-  process.env.WALLET_MNEMONIC ?? (MNEMONIC_FILE ? readFileSync(MNEMONIC_FILE, "utf8").trim() : undefined);
-if (!mnemonic) fail("WALLET_MNEMONIC or WALLET_MNEMONIC_FILE is required");
+
+/**
+ * Where the mnemonic comes from, in order of how much it protects.
+ *
+ * WALLET_KEYSTORE_FILE is the one to use: passphrase-encrypted, so a stolen backup or a directory
+ * whose permissions were wrong for a week yields ciphertext. WALLET_MNEMONIC_FILE is plaintext on
+ * disk. WALLET_MNEMONIC is plaintext in the environment, which on most systems means plaintext in
+ * `ps`, in the service manager's state, and in whatever collects your logs.
+ *
+ * None of them helps once signerd is running: a hot wallet holds its key in memory, and that is
+ * what makes it hot. What encryption buys is that reading a file is no longer enough.
+ */
+async function loadMnemonic(): Promise<string> {
+  if (KEYSTORE_FILE) {
+    let keystore: unknown;
+    try {
+      keystore = JSON.parse(readFileSync(KEYSTORE_FILE, "utf8"));
+      assertKeystore(keystore);
+    } catch (e) {
+      fail(`keystore ${resolvePath(KEYSTORE_FILE)}: ${e instanceof Error ? e.message : e}`);
+    }
+    const passphrase = await readPassphrase();
+    try {
+      return decryptMnemonic(keystore as Parameters<typeof decryptMnemonic>[0], passphrase);
+    } catch (e) {
+      fail(String(e instanceof Error ? e.message : e));
+    }
+  }
+  if (process.env.WALLET_MNEMONIC) return process.env.WALLET_MNEMONIC.trim();
+  if (MNEMONIC_FILE) return readFileSync(MNEMONIC_FILE, "utf8").trim();
+  fail("one of WALLET_KEYSTORE_FILE, WALLET_MNEMONIC_FILE or WALLET_MNEMONIC is required");
+}
+
+async function readPassphrase(): Promise<string> {
+  // Deliberately not an environment variable: the point of the keystore is that reading one thing
+  // is not enough, and an env var is readable by anything that can read the process.
+  if (PASSPHRASE_FILE) return readFileSync(PASSPHRASE_FILE, "utf8").replace(/\r?\n$/, "");
+  if (!process.stdin.isTTY)
+    fail("keystore passphrase: set WALLET_PASSPHRASE_FILE, or start signerd attached to a terminal");
+  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  const muted = (rl as unknown as { output: NodeJS.WriteStream & { muted?: boolean } }).output;
+  const write = muted.write.bind(muted);
+  (muted as unknown as { write: (chunk: string) => boolean }).write = (chunk: string) =>
+    muted.muted ? true : write(chunk);
+  process.stdout.write("keystore passphrase: ");
+  muted.muted = true;
+  const answer = await new Promise<string>(resolve => rl.question("", resolve));
+  muted.muted = false;
+  process.stdout.write("\n");
+  rl.close();
+  return answer;
+}
+
+const mnemonic = await loadMnemonic();
 
 /**
  * Mode bits on the files that decide what this wallet may spend.
@@ -143,6 +202,8 @@ try {
 checkFileMode("policy", POLICY_FILE);
 checkFileMode("audit", AUDIT_FILE);
 if (MNEMONIC_FILE) checkFileMode("mnemonic", MNEMONIC_FILE);
+if (KEYSTORE_FILE) checkFileMode("keystore", KEYSTORE_FILE);
+if (PASSPHRASE_FILE) checkFileMode("passphrase", PASSPHRASE_FILE);
 
 /**
  * The spend ledger and the audit log are two different things, and conflating them was a hole.
@@ -339,7 +400,7 @@ if (openPending.length)
 writeCheckpoint();
 
 const signer: ClientCardanoSigner = toClientCardanoSigner({
-  mnemonic: mnemonic!,
+  mnemonic,
   network: NETWORK,
   provider: providerConfig(),
   // A masumi escrow locks collateral derived from the datum size, and the datum carries the
@@ -356,6 +417,49 @@ function providerConfig() {
   return { koios: { baseUrl: preprod ? "https://preprod.koios.rest/api/v1" : "https://api.koios.rest/api/v1", token: process.env.KOIOS_TOKEN } };
 }
 const address = signer.getAddress();
+
+/**
+ * What the wallet is holding, refreshed in the background.
+ *
+ * The daily cap bounds an agent; it does not bound someone who has the key. What bounds them is
+ * how much is in the wallet, which is why MAX_HOT_BALANCE_LOVELACE exists and why preflight fails
+ * on mainnet without one. Cached rather than fetched on demand so a metrics scrape never waits on
+ * a provider, and never turns into one request per scrape against a rate-limited free service.
+ */
+let hotBalance: bigint | undefined;
+let hotBalanceAt = 0;
+let hotBalanceError: string | undefined;
+
+async function refreshBalance() {
+  try {
+    const preprod = NETWORK.endsWith("preprod");
+    let lovelace: bigint;
+    if (process.env.BLOCKFROST_PROJECT_ID) {
+      const r = await fetch(`https://cardano-${preprod ? "preprod" : "mainnet"}.blockfrost.io/api/v0/addresses/${address}`, {
+        headers: { project_id: process.env.BLOCKFROST_PROJECT_ID },
+      });
+      if (!r.ok) throw new Error(`blockfrost ${r.status}`);
+      const body = (await r.json()) as { amount?: Array<{ unit: string; quantity: string }> };
+      lovelace = BigInt(body.amount?.find(a => a.unit === "lovelace")?.quantity ?? "0");
+    } else {
+      const r = await fetch(`${preprod ? "https://preprod.koios.rest" : "https://api.koios.rest"}/api/v1/address_info`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(process.env.KOIOS_TOKEN ? { authorization: `Bearer ${process.env.KOIOS_TOKEN}` } : {}) },
+        body: JSON.stringify({ _addresses: [address] }),
+      });
+      if (!r.ok) throw new Error(`koios ${r.status}`);
+      const rows = (await r.json()) as Array<{ balance?: string }>;
+      lovelace = BigInt(rows[0]?.balance ?? "0");
+    }
+    hotBalance = lovelace;
+    hotBalanceAt = Date.now();
+    hotBalanceError = undefined;
+  } catch (e) {
+    hotBalanceError = String(e instanceof Error ? e.message : e);
+  }
+}
+void refreshBalance();
+setInterval(refreshBalance, 60_000).unref();
 
 /**
  * Two different things need ordering, so there are two locks.
@@ -598,6 +702,15 @@ function metrics(): string {
   emit("ada_wallet_audit_seq", "Sequence number of the last audit record.", "gauge", [["", auditSeq]]);
   emit("ada_wallet_pending_approvals", "Payments waiting on a human right now.", "gauge", [["", pending.size]]);
   emit("ada_wallet_inflight_utxos", "UTXOs committed to a handed-out payment that has not settled.", "gauge", [["", inflightNonces.size]]);
+  if (hotBalance !== undefined) {
+    emit("ada_wallet_balance_lovelace", "Lovelace held by the wallet, as of the last refresh.", "gauge", [["", hotBalance.toString()]]);
+    emit("ada_wallet_balance_age_seconds", "Seconds since the balance was last refreshed.", "gauge", [["", Math.round((Date.now() - hotBalanceAt) / 1000)]]);
+  }
+  if (MAX_HOT_BALANCE !== undefined) {
+    emit("ada_wallet_balance_ceiling_lovelace", "Configured ceiling on what this hot wallet should hold.", "gauge", [["", MAX_HOT_BALANCE.toString()]]);
+    emit("ada_wallet_balance_over_ceiling", "1 when the wallet holds more than the configured ceiling.", "gauge",
+      [["", hotBalance !== undefined && hotBalance > MAX_HOT_BALANCE ? 1 : 0]]);
+  }
 
   let current: Policy | undefined;
   try {
@@ -650,6 +763,30 @@ function preflight() {
 
   for (const note of permissionNotes) {
     add(note.startsWith("WARNING") ? "warn" : "ok", "file permissions", note.replace(/^WARNING /, ""));
+  }
+
+  add(
+    KEYSTORE_FILE ? "ok" : IS_MAINNET ? "fail" : "warn",
+    "key at rest",
+    KEYSTORE_FILE
+      ? `passphrase-encrypted keystore (${resolvePath(KEYSTORE_FILE)})`
+      : process.env.WALLET_MNEMONIC
+        ? "WALLET_MNEMONIC: the mnemonic is in the environment, readable by anything that can read this process"
+        : "WALLET_MNEMONIC_FILE: the mnemonic is plaintext on disk; anyone who can read the file has the wallet",
+  );
+  if (KEYSTORE_FILE && PASSPHRASE_FILE && dirname(resolvePath(KEYSTORE_FILE)) === dirname(resolvePath(PASSPHRASE_FILE)))
+    add("warn", "keystore passphrase", "the passphrase file sits in the same directory as the keystore, so one directory still yields the wallet");
+  else if (KEYSTORE_FILE)
+    add("ok", "keystore passphrase", PASSPHRASE_FILE ? resolvePath(PASSPHRASE_FILE) : "prompted on the terminal at startup");
+
+  if (MAX_HOT_BALANCE === undefined) {
+    add(IS_MAINNET ? "fail" : "warn", "hot wallet ceiling",
+      "MAX_HOT_BALANCE_LOVELACE is unset. The daily cap bounds an agent; nothing here bounds what someone with the key can take, except how much is in the wallet");
+  } else if (hotBalance === undefined) {
+    add("warn", "hot wallet ceiling", `ceiling ${MAX_HOT_BALANCE} lovelace, but the balance could not be read${hotBalanceError ? ` (${hotBalanceError})` : ""}`);
+  } else {
+    add(hotBalance > MAX_HOT_BALANCE ? (IS_MAINNET ? "fail" : "warn") : "ok", "hot wallet ceiling",
+      `holding ${hotBalance} of a ${MAX_HOT_BALANCE} lovelace ceiling`);
   }
 
   const cp = existsSync(LEDGER_FILE);
@@ -769,6 +906,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.error(`audit:  ${resolvePath(AUDIT_FILE)}  (chain at #${auditSeq}, ${replayedSkipped} records older than the window)`);
   console.error(`ledger: ${resolvePath(LEDGER_FILE)}  (${ledger.length} spends inside the 24h window)`);
   console.error(`agents: ${Object.keys(policy.agents).join(", ")}`);
+  console.error(`key:    ${KEYSTORE_FILE ? "encrypted keystore" : "plaintext mnemonic"}`);
   for (const note of permissionNotes) console.error(`  ${note}`);
   console.error(`neither the policy nor the audit file may be writable by the agent's user`);
   console.error(`run "walletctl preflight" before pointing this at real money`);

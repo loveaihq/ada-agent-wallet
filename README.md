@@ -74,6 +74,8 @@ npm run balance             # BUYER_ADDRESS / SELLER_ADDRESS balances, to see th
 npm run concurrency         # regression check for the spend-cap race (spends nothing)
 npm run walletctl -- preflight   # deployment checks; see "Before mainnet"
 npm run verify:vendor            # sha256 of vendor/; runs automatically before npm test
+npm run integrity                # proves no single deletion resets the spend cap
+npm run keystore -- create ...   # encrypt the mnemonic at rest
 ```
 
 `npm run concurrency` starts a throwaway signerd with a cap that fits one payment, fires several
@@ -139,6 +141,29 @@ the signer — so it constrains an agent that is running this code and being ste
 prompt-injection case, and not one whose process has been replaced. `allowedPayees` is the control
 that binds the transaction itself; treat the resource list as the layer above it.
 
+### The key
+```
+npm run keystore -- create --mnemonic-file ~/.ada-agent-wallet/mnemonic --out ~/.ada-agent-wallet/keystore.json
+```
+scrypt and AES-256-GCM, asked for the passphrase twice, proved to round-trip before anything is
+written. Point signerd at it with `WALLET_KEYSTORE_FILE`, then delete the plaintext mnemonic — once
+you are certain the passphrase is recoverable, because at that point the keystore is the wallet.
+
+The passphrase comes from `WALLET_PASSPHRASE_FILE`, or a terminal prompt when there is one.
+Deliberately not an environment variable: the point of a keystore is that reading one thing is not
+enough, and an env var is readable by anything that can read the process. And if the passphrase
+file lives next to the keystore, preflight says so — encryption with the key taped to the box is
+worth about what it sounds like.
+
+What this buys: reading a file is no longer enough. A stolen backup, a disk image, a stray copy in
+a repository, a directory whose permissions were wrong for a week — all of those now yield
+ciphertext. What it does not buy: anything at all against a compromised signerd, which holds the
+decrypted mnemonic in memory for as long as it runs. That is what a hot wallet is.
+
+Which is why `MAX_HOT_BALANCE_LOVELACE` exists and why preflight fails on mainnet without it. The
+daily cap bounds an agent. Nothing bounds someone who has the key, except how much is in the
+wallet, so decide that number deliberately and alert on `ada_wallet_balance_over_ceiling`.
+
 ### Monitoring
 `GET /metrics` is Prometheus exposition behind the same bearer token — it reports what this wallet
 has spent, which is not public. Counters restart with the process, as is conventional; the gauges
@@ -152,10 +177,10 @@ in the rate of them is the first sign that something upstream is steering it som
 
 ### What this still does not do
 Naming these is the point; none is fixed by more policy code.
-- **The key is a plaintext mnemonic on disk.** That is the design: signerd is a hot wallet. There is
-  no hardware-wallet or KMS path here. Run it as its own user, on an encrypted disk, and keep the
-  balance to what you would accept losing outright — the daily cap bounds an agent, not an attacker
-  who can read the file.
+- **There is no hardware-wallet or KMS path.** The keystore means a file read is no longer enough,
+  but signerd still decrypts the mnemonic into its own memory and keeps it there. A key that never
+  leaves a device is a different architecture, not a setting — and the honest mitigation for this
+  one is the balance ceiling: keep in the wallet only what you would accept losing outright.
 - **`vendor/` is unreviewed code, now at least a known quantity.** Both tarballs are pinned by
   sha256 (`npm test` checks them) and traced to upstream `fdeda56`, verified by recovering their
   TypeScript from the shipped source maps and diffing it against that commit — see

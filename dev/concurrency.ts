@@ -40,6 +40,10 @@ if (!TOKEN || !PAY_TO) {
 const workdir = mkdtempSync(join(tmpdir(), "ada-wallet-race-"));
 const policyFile = join(workdir, "policy.json");
 const auditFile = join(workdir, "audit.jsonl");
+// The ledger checkpoint has to be isolated too, not just the audit: leaving it at the default
+// pointed this throwaway signerd at the real project checkpoint, whose chain position the temp
+// audit does not contain — so it refused to start, correctly.
+const ledgerFile = join(workdir, "ledger.json");
 writeFileSync(
   policyFile,
   JSON.stringify({
@@ -57,7 +61,7 @@ writeFileSync(
 // node directly rather than npx: Node refuses to spawn a .cmd shim without a shell on Windows,
 // and going through the shim buys nothing here.
 const child = spawn(process.execPath, ["--import", "tsx", SIGNERD], {
-  env: { ...process.env, SIGNERD_PORT: String(PORT), POLICY_FILE: policyFile, AUDIT_FILE: auditFile },
+  env: { ...process.env, SIGNERD_PORT: String(PORT), POLICY_FILE: policyFile, AUDIT_FILE: auditFile, LEDGER_FILE: ledgerFile },
   stdio: ["ignore", "inherit", "inherit"],
 });
 

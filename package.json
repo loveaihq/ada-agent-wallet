@@ -17,7 +17,8 @@
     "concurrency": "tsx dev/concurrency.ts",
     "verify:vendor": "node scripts/verify-vendor.mjs",
     "pretest": "node scripts/verify-vendor.mjs",
-    "integrity": "tsx dev/integrity.ts"
+    "integrity": "tsx dev/integrity.ts",
+    "keystore": "tsx scripts/keystore.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
