@@ -32,6 +32,21 @@ npm run signerd                                            # prints the address 
 ```
 `@x402/fetch` rethrows a signer error as a plain `Error` with no `cause`, so `gatedSigner` hands the
 verdict to `mcp.ts` through an `onDenied` callback; catching alone would lose the rule and pending id.
+
+**Where the policy and audit files live is part of the security model.** The daily cap is enforced
+from a ledger rebuilt by replaying `audit.jsonl`, and the limits themselves are re-read from
+`policy.json` on every decision. An agent that can write either file raises its own budget without
+going near the key: deleting the audit file alone resets the day's spend to zero. Put both where
+the agent's user cannot write, and run signerd as a different user. signerd prints both absolute
+paths at startup so this is checkable rather than assumed.
+
+Two defaults in `policy.example.json` are deliberately conservative and worth a look before you
+widen them: `allowedPayees: ["*"]` accepts any payee, which is only reasonable while the agent is
+talking to endpoints you chose; and `allowedAssetTransferMethods: ["default"]` refuses masumi
+escrow, whose cost is not only `amount` — it also locks buyer collateral that no field in the
+policy can see, up to the SDK's 15 ADA ceiling, and not released until the contract's
+`submit_result_time`. Enabling masumi means accepting that charge; bound it with
+`MASUMI_MAX_COLLATERAL_LOVELACE`.
 MCP registration (Claude Desktop / Code / Cowork):
 ```json
 { "mcpServers": { "ada-wallet": { "command": "npx", "args": ["tsx", "/path/ada-agent-wallet/src/mcp.ts"],
@@ -56,7 +71,12 @@ npm run roundtrip           # GET /quote    1.5 tADA, under approvalAbove -> sig
 npm run roundtrip approve   # GET /report   4 tADA, queues -> npm run walletctl -- approve <id>
 npm run roundtrip deny      # GET /premium  6 tADA, over perTxMax -> denied, nothing signed
 npm run balance             # BUYER_ADDRESS / SELLER_ADDRESS balances, to see the faucet land
+npm run concurrency         # regression check for the spend-cap race (spends nothing)
 ```
+
+`npm run concurrency` starts a throwaway signerd with a cap that fits one payment, fires several
+requests at once, and fails unless exactly one is signed. It needs a funded wallet because signing
+reads its UTXOs, but nothing it signs is ever handed to a facilitator, so no funds move.
 
 Routes pin `confirmationPolicy: { l1Confirmations: 0 }`. Depth above canonical inclusion needs an
 evidence hook that only the Blockfrost provider supplies, so a Koios facilitator advertises
@@ -92,6 +112,24 @@ the same budget chain, or Blockfrost.
 - ledger accounting against the real chain: three payments (1.5 + 1.5 + 4 tADA) left
   `dailyRemaining 13000000` of a 20 tADA cap and `paymentsLastHour 3`, and 7 tADA arrived at the
   seller address in three UTXOs.
+- the spend cap holds under concurrency (`npm run concurrency`): four simultaneous requests against
+  a cap that fits one produce one `signed` and three `daily_max` denials. Before the agent lock the
+  same probe signed every one of them, on one shared nonce.
+
+## Known behaviour worth expecting
+- **A signed payment counts against the budget even if settlement then fails.** signerd records the
+  spend when it signs, and never hears whether the facilitator got the transaction on chain, so a
+  transient submit failure costs budget without moving funds. This is the conservative direction and
+  deliberately so — refunding it would mean deciding "this will never land", which is exactly the
+  question the facilitator cannot answer either. Observed once here: `dailySpent` of 16.5 tADA
+  against 12.5 tADA actually delivered.
+- **Koios can refuse a submit moments after confirming the transaction it chains from.** A payment
+  spending the change of a just-confirmed transaction was rejected with `Koios submitTx failed`,
+  and the identical payment succeeded on retry: its query view had the new UTXO before its submit
+  node had the block. Retry rather than treat it as fatal — and note this is why the in-flight UTXO
+  hold is short, since an over-long one makes that retry impossible.
+- The in-flight hold is not what keeps an agent inside its cap; the ledger is. `NONCE_HOLD_SECONDS`
+  (120s) only avoids handing back a transaction some other unsettled one has already doomed.
 
 ## Not yet
 - direct `send` (non-x402 transfer) — needs our own submit path; v1 is x402 only
