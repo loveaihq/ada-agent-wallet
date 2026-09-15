@@ -9,7 +9,11 @@
     "test": "node --test --import tsx test/*.test.ts",
     "signerd": "tsx src/signerd.ts",
     "mcp": "tsx src/mcp.ts",
-    "walletctl": "tsx src/walletctl.ts"
+    "walletctl": "tsx src/walletctl.ts",
+    "dev:facilitator": "tsx dev/facilitator.ts",
+    "dev:resource": "tsx dev/resource.ts",
+    "roundtrip": "tsx dev/roundtrip.ts",
+    "balance": "tsx dev/balance.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

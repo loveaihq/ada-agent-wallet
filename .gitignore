@@ -1,0 +1,7 @@
+node_modules/
+dist/
+policy.json
+audit.jsonl
+.env.local
+*.log
+.mcp.json
