@@ -10,11 +10,19 @@ agent (Claude / any MCP client)
    └── mcp.ts        wallet_status, x402_fetch(url, reason)      ← no keys here
          └── gatedSigner.ts  implements ClientCardanoSigner, forwards to ↓
 signerd.ts   127.0.0.1 only, bearer token, holds the mnemonic
-   ├── policy.ts    per-tx max · rolling-24h max · payee allowlist · asset allowlist · per-hour rate · approval threshold
-   ├── audit.jsonl  every decision: signed / denied / pending / approved (+ agent's stated reason)
+   ├── policy.ts    per-tx max · rolling-24h max · payee, resource, asset and transfer-method
+   │                allowlists · per-hour rate · approval threshold
+   ├── replay.ts    rebuilds the 24h spend window at startup, and checks what it rebuilds from
+   ├── serialize.ts one lock per agent for the cap, one per wallet for signing
+   ├── keystore.ts  scrypt + AES-256-GCM, so the mnemonic is not plaintext at rest
+   ├── ledger.json  the spend state the cap is computed from, rewritten after every signature
+   ├── audit.jsonl  every decision, hash-chained, the checkpoint pointing into it
    └── @x402/cardano toClientCardanoSigner (Koios by default, Blockfrost optional)
-walletctl.ts  status | pending | approve <id> | deny <id> | audit
+walletctl.ts  status | preflight | pending | approve <id> | deny <id> | audit
 ```
+
+`ledger.json` and `audit.jsonl` are deliberately two files: the cap is state, the log is a log, and
+conflating them meant `rm audit.jsonl` handed a spent agent its budget back.
 
 What `@x402/core` already has: a per-payment USD cap and an asset allowlist, inside the agent process.
 What this adds: key isolation, rolling daily/hourly limits, payee allowlist, human approval, audit trail —
@@ -24,14 +32,14 @@ Masumi's Payment Service (the other Cardano agent-payment stack) has none of the
 ## Run (preprod)
 ```
 npm install
-cp policy.example.json policy.json            # edit limits; amounts are lovelace / USDM 6-dec units
+cp policy.example.json policy.json            # edit the limits; amounts are in the asset's smallest unit
 export SIGNERD_TOKEN=$(openssl rand -hex 16)
 export WALLET_MNEMONIC_FILE=~/.ada-agent-wallet/mnemonic   # 24 words, chmod 600
 export CARDANO_NETWORK=cardano:preprod                     # Koios, no API key needed
 npm run signerd                                            # prints the address → fund it from the preprod faucet
 ```
-`@x402/fetch` rethrows a signer error as a plain `Error` with no `cause`, so `gatedSigner` hands the
-verdict to `mcp.ts` through an `onDenied` callback; catching alone would lose the rule and pending id.
+The policy file declares the network it was written for, and signerd refuses to start on a mismatch.
+A plaintext mnemonic is fine for a faucet wallet; for anything else see "The key" below.
 
 **Where the policy and audit files live is part of the security model.** The daily cap is enforced
 from a ledger rebuilt by replaying `audit.jsonl`, and the limits themselves are re-read from
@@ -97,8 +105,11 @@ facilitator client 115s so the wait is not cut off one level up. Anything talkin
 the same budget chain, or Blockfrost.
 
 ## Verified
-- policy engine: 13/13 unit tests (`npm test`)
-- signerd: status, per-tx deny, unknown-agent deny, unauthorized, approval queue → CLI deny → agent receives the verdict, audit replay
+- `npm test`: 50 unit tests over the policy engine, the startup replay, the locks and the keystore,
+  plus the vendor checksums, which gate the rest. None of them needs a chain.
+- `npm run integrity`: no single deletion resets the spend cap, and restarting does not re-count
+  what the checkpoint already holds
+- `npm run concurrency`: the cap holds under simultaneous requests
 - mcp: tool listing and `wallet_status` through a real MCP client
 - deny path, end to end: MCP `x402_fetch` → 402 → gated signer → signerd → `per_tx_max` →
   structured verdict back at the tool, `denied` in `audit.jsonl`
@@ -116,14 +127,17 @@ the same budget chain, or Blockfrost.
 - ledger accounting against the real chain: three payments (1.5 + 1.5 + 4 tADA) left
   `dailyRemaining 13000000` of a 20 tADA cap and `paymentsLastHour 3`, and 7 tADA arrived at the
   seller address in three UTXOs.
-- the spend cap holds under concurrency (`npm run concurrency`): four simultaneous requests against
-  a cap that fits one produce one `signed` and three `daily_max` denials. Before the agent lock the
-  same probe signed every one of them, on one shared nonce.
+- the spend cap holds under concurrency: four simultaneous requests against a cap that fits one
+  produce one `signed` and three `daily_max` denials. Before the agent lock the same probe signed
+  every one of them, on one shared nonce.
 
 ## Before mainnet
 ```
 npm run walletctl -- preflight     # fails on anything that must be fixed, warns on every decision
 ```
+`ALLOW_UNVERIFIED_AUDIT=1` is the way past a refused startup when the audit log was rotated on
+purpose; it waives the check, not the ledger. `LEDGER_FILE` and `AUDIT_FILE` say where both live.
+
 `preflight` refuses to pass until the policy declares `"network": "cardano:mainnet"`, and signerd
 refuses to start on mainnet without it: caps here are bare integers with no unit, so a file tuned
 against 10,000 faucet tADA says exactly the same thing to a wallet holding real ADA. It also warns
