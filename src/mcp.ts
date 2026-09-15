@@ -76,7 +76,9 @@ server.tool(
       .string()
       .url()
       .refine(u => /^https?:$/.test(new URL(u).protocol), { message: "url must be http or https" }),
-    reason: z.string().min(3),
+    // Capped because it is written verbatim into an append-only log that signerd replays at every
+    // start, not because a sentence needs a limit.
+    reason: z.string().min(3).max(1000),
     method: z.enum(["GET", "POST"]).default("GET"),
     body: z.string().optional(),
   },

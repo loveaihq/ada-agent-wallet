@@ -19,10 +19,11 @@ import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "no
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { freePort } from "./port.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SIGNERD = resolvePath(HERE, "../src/signerd.ts");
-const PORT = Number(process.env.INTEGRITY_PORT ?? 7415);
+const PORT = Number(process.env.INTEGRITY_PORT) || (await freePort());
 const URL_ = `http://127.0.0.1:${PORT}`;
 const NETWORK = process.env.CARDANO_NETWORK ?? "cardano:preprod";
 const AMOUNT = "1500000";
@@ -147,16 +148,18 @@ function env(extra: Record<string, string> = {}) {
 
 async function start(extra: Record<string, string> = {}): Promise<ChildProcess> {
   const child = spawn(process.execPath, ["--import", "tsx", SIGNERD], { env: env(extra), stdio: ["ignore", "ignore", "ignore"] });
+  let last: unknown;
   for (let i = 0; i < 60; i++) {
     try {
       if ((await fetch(`${URL_}/status`, { headers })).ok) return child;
-    } catch {
-      // not listening yet
+    } catch (e) {
+      // Keep it: swallowing this reports a timeout for an error thrown on the first try.
+      last = e;
     }
     await new Promise(r => setTimeout(r, 1000));
   }
   child.kill();
-  throw new Error(`signerd did not come up on ${URL_}`);
+  throw new Error(`signerd did not come up on ${URL_}: ${last instanceof Error ? last.message : last}`);
 }
 
 /** Starts signerd expecting it to refuse; reports whether it exited and what it said. */

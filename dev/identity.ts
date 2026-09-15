@@ -14,10 +14,11 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { freePort } from "./port.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SIGNERD = resolvePath(HERE, "../src/signerd.ts");
-const PORT = Number(process.env.IDENTITY_PORT ?? 7428);
+const PORT = Number(process.env.IDENTITY_PORT) || (await freePort());
 const URL_ = `http://127.0.0.1:${PORT}`;
 const NETWORK = process.env.CARDANO_NETWORK ?? "cardano:preprod";
 const SCANNER_TOKEN = "scanner-token-0123456789abcdef";

@@ -82,6 +82,21 @@ const PASSPHRASE_FILE = process.env.WALLET_PASSPHRASE_FILE;
 const MAX_HOT_BALANCE = process.env.MAX_HOT_BALANCE_LOVELACE ? BigInt(process.env.MAX_HOT_BALANCE_LOVELACE) : undefined;
 const IS_MAINNET = NETWORK.endsWith("mainnet");
 const MAX_BODY_BYTES = 1 << 20;
+/**
+ * Caps on the free text a caller can put into the audit log.
+ *
+ * `reason` is written verbatim for every decision, including denied ones, and the log is replayed
+ * and hash-chained at every start. Unbounded, a single refused request wrote half a megabyte of it
+ * here, and refusal costs an agent nothing, so there was no limit on how much an agent could make
+ * this file weigh. A reason is a sentence.
+ */
+const MAX_REASON = 1000;
+const MAX_RESOURCE = 2048;
+const MAX_AGENT_ID = 64;
+// Also audited verbatim, and with `allowedPayees: ["*"]` nothing else bounds them. A bech32
+// Cardano address is about 103 characters; a canonical asset id is at most 121.
+const MAX_PAY_TO = 200;
+const MAX_ASSET = 130;
 const MAX_APPROVAL_SECONDS = 900;
 // Long enough to cover one settle attempt (facilitator awaitTx 100s inside a 115s client timeout
 // in dev/), short enough that a failed settlement does not strand the wallet.
@@ -333,6 +348,8 @@ const auditFd = openSync(AUDIT_FILE, "a");
 /** Every record passes through here, so it is also where they are counted for /metrics. */
 const eventCounts = new Map<string, number>();
 let unauthorizedRequests = 0;
+/** Requests refused before they were worth auditing; nothing else would show them. */
+let badRequests = 0;
 
 function audit(event: string, data: Record<string, unknown>) {
   eventCounts.set(event, (eventCounts.get(event) ?? 0) + 1);
@@ -592,6 +609,17 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       return json(res, 400, { error: "input.amount must be a decimal integer string" });
     if (typeof input.payTo !== "string" || typeof input.asset !== "string")
       return json(res, 400, { error: "input.payTo and input.asset must be strings" });
+    // Refused before anything is written, because writing is the cost being bounded.
+    const tooLong =
+      (typeof reason === "string" && reason.length > MAX_REASON && `reason (${reason.length} > ${MAX_REASON})`) ||
+      (typeof resource === "string" && resource.length > MAX_RESOURCE && `resource (${resource.length} > ${MAX_RESOURCE})`) ||
+      (typeof agentId === "string" && agentId.length > MAX_AGENT_ID && `agentId (${agentId.length} > ${MAX_AGENT_ID})`) ||
+      (input.payTo.length > MAX_PAY_TO && `input.payTo (${input.payTo.length} > ${MAX_PAY_TO})`) ||
+      (input.asset.length > MAX_ASSET && `input.asset (${input.asset.length} > ${MAX_ASSET})`);
+    if (tooLong) {
+      badRequests++;
+      return json(res, 400, { error: "too_long", detail: `${tooLong} — it goes verbatim into an append-only log` });
+    }
 
     // Everything from reading the ledger to recording the spend runs under this agent's lock.
     const outcome = await withAgentLock(agentId, async (): Promise<SignOutcome> => {
@@ -741,6 +769,7 @@ function metrics(): string {
   series("ada_wallet_audit_events_total", "Audit records written since this process started, by event.", "counter",
     [...eventCounts].map(([event, n]): Sample => [`event="${esc(event)}"`, n]));
   one("ada_wallet_unauthorized_requests_total", "Requests rejected for a bad or missing bearer token.", "counter", unauthorizedRequests);
+  one("ada_wallet_bad_requests_total", "Requests refused as malformed, before anything was audited.", "counter", badRequests);
   one("ada_wallet_audit_seq", "Sequence number of the last audit record.", "gauge", auditSeq);
   one("ada_wallet_pending_approvals", "Payments waiting on a human right now.", "gauge", pending.size);
   one("ada_wallet_inflight_utxos", "UTXOs committed to a handed-out payment that has not settled.", "gauge", inflightNonces.size);

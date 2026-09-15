@@ -15,10 +15,11 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "no
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { freePort } from "./port.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SIGNERD = resolvePath(HERE, "../src/signerd.ts");
-const PORT = Number(process.env.APPROVALS_PORT ?? 7422);
+const PORT = Number(process.env.APPROVALS_PORT) || (await freePort());
 const URL_ = `http://127.0.0.1:${PORT}`;
 const NETWORK = process.env.CARDANO_NETWORK ?? "cardano:preprod";
 const AMOUNT = "1500000";
@@ -198,13 +199,15 @@ async function settle(condition: () => Promise<boolean>, what: string, seconds =
 }
 
 async function waitForPort() {
+  let last: unknown;
   for (let i = 0; i < 60; i++) {
     try {
       if ((await fetch(`${URL_}/status`, { headers })).ok) return;
-    } catch {
-      // not listening yet
+    } catch (e) {
+      // Keep it: swallowing this reports a timeout for an error thrown on the first try.
+      last = e;
     }
     await new Promise(r => setTimeout(r, 1000));
   }
-  throw new Error(`signerd did not come up on ${URL_}`);
+  throw new Error(`signerd did not come up on ${URL_}: ${last instanceof Error ? last.message : last}`);
 }
