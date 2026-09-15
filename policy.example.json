@@ -1,0 +1,11 @@
+{
+  "agents": {
+    "default": {
+      "perTxMax":     { "lovelace": "2000000", "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d": "1000000" },
+      "dailyMax":     { "lovelace": "10000000", "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d": "5000000" },
+      "allowedPayees": ["*"],
+      "maxPerHour": 20,
+      "approvalAbove": { "lovelace": "1000000" }
+    }
+  }
+}

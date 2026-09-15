@@ -1,0 +1,26 @@
+{
+  "name": "ada-agent-wallet",
+  "version": "0.1.0",
+  "description": "Policy-gated Cardano wallet for AI agents: spend caps, payee allowlist, human approval, audit log. Plugs into the official @x402/cardano client.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test --import tsx test/*.test.ts",
+    "signerd": "tsx src/signerd.ts",
+    "mcp": "tsx src/mcp.ts",
+    "walletctl": "tsx src/walletctl.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@x402/cardano": "file:vendor/x402-cardano-2.25.0.tgz",
+    "@x402/core": "file:vendor/x402-core-2.25.0.tgz",
+    "@x402/fetch": "^2.25.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,38 @@
+/**
+ * A ClientCardanoSigner that holds NO keys. It forwards every signing request to signerd,
+ * which enforces the policy and signs. Drop-in for @x402/cardano's ExactCardanoScheme.
+ */
+import type { ClientCardanoSignInput, ClientCardanoSignResult, ClientCardanoSigner } from "@x402/cardano";
+
+export interface GatedSignerConfig {
+  signerdUrl: string; // http://127.0.0.1:7402
+  token: string;
+  agentId: string;
+  /** Called per payment to supply the reason logged in the audit trail. */
+  reason: () => string;
+}
+
+export class PolicyDenied extends Error {
+  constructor(public readonly rule: string, public readonly detail: string, public readonly pendingId?: string) {
+    super(`policy ${rule}: ${detail}`);
+  }
+}
+
+export async function createGatedSigner(cfg: GatedSignerConfig): Promise<ClientCardanoSigner> {
+  const headers = { authorization: `Bearer ${cfg.token}`, "content-type": "application/json" };
+  const status = await fetch(`${cfg.signerdUrl}/status`, { headers }).then(r => r.json() as Promise<{ address: string }>);
+  const address = status.address;
+  return {
+    getAddress: () => address,
+    async buildAndSignPaymentTransaction(input: ClientCardanoSignInput): Promise<ClientCardanoSignResult> {
+      const r = await fetch(`${cfg.signerdUrl}/sign`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ agentId: cfg.agentId, reason: cfg.reason(), input }),
+      });
+      const data = (await r.json()) as Record<string, string>;
+      if (!r.ok) throw new PolicyDenied(data.rule ?? data.error ?? "error", data.detail ?? "", data.id);
+      return { transaction: data.transaction, nonce: data.nonce };
+    },
+  };
+}
