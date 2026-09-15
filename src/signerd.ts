@@ -36,7 +36,10 @@
  *                           (a deliberate rotation). It waives the check, not the ledger: recorded
  *                           spends come from the checkpoint and survive.
  *   SIGNERD_PORT      default 7402
- *   SIGNERD_TOKEN     shared secret (required)
+ *   SIGNERD_TOKEN     the operator's secret (required)
+ *   AGENT_TOKENS_FILE JSON of {"<token>": "<agentId>"}. Without it `agentId` is whatever the
+ *                     caller says it is, so the per-agent split is a convention rather than a
+ *                     boundary; with it, a token is an identity and cannot claim another.
  *   MASUMI_MAX_COLLATERAL_LOVELACE  ceiling on the collateral a masumi escrow may lock
  *   NONCE_HOLD_SECONDS              how long a handed-out UTXO is treated as in flight
  */
@@ -73,6 +76,7 @@ const AUDIT_FILE = process.env.AUDIT_FILE ?? "./audit.jsonl";
 const LEDGER_FILE = process.env.LEDGER_FILE ?? "./ledger.json";
 const ALLOW_UNVERIFIED_AUDIT = process.env.ALLOW_UNVERIFIED_AUDIT === "1";
 const MNEMONIC_FILE = process.env.WALLET_MNEMONIC_FILE;
+const AGENT_TOKENS_FILE = process.env.AGENT_TOKENS_FILE;
 const KEYSTORE_FILE = process.env.WALLET_KEYSTORE_FILE;
 const PASSPHRASE_FILE = process.env.WALLET_PASSPHRASE_FILE;
 const MAX_HOT_BALANCE = process.env.MAX_HOT_BALANCE_LOVELACE ? BigInt(process.env.MAX_HOT_BALANCE_LOVELACE) : undefined;
@@ -160,6 +164,23 @@ function assertPolicyNetwork(p: Policy) {
     throw new Error(`refusing to run on ${NETWORK} with a policy that does not declare "network": "${NETWORK}"`);
 }
 
+/** token -> agentId. Empty unless AGENT_TOKENS_FILE is set. */
+const agentTokens = new Map<string, string>();
+if (AGENT_TOKENS_FILE) {
+  try {
+    const raw = JSON.parse(readFileSync(AGENT_TOKENS_FILE, "utf8")) as Record<string, string>;
+    for (const [token, agentId] of Object.entries(raw)) {
+      if (typeof token !== "string" || token.length < 16) throw new Error(`a token shorter than 16 characters is not one`);
+      if (typeof agentId !== "string" || !agentId) throw new Error(`token for "${agentId}" names no agent`);
+      if (token === TOKEN) throw new Error(`the operator token cannot also be an agent's`);
+      agentTokens.set(token, agentId);
+    }
+    if (agentTokens.size === 0) throw new Error("no tokens in it");
+  } catch (e) {
+    fail(`agent tokens ${resolvePath(AGENT_TOKENS_FILE)}: ${e instanceof Error ? e.message : e}`);
+  }
+}
+
 let policy: Policy;
 let policyMtimeMs = -1;
 function readPolicy(): Policy {
@@ -189,6 +210,7 @@ try {
 checkFileMode("policy", POLICY_FILE);
 checkFileMode("audit", AUDIT_FILE);
 if (MNEMONIC_FILE) checkFileMode("mnemonic", MNEMONIC_FILE);
+if (AGENT_TOKENS_FILE) checkFileMode("agent tokens", AGENT_TOKENS_FILE);
 if (KEYSTORE_FILE) checkFileMode("keystore", KEYSTORE_FILE);
 if (PASSPHRASE_FILE) checkFileMode("passphrase", PASSPHRASE_FILE);
 
@@ -511,10 +533,13 @@ type SignOutcome =
 let shuttingDown = false;
 
 async function handle(req: IncomingMessage, res: ServerResponse) {
-  if (!authorized(req.headers.authorization)) {
+  const caller = identify(req.headers.authorization);
+  if (!caller) {
     unauthorizedRequests++;
     return json(res, 401, { error: "unauthorized" });
   }
+  // An agent's token signs and reads its own budget; everything else is the operator's.
+  const operatorOnly = caller.kind === "operator";
   if (shuttingDown) return json(res, 503, { error: "shutting_down" });
   const url = new URL(req.url ?? "/", "http://localhost");
   const body = req.method === "POST" ? JSON.parse((await readBody(req)) || "{}") : {};
@@ -526,10 +551,16 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     } catch (e) {
       return json(res, 503, { error: "policy_unreadable", detail: String(e instanceof Error ? e.message : e) });
     }
+    // An agent sees its own budget. What the others have spent is not its business, and was in the
+    // response until now.
+    const visible = operatorOnly ? Object.keys(current.agents) : [caller.agentId];
     const agents: Record<string, unknown> = {};
-    for (const id of Object.keys(current.agents)) agents[id] = remaining(current, effectiveLedger(), id);
-    return json(res, 200, { address, network: NETWORK, agents, pending: pending.size });
+    for (const id of visible) agents[id] = remaining(current, effectiveLedger(), id);
+    return json(res, 200, { address, network: NETWORK, agents, pending: operatorOnly ? pending.size : undefined });
   }
+
+  if (!operatorOnly && url.pathname !== "/sign" && url.pathname !== "/status")
+    return json(res, 403, { error: "operator_only", detail: `an agent token cannot call ${url.pathname}` });
 
   if (req.method === "GET" && url.pathname === "/preflight") return json(res, 200, preflight());
 
@@ -539,12 +570,21 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   }
 
   if (req.method === "POST" && url.pathname === "/sign") {
-    const { agentId, reason, resource, input } = body as {
-      agentId: string;
+    const { reason, resource, input } = body as {
       reason: string;
       resource?: string;
       input: ClientCardanoSignInput;
     };
+    // Where identity comes from: the token if there is one that means something, the body only
+    // when there is not.
+    const claimed = (body as { agentId?: string }).agentId;
+    // Once tokens mean something, the operator's does not mean "any agent". Operating and paying
+    // are different authorities, and the operator already has the policy and the approval queue.
+    if (agentTokens.size > 0 && caller.kind === "operator")
+      return json(res, 403, { error: "operator_cannot_sign", detail: "signing needs an agent token; the operator token operates" });
+    const agentId = caller.kind === "agent" ? caller.agentId : claimed;
+    if (caller.kind === "agent" && claimed !== undefined && claimed !== agentId)
+      return json(res, 403, { error: "agent_mismatch", detail: `this token signs for ${agentId}, not ${claimed}` });
     if (!agentId || !input?.payTo || !input?.asset || !input?.amount)
       return json(res, 400, { error: "agentId, reason, input{payTo,asset,amount} required" });
     // Otherwise BigInt() turns the caller's mistake into a 500.
@@ -789,6 +829,17 @@ function preflight() {
       `holding ${hotBalance} of a ${MAX_HOT_BALANCE} lovelace ceiling`);
   }
 
+  const agentCount = Object.keys(current?.agents ?? {}).length;
+  add(
+    agentTokens.size > 0 ? "ok" : agentCount > 1 ? "warn" : "ok",
+    "agent identity",
+    agentTokens.size > 0
+      ? `${agentTokens.size} token(s), each fixed to one agent`
+      : agentCount > 1
+        ? `AGENT_TOKENS_FILE is unset and there are ${agentCount} agents, so any holder of the operator token can spend any of their budgets by naming it`
+        : "one agent, so there is no other budget to claim",
+  );
+
   const cp = existsSync(LEDGER_FILE);
   add(cp ? "ok" : ledger.length ? "warn" : "ok", "spend ledger checkpoint",
     cp
@@ -858,11 +909,27 @@ function preflight() {
   };
 }
 
-function authorized(header: string | undefined): boolean {
-  const expected = Buffer.from(`Bearer ${TOKEN}`);
+/**
+ * Who is calling.
+ *
+ * With AGENT_TOKENS_FILE, a token *is* an agent: `agentId` stops being something the caller
+ * asserts, which it was, and which meant any process holding the shared token could spend any
+ * agent's budget by naming it. Without the file the old behaviour stands, and preflight says so
+ * when there is more than one agent for it to matter to.
+ */
+type Caller = { kind: "operator" } | { kind: "agent"; agentId: string };
+
+function sameToken(header: string | undefined, token: string): boolean {
+  const expected = Buffer.from(`Bearer ${token}`);
   const got = Buffer.from(header ?? "");
   // timingSafeEqual throws on unequal lengths, and a bearer token's length is not the secret.
   return got.length === expected.length && timingSafeEqual(got, expected);
+}
+
+function identify(header: string | undefined): Caller | undefined {
+  if (sameToken(header, TOKEN!)) return { kind: "operator" };
+  for (const [token, agentId] of agentTokens) if (sameToken(header, token)) return { kind: "agent", agentId };
+  return undefined;
 }
 
 function json(res: ServerResponse, code: number, data: unknown) {

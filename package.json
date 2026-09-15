@@ -20,7 +20,8 @@
     "integrity": "tsx dev/integrity.ts",
     "keystore": "tsx scripts/keystore.ts",
     "approvals": "tsx dev/approvals.ts",
-    "assets": "tsx dev/assets.ts"
+    "assets": "tsx dev/assets.ts",
+    "identity": "tsx dev/identity.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

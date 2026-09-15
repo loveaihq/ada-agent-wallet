@@ -18,6 +18,7 @@ signerd.ts   127.0.0.1 only, bearer token, holds the mnemonic
    ├── verifyTx.ts  reads back the signed transaction: does it pay who was authorised, only them
    ├── ledger.json  the spend state the cap is computed from, rewritten after every signature
    ├── audit.jsonl  every decision, hash-chained, the checkpoint pointing into it
+   ├── tokens.json  optional: a token per agent, so `agentId` is not self-reported
    └── @x402/cardano toClientCardanoSigner (Koios by default, Blockfrost optional)
 walletctl.ts  status | preflight | pending | approve <id> | deny <id> | audit
 ```
@@ -86,6 +87,7 @@ npm run verify:vendor            # sha256 of vendor/; runs automatically before 
 npm run integrity                # proves no single deletion resets the spend cap
 npm run approvals                # every way out of the approval queue gives the budget back
 npm run assets                   # per-asset caps and windows, and the rate they share
+npm run identity                 # whether an agent can spend a budget that is not its own
 npm run keystore -- create ...   # encrypt the mnemonic at rest
 ```
 
@@ -122,6 +124,9 @@ the same budget chain, or Blockfrost.
 - `npm run assets`: caps and 24h windows are per asset, the hourly rate is shared across them, and
   an asset the wallet does not hold is refused as `insufficient_funds` rather than as a fault.
   Not covered: an actual native-asset settlement, which needs a wallet holding one.
+- `npm run identity`: with `AGENT_TOKENS_FILE`, an agent cannot sign as another or read another's
+  budget, and the operator token cannot sign at all. Without it, the same check demonstrates that
+  it can.
 - mcp: tool listing and `wallet_status` through a real MCP client
 - deny path, end to end: MCP `x402_fetch` → 402 → gated signer → signerd → `per_tx_max` →
   structured verdict back at the tool, `denied` in `audit.jsonl`
@@ -189,6 +194,18 @@ decrypted mnemonic in memory for as long as it runs. That is what a hot wallet i
 Which is why `MAX_HOT_BALANCE_LOVELACE` exists and why preflight fails on mainnet without it. The
 daily cap bounds an agent. Nothing bounds someone who has the key, except how much is in the
 wallet, so decide that number deliberately and alert on `ada_wallet_balance_over_ceiling`.
+
+### Who an agent is
+By default there is one token, and `agentId` arrives in the request body. With a single agent that
+is fine. With several it means the split between them is a convention: any process holding that
+token can spend any agent's budget by naming it, which is the opposite of what a per-agent policy
+is for. Preflight says so when the policy has more than one agent.
+
+`AGENT_TOKENS_FILE` is a JSON map of `{"<token>": "<agentId>"}`. With it, a token *is* an identity:
+`/sign` takes the agent from the token and refuses a body that names another, `/status` returns only
+that agent's budget, the approval queue and everything else is the operator's alone, and the
+operator token stops signing at all. Operating and paying become different authorities, which they
+were not.
 
 ### Monitoring
 `GET /metrics` is Prometheus exposition behind the same bearer token — it reports what this wallet
