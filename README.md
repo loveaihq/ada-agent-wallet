@@ -15,6 +15,7 @@ signerd.ts   127.0.0.1 only, bearer token, holds the mnemonic
    ├── replay.ts    rebuilds the 24h spend window at startup, and checks what it rebuilds from
    ├── serialize.ts one lock per agent for the cap, one per wallet for signing
    ├── keystore.ts  scrypt + AES-256-GCM, so the mnemonic is not plaintext at rest
+   ├── verifyTx.ts  reads back the signed transaction: does it pay who was authorised, only them
    ├── ledger.json  the spend state the cap is computed from, rewritten after every signature
    ├── audit.jsonl  every decision, hash-chained, the checkpoint pointing into it
    └── @x402/cardano toClientCardanoSigner (Koios by default, Blockfrost optional)
@@ -107,8 +108,10 @@ facilitator client 115s so the wait is not cut off one level up. Anything talkin
 the same budget chain, or Blockfrost.
 
 ## Verified
-- `npm test`: 50 unit tests over the policy engine, the startup replay, the locks and the keystore,
-  plus the vendor checksums, which gate the rest. None of them needs a chain.
+- `npm test`: 59 unit tests over the policy engine, the startup replay, the locks, the keystore and
+  the signed-transaction check, plus the vendor checksums, which gate the rest. None needs a chain.
+- every signature is read back before it is handed over: an output pays the authorised payee at
+  least the authorised amount, the nonce is spent, and nothing else is paid at all
 - `npm run integrity`: no single deletion resets the spend cap, and restarting does not re-count
   what the checkpoint already holds
 - `npm run concurrency`: the cap holds under simultaneous requests, and two agents sharing one

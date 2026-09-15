@@ -58,10 +58,11 @@ import {
 import { createInterface } from "node:readline";
 import { resolve as resolvePath, dirname } from "node:path";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { toClientCardanoSigner, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
+import { toClientCardanoSigner, decodeCardanoTransaction, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
 import { decide, parsePolicy, remaining, type Policy, type SpendRecord } from "./policy.js";
 import { createKeyedLock, createLock } from "./serialize.js";
 import { replayAudit, sha256, type Checkpoint } from "./replay.js";
+import { mismatch } from "./verifyTx.js";
 import { decryptMnemonic, assertKeystore } from "./keystore.js";
 
 const PORT = Number(process.env.SIGNERD_PORT ?? 7402);
@@ -452,6 +453,28 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
       audit("insufficient_funds", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount });
       throw new InsufficientFunds(`the wallet cannot fund ${input.amount} of ${input.asset}`);
     }
+    // Read back what was actually signed before anything commits to it. The policy decided on the
+    // request; up to here nothing had looked at the transaction built from it, and the only other
+    // party who checks is the facilitator, which is the seller's and has no reason to care whether
+    // this wallet also paid someone else.
+    let wrong: string | undefined;
+    try {
+      wrong = mismatch(decodeCardanoTransaction(res.transaction), {
+        payTo: input.payTo,
+        asset: input.asset,
+        amount: input.amount,
+        changeTo: address,
+        nonce: res.nonce,
+        assetTransferMethod: typeof input.extra?.assetTransferMethod === "string" ? input.extra.assetTransferMethod : undefined,
+      });
+    } catch (e) {
+      wrong = `it could not be decoded: ${e instanceof Error ? e.message : e}`;
+    }
+    if (wrong) {
+      audit("transaction_mismatch", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, detail: wrong });
+      throw new Error(`refusing to hand over a transaction that does not match what was authorised: ${wrong}`);
+    }
+
     if (!claimNonce(res.nonce, Math.min(approvalWindow(input), NONCE_HOLD_SECONDS))) {
       audit("nonce_collision", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce });
       throw new UtxoBusy(`utxo ${res.nonce} is already committed to an unsettled payment; retry once it settles`);
