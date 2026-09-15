@@ -42,6 +42,19 @@ export interface Replay {
   sawCheckpoint: boolean;
 }
 
+/**
+ * A spend is only a spend if every field it needs is there and readable. `BigInt("1.5")` throws,
+ * and `String(undefined)` is "undefined" — an amount that takes down startup with no line number,
+ * and an agent id that matches no policy and so quietly costs nothing.
+ */
+function readSpend(e: Record<string, unknown>): { agentId: string; asset: string; amount: bigint } | undefined {
+  const { agentId, asset, amount } = e;
+  if (typeof agentId !== "string" || !agentId) return undefined;
+  if (typeof asset !== "string" || !asset) return undefined;
+  if (typeof amount !== "string" || !/^[0-9]+$/.test(amount)) return undefined;
+  return { agentId, asset, amount: BigInt(amount) };
+}
+
 const TERMINAL_EVENTS = new Set([
   "approved",
   "approval_denied",
@@ -106,14 +119,22 @@ export async function replayAudit(
       // Only what the checkpoint cannot already hold. No seq means it predates the chain, so it is
       // older than the checkpoint by construction; counting it again inflated spend on every
       // restart, without bound.
-      else if (checkpoint === undefined || (seq !== undefined && seq > checkpoint.seq))
-        afterCheckpoint.push({ ts: e.ts, agentId: String(e.agentId), asset: String(e.asset), amount: BigInt(String(e.amount)) });
+      else if (checkpoint === undefined || (seq !== undefined && seq > checkpoint.seq)) {
+        const spend = readSpend(e);
+        // A spend that cannot be read is reported, not skipped: skipping it would hand the agent
+        // back its budget.
+        if (spend === undefined) out.malformedAt ??= lineNo;
+        else afterCheckpoint.push({ ts: e.ts, ...spend });
+      }
     }
   }
 
   if (checkpoint) {
     for (const s of checkpoint.spends) {
-      if (s.ts >= cutoff) out.spends.push({ ts: s.ts, agentId: s.agentId, asset: s.asset, amount: BigInt(s.amount) });
+      const spend = readSpend(s as unknown as Record<string, unknown>);
+      if (spend === undefined || typeof s.ts !== "number")
+        throw new Error(`checkpoint holds an unreadable spend: ${JSON.stringify(s)}`);
+      if (s.ts >= cutoff) out.spends.push({ ts: s.ts, ...spend });
     }
     out.lastSeq = Math.max(out.lastSeq, checkpoint.seq);
   }

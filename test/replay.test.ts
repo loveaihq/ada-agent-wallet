@@ -148,3 +148,32 @@ test("the window is returned in time order", async () => {
   const r = await replayAudit(lines, WINDOW);
   assert.deepEqual(r.spends.map(s => s.ts), [NOW - 900, NOW - 600, NOW - 300]);
 });
+
+test("a spend that cannot be read is reported, never skipped", async () => {
+  // Skipping it would hand the agent back its budget; throwing took startup down with a BigInt
+  // error and no line number.
+  const base = { ts: NOW, event: "signed", agentId: "a", asset: "lovelace", amount: "100" };
+  for (const [label, bad] of [
+    ["fractional amount", { ...base, amount: "1.5" }],
+    ["missing amount", { ts: NOW, event: "signed", agentId: "a", asset: "lovelace" }],
+    ["negative amount", { ...base, amount: "-5" }],
+    ["missing agentId", { ts: NOW, event: "signed", asset: "lovelace", amount: "100" }],
+    ["missing asset", { ts: NOW, event: "signed", agentId: "a", amount: "100" }],
+  ] as const) {
+    const r = await replayAudit([JSON.stringify(bad)], WINDOW);
+    assert.equal(r.malformedAt, 1, `${label} was not reported`);
+    assert.equal(r.spends.length, 0, `${label} was counted anyway`);
+  }
+  assert.equal((await replayAudit([JSON.stringify(base)], WINDOW)).malformedAt, undefined);
+});
+
+test("an unreadable checkpoint spend is refused rather than silently dropped", async () => {
+  const checkpoint = {
+    version: 1 as const,
+    seq: 0,
+    hash: "",
+    updatedAt: NOW,
+    spends: [{ ts: NOW, agentId: "a", asset: "lovelace", amount: "oops" }],
+  };
+  await assert.rejects(() => replayAudit([], { ...WINDOW, checkpoint }), /unreadable spend/);
+});

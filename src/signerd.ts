@@ -205,6 +205,7 @@ function readCheckpoint(): Checkpoint | undefined {
   try {
     const c = JSON.parse(readFileSync(LEDGER_FILE, "utf8")) as Checkpoint;
     if (c.version !== 1 || !Array.isArray(c.spends)) throw new Error("unrecognized checkpoint shape");
+    if (!Number.isInteger(c.seq) || typeof c.hash !== "string") throw new Error("checkpoint has no chain position");
     return c;
   } catch (e) {
     fail(`ledger checkpoint ${resolvePath(LEDGER_FILE)} is unreadable: ${e instanceof Error ? e.message : e}`);
