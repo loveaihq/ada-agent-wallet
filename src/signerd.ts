@@ -14,11 +14,8 @@
  *   POST /approve  {id}                -> signs the queued request
  *   POST /deny     {id}
  *
- * Deployment contract: the ledger enforcing the daily cap is a replay of AUDIT_FILE, and the
- * limits are re-read from POLICY_FILE when it changes. An agent that can write either file can
- * raise its own budget without going near this process — deleting the audit file alone resets the
- * day's spend to zero. Both must live where the agent's user has no write access; signerd checks
- * the mode bits at startup and refuses to run on mainnet if they are loose.
+ * Neither POLICY_FILE nor AUDIT_FILE may be writable by the agent's user: between them they are
+ * the limits and the spending they are measured against. See README, "Before mainnet".
  *
  * Env:
  *   WALLET_KEYSTORE_FILE    passphrase-encrypted mnemonic (preferred; see scripts/keystore.mjs)
@@ -78,17 +75,7 @@ function fail(msg: string): never {
 
 if (!TOKEN) fail("SIGNERD_TOKEN is required");
 
-/**
- * Where the mnemonic comes from, in order of how much it protects.
- *
- * WALLET_KEYSTORE_FILE is the one to use: passphrase-encrypted, so a stolen backup or a directory
- * whose permissions were wrong for a week yields ciphertext. WALLET_MNEMONIC_FILE is plaintext on
- * disk. WALLET_MNEMONIC is plaintext in the environment, which on most systems means plaintext in
- * `ps`, in the service manager's state, and in whatever collects your logs.
- *
- * None of them helps once signerd is running: a hot wallet holds its key in memory, and that is
- * what makes it hot. What encryption buys is that reading a file is no longer enough.
- */
+/** Keystore, then plaintext file, then environment — best to worst. See README, "The key". */
 async function loadMnemonic(): Promise<string> {
   if (KEYSTORE_FILE) {
     let keystore: unknown;
@@ -111,8 +98,7 @@ async function loadMnemonic(): Promise<string> {
 }
 
 async function readPassphrase(): Promise<string> {
-  // Deliberately not an environment variable: the point of the keystore is that reading one thing
-  // is not enough, and an env var is readable by anything that can read the process.
+  // Not an environment variable: a keystore is pointless if reading one thing still suffices.
   if (PASSPHRASE_FILE) return readFileSync(PASSPHRASE_FILE, "utf8").replace(/\r?\n$/, "");
   if (!process.stdin.isTTY)
     fail("keystore passphrase: set WALLET_PASSPHRASE_FILE, or start signerd attached to a terminal");
@@ -132,40 +118,23 @@ async function readPassphrase(): Promise<string> {
 
 const mnemonic = await loadMnemonic();
 
-/**
- * Mode bits on the files that decide what this wallet may spend.
- *
- * On mainnet a loose mode is fatal, because "the agent cannot raise its own limits" stops being
- * true the moment the agent's user can write either file. Elsewhere it is a warning: a preprod
- * wallet is not worth refusing to start over. Windows mode bits do not carry this meaning, so the
- * check reports that it could not run rather than pretending to pass.
- */
-const permissionNotes: string[] = [];
+/** Group- or world-writable is fatal on mainnet, a warning elsewhere. */
+const permissionNotes: Array<{ level: "ok" | "warn"; detail: string }> = [];
 function checkFileMode(label: string, file: string) {
-  if (!existsSync(file)) return; // nothing to check, and saying otherwise is noise
+  if (!existsSync(file)) return;
   if (process.platform === "win32") {
-    // Not a pass. The check could not run, and reporting that as "ok" is how a deployment ends up
-    // believing it verified something it never looked at.
-    permissionNotes.push(`WARNING ${label}: not checked — Windows mode bits do not carry this meaning; verify the ACL by hand`);
+    // A check that could not run is not a check that passed.
+    permissionNotes.push({ level: "warn", detail: `${label}: not checked — Windows mode bits do not carry this meaning; verify the ACL by hand` });
     return;
   }
   const mode = statSync(file).mode & 0o777;
-  if (mode & 0o022) {
-    const msg = `${label} ${file} is writable by group or other (mode ${mode.toString(8)})`;
-    if (IS_MAINNET) fail(`refusing to run on ${NETWORK}: ${msg}`);
-    permissionNotes.push(`WARNING ${msg}`);
-  } else {
-    permissionNotes.push(`${label}: mode ${mode.toString(8)}`);
-  }
+  if (!(mode & 0o022)) return permissionNotes.push({ level: "ok", detail: `${label}: mode ${mode.toString(8)}` });
+  const msg = `${label} ${file} is writable by group or other (mode ${mode.toString(8)})`;
+  if (IS_MAINNET) fail(`refusing to run on ${NETWORK}: ${msg}`);
+  permissionNotes.push({ level: "warn", detail: msg });
 }
 
-/**
- * The policy declares the network its numbers were written for.
- *
- * Caps are bare integers with no unit attached, so a file tuned against 10,000 faucet tADA says
- * exactly the same thing to a mainnet wallet — where it means real money. Requiring mainnet to be
- * stated turns "wrong file" from an expensive no-op into a refusal to start.
- */
+/** Caps are bare integers, so a preprod file means something very different against real ADA. */
 function assertPolicyNetwork(p: Policy) {
   if (p.network && p.network !== NETWORK)
     throw new Error(`policy declares network "${p.network}" but CARDANO_NETWORK is "${NETWORK}"`);
@@ -206,24 +175,9 @@ if (KEYSTORE_FILE) checkFileMode("keystore", KEYSTORE_FILE);
 if (PASSPHRASE_FILE) checkFileMode("passphrase", PASSPHRASE_FILE);
 
 /**
- * The spend ledger and the audit log are two different things, and conflating them was a hole.
- *
- * The cap used to be a replay of `audit.jsonl` alone, so deleting that file reset the day's spend
- * to zero and rotating it did the same by accident. The ledger now lives in its own checkpoint —
- * rewritten atomically after every signed payment, holding only the 24h window any rule consults —
- * and the audit is what it says on the tin: an append-only log.
- *
- * They check each other. Every audit record carries a sequence number and the hash of the record
- * before it, and the checkpoint remembers where in that chain it was written. On startup the chain
- * is verified and the checkpoint must be found inside it, so:
- *
- *   - deleting the checkpoint changes nothing; it is rebuilt from the audit
- *   - deleting or over-rotating the audit is refused, because the record the checkpoint names is
- *     gone, and a removed record and an erased spend look the same from here
- *   - rotation stays possible: keep everything from the last checkpointed record onward
- *
- * Resetting the budget therefore takes two coordinated deletions rather than one `rm`, on top of
- * the file permissions meant to prevent either.
+ * The cap is computed from this checkpoint, not from the audit log. The log is chained, and the
+ * checkpoint records where in that chain it was written, so each can detect the other's loss:
+ * `npm run integrity` is the executable version of what that does and does not cover.
  */
 interface Checkpoint {
   version: 1;
@@ -251,7 +205,7 @@ function readCheckpoint(): Checkpoint | undefined {
   }
 }
 
-/** Replaces the checkpoint atomically: a torn write is indistinguishable from a tampered one. */
+/** Atomic: a torn write is indistinguishable from a tampered one. */
 function writeCheckpoint() {
   const body: Checkpoint = {
     version: 1,
@@ -282,8 +236,7 @@ function writeCheckpoint() {
     for await (const line of lines) {
       lineNo++;
       if (!line.trim()) continue;
-      // A truncated record is tolerated only as the very last thing in the file, which is what a
-      // crash mid-append looks like. One in the middle means the log is not the log that was written.
+      // Tolerated only as the last line, which is what a crash mid-append looks like.
       if (malformedTail !== undefined) fail(`audit ${resolvePath(AUDIT_FILE)} line ${malformedTail} is malformed`);
       let e: Record<string, unknown>;
       try {
@@ -293,8 +246,8 @@ function writeCheckpoint() {
         continue;
       }
       auditHasRecords = true;
+      // Records predating the chain carry no seq and no prev, so they are simply not verified.
       const seq = typeof e.seq === "number" ? e.seq : undefined;
-      // Records written before this scheme carry no seq and no prev; they are simply not chained.
       if (seq !== undefined) {
         if (chainBroken === undefined && typeof e.prev === "string" && e.prev !== auditPrevHash) chainBroken = lineNo;
         auditSeq = seq;
@@ -303,8 +256,12 @@ function writeCheckpoint() {
       if (checkpoint && seq === checkpoint.seq && auditPrevHash === checkpoint.hash) sawCheckpointRecord = true;
 
       const event = e.event;
+      // Only recent approvals: one cannot outlive MAX_APPROVAL_SECONDS, so anything older is
+      // settled whatever the log says. Tracking every id ever seen would grow without bound on a
+      // long-lived audit, which is the one thing the 24h window exists to avoid.
+      const recent = typeof e.ts === "number" && e.ts >= cutoff;
       if (event === "pending") {
-        pendingSeen.set(String(e.id), { id: String(e.id), agentId: String(e.agentId), reason: e.reason as string });
+        if (recent) pendingSeen.set(String(e.id), { id: String(e.id), agentId: String(e.agentId), reason: e.reason as string });
       } else if (
         event === "approved" ||
         event === "approval_denied" ||
@@ -313,12 +270,12 @@ function writeCheckpoint() {
         event === "approval_sign_error" ||
         event === "pending_abandoned"
       ) {
-        terminated.add(String(e.id));
+        if (recent) terminated.add(String(e.id));
       } else if (event === "signed" && typeof e.ts === "number") {
         if (e.ts < cutoff) replayedSkipped++;
-        // Only what the checkpoint cannot already contain. A record with no seq predates the chain
-        // entirely, so it is necessarily older than the checkpoint and already counted in it —
-        // adding it again re-counted those spends on every single restart, without bound.
+        // Only what the checkpoint cannot already hold. No seq means it predates the chain, so it
+        // is older than the checkpoint by construction; counting it again inflated spend on every
+        // restart, without bound.
         else if (checkpoint === undefined || (seq !== undefined && seq > checkpoint.seq))
           afterCheckpoint.push({ ts: e.ts, agentId: String(e.agentId), asset: String(e.asset), amount: BigInt(String(e.amount)) });
       }
@@ -344,14 +301,14 @@ function writeCheckpoint() {
   } else if (auditHasRecords) {
     console.error(`signerd: no ledger checkpoint yet; rebuilding the 24h window from the audit log`);
   }
-  // Anything the audit recorded after the checkpoint was written: a crash between the two.
+  // Anything logged after the checkpoint: a crash between the two.
   ledger.push(...afterCheckpoint);
   ledger.sort((a, b) => a.ts - b.ts);
 
   for (const [id, entry] of pendingSeen) if (!terminated.has(id)) openPending.push(entry);
 }
 
-/** Ledger entries are appended in time order, so what has expired is always a prefix. */
+/** Appended in time order, so what has expired is always a prefix. */
 function pruneLedger(now = Date.now()) {
   const cutoff = now - LEDGER_WINDOW_MS;
   let drop = 0;
@@ -360,27 +317,21 @@ function pruneLedger(now = Date.now()) {
 }
 
 /**
- * Budget held by a queued approval. A request waiting on a human has not spent anything yet, but
- * it will if the operator says yes — so queuing two requests must not be a way to promise the
- * same budget twice. Reservations count as spend until the request resolves either way.
+ * Budget held by a queued approval, counted as spend until it resolves: queuing two requests must
+ * not be a way to promise the same budget twice.
  */
 const reserved = new Map<string, SpendRecord>();
 const effectiveLedger = (): readonly SpendRecord[] =>
   reserved.size === 0 ? ledger : [...ledger, ...reserved.values()];
 
 const auditFd = openSync(AUDIT_FILE, "a");
-/**
- * Every audit record passes through here, so this is also where they get counted. The events that
- * matter operationally — denied, policy_error, nonce_collision, approval_timeout — are exactly the
- * ones nobody notices until someone goes looking, which is what /metrics is for.
- */
+/** Every record passes through here, so it is also where they are counted for /metrics. */
 const eventCounts = new Map<string, number>();
 let unauthorizedRequests = 0;
 
 function audit(event: string, data: Record<string, unknown>) {
   eventCounts.set(event, (eventCounts.get(event) ?? 0) + 1);
-  // `seq` and `prev` make the log a chain: a record that is removed or edited stops matching the
-  // one after it, which is what lets the ledger checkpoint refuse a log that has been rewritten.
+  // `seq` and `prev` chain the log: a removed or edited record stops matching the one after it.
   const entry = { ts: Date.now(), seq: ++auditSeq, prev: auditPrevHash, event, ...data };
   const line = JSON.stringify(entry, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
   writeSync(auditFd, line + "\n");
@@ -389,25 +340,23 @@ function audit(event: string, data: Record<string, unknown>) {
   return entry;
 }
 
-// A hard kill cannot drain the approval queue the way a signal handler does, so the log is
-// reconciled here instead: a request left open by a previous run is closed now rather than sitting
-// in the audit forever as a `pending` that nothing ever answers.
+// A SIGKILL cannot drain the approval queue the way a signal handler does, so anything a previous
+// run left open is closed here rather than staying a `pending` nothing ever answers.
 for (const abandoned of openPending)
   audit("pending_abandoned", { id: abandoned.id, agentId: abandoned.agentId, reason: abandoned.reason });
 if (openPending.length)
   console.error(`signerd: closed ${openPending.length} approval request(s) left open by a previous run`);
 
-// Re-establish the checkpoint now rather than at the next payment. Without this there is a window
-// — arbitrarily long, on a wallet that is idle — in which no checkpoint exists and deleting the
-// audit log would silently reset the cap, which is the whole thing the checkpoint prevents.
+// Now, not at the next payment: an idle wallet would otherwise sit with no checkpoint at all, and
+// so with nothing protecting the cap.
 writeCheckpoint();
 
 const signer: ClientCardanoSigner = toClientCardanoSigner({
   mnemonic,
   network: NETWORK,
   provider: providerConfig(),
-  // A masumi escrow locks collateral derived from the datum size, and the datum carries the
-  // seller's own bytes verbatim — so without a ceiling a seller chooses how much this wallet locks.
+  // Masumi collateral scales with datum size, and the datum carries the seller's own bytes: with
+  // no ceiling, the seller chooses how much this wallet locks.
   ...(process.env.MASUMI_MAX_COLLATERAL_LOVELACE
     ? { masumiMaxCollateralLovelace: BigInt(process.env.MASUMI_MAX_COLLATERAL_LOVELACE) }
     : {}),
@@ -422,18 +371,17 @@ function providerConfig() {
 const address = signer.getAddress();
 
 /**
- * What the wallet is holding, refreshed in the background.
- *
- * The daily cap bounds an agent; it does not bound someone who has the key. What bounds them is
- * how much is in the wallet, which is why MAX_HOT_BALANCE_LOVELACE exists and why preflight fails
- * on mainnet without one. Cached rather than fetched on demand so a metrics scrape never waits on
- * a provider, and never turns into one request per scrape against a rate-limited free service.
+ * What the wallet holds. The daily cap bounds an agent, not someone holding the key — only the
+ * balance does that. Cached so a metrics scrape never waits on a rate-limited provider.
  */
 let hotBalance: bigint | undefined;
 let hotBalanceAt = 0;
 let hotBalanceError: string | undefined;
+let balanceInFlight = false;
 
 async function refreshBalance() {
+  if (balanceInFlight) return; // a slow provider must not stack up one request per interval
+  balanceInFlight = true;
   try {
     const preprod = NETWORK.endsWith("preprod");
     let lovelace: bigint;
@@ -459,40 +407,26 @@ async function refreshBalance() {
     hotBalanceError = undefined;
   } catch (e) {
     hotBalanceError = String(e instanceof Error ? e.message : e);
+  } finally {
+    balanceInFlight = false;
   }
 }
 void refreshBalance();
 setInterval(refreshBalance, 60_000).unref();
 
 /**
- * Two different things need ordering, so there are two locks.
- *
- * The agent lock covers "decide, then record the spend". `decide` reads the ledger and the spend
- * is appended only after the transaction is built — and building queries the chain — so without
- * it, two concurrent requests for one agent both read the same pre-spend ledger and both pass a
- * cap that fits one. Measured on preprod before this existed: a 2 ADA daily cap signed two 1.5 ADA
- * payments, and status then reported a remaining budget of zero rather than the overspend.
- *
- * The wallet lock covers signing, which belongs to the key rather than to the agent: there is one
- * wallet, so two builds racing over its UTXO set are free to pick the same one.
+ * Two locks, because two things need ordering. The agent lock spans "decide, then record the
+ * spend" — building the transaction queries the chain, so without it two concurrent requests read
+ * the same pre-spend ledger and both pass a cap that fits one. The wallet lock spans signing, which
+ * belongs to the key rather than the agent: one wallet, one UTXO set. `npm run concurrency`.
  */
 const withAgentLock = createKeyedLock();
 const withWalletLock = createLock();
 
 /**
- * UTXOs committed to a transaction that has been handed out but has not settled.
- *
- * signerd never learns when a payment settles — it returns the signed transaction to the agent and
- * the facilitator broadcasts it. What it can see is the signer picking a UTXO that another
- * unsettled transaction already spends: the chain still reports it unspent, so serializing the
- * builds does not prevent this, and only one of the two can ever land. Refusing beats handing back
- * a transaction that is already dead.
- *
- * The hold is deliberately short, and shorter than the transaction's own TTL. What actually stops
- * an agent overspending is the ledger; this is only an optimization against wasted signatures, and
- * a real double-spend is refused by the chain regardless. Holding too long is the worse mistake:
- * a settlement that fails is never reported back here, so an over-long hold wedges the wallet —
- * on a single-UTXO wallet, completely — for no safety gained.
+ * UTXOs committed to a handed-out payment that has not settled. The facilitator broadcasts, so
+ * settlement is never reported back here — which is why the hold is short: a failed settlement
+ * would otherwise wedge the wallet, and the ledger, not this, is what bounds spending.
  */
 const inflightNonces = new Map<string, number>();
 function claimNonce(nonce: string, ttlSeconds: number): boolean {
@@ -503,11 +437,7 @@ function claimNonce(nonce: string, ttlSeconds: number): boolean {
   return true;
 }
 
-/**
- * How long an approval may wait. `maxTimeoutSeconds` arrives from the seller's 402, so it is not
- * ours to trust: left unclamped, a zero or negative value made every approval time out the instant
- * it was queued, which is a denial of service on the one path that involves a human.
- */
+/** `maxTimeoutSeconds` comes from the seller's 402: unclamped, zero times out every approval. */
 const approvalWindow = (input: ClientCardanoSignInput) =>
   Math.max(30, Math.min(input.maxTimeoutSeconds ?? 300, MAX_APPROVAL_SECONDS));
 
@@ -521,9 +451,7 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
     ledger.push({ ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
     pruneLedger();
     audit("signed", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce, network: input.network });
-    // After the audit record, so the checkpoint names it. A crash between the two is recoverable:
-    // startup replays anything the log has beyond the checkpoint.
-    writeCheckpoint();
+    writeCheckpoint(); // after the audit record, so the checkpoint names it
     return res;
   });
 }
@@ -586,8 +514,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     };
     if (!agentId || !input?.payTo || !input?.asset || !input?.amount)
       return json(res, 400, { error: "agentId, reason, input{payTo,asset,amount} required" });
-    // A bad amount is the caller's mistake, not ours: BigInt() would throw it into a 500 and an
-    // audit record nobody can act on.
+    // Otherwise BigInt() turns the caller's mistake into a 500.
     if (typeof input.amount !== "string" || !/^[0-9]+$/.test(input.amount))
       return json(res, 400, { error: "input.amount must be a decimal integer string" });
     if (typeof input.payTo !== "string" || typeof input.asset !== "string")
@@ -599,7 +526,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       try {
         current = refreshPolicy();
       } catch (e) {
-        // Fail closed, and say so in the audit: an unreadable policy is not a permissive one.
+        // An unreadable policy is not a permissive one.
         const detail = String(e instanceof Error ? e.message : e);
         audit("policy_error", { agentId, reason, detail });
         return { kind: "deny", rule: "policy_unreadable", detail };
@@ -622,8 +549,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
       if (d.verdict === "needs_approval") {
         const id = randomUUID().slice(0, 8);
-        // Hold the budget while the operator decides, but release the lock: a human may take
-        // minutes, and nothing else for this agent should be stalled behind them.
+        // Hold the budget, release the lock: a human may take minutes.
         reserved.set(id, { ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
         audit("pending", { id, agentId, reason, resource, payTo: input.payTo, asset: input.asset, amount: input.amount, detail: d.detail });
         const settled = new Promise<Settled>(resolve => {
@@ -671,8 +597,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       return json(res, 200, { ok: true });
     }
     try {
-      // Signing appends the real spend; the reservation standing in for it is dropped only
-      // afterwards, so the budget is never momentarily unheld.
+      // Drop the reservation only after signing has recorded the real spend.
       const out = await withAgentLock(p.agentId, () => sign(p.agentId, p.reason, p.input));
       reserved.delete(p.id);
       audit("approved", { id: p.id, agentId: p.agentId });
@@ -688,59 +613,49 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   json(res, 404, { error: "not found" });
 }
 
-/**
- * Prometheus exposition, behind the same bearer token as everything else — it reports what this
- * wallet has spent, which is not public.
- *
- * Counters restart at zero with the process, which is the convention: a scrape sees the reset and
- * rates stay correct across it. The gauges are the live view the counters cannot give you —
- * remaining budget, whether a cap has been breached, how long the approval queue is.
- *
- * Worth alerting on: any increase in denied, policy_error or nonce_collision; over_budget going to
- * 1; pending staying above zero for longer than a human should take.
- */
+type Sample = [labels: string, value: string | number];
+
+/** Prometheus exposition, behind the same bearer token: what this wallet has spent is not public. */
 function metrics(): string {
   const out: string[] = [];
-  const emit = (name: string, help: string, type: "counter" | "gauge", samples: Array<[string, string | number]>) => {
+  const series = (name: string, help: string, type: "counter" | "gauge", samples: Sample[]) => {
     if (samples.length === 0) return;
     out.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`);
     for (const [labels, value] of samples) out.push(labels ? `${name}{${labels}} ${value}` : `${name} ${value}`);
   };
+  const one = (name: string, help: string, type: "counter" | "gauge", value: string | number) =>
+    series(name, help, type, [["", value]]);
   const esc = (v: string) => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 
-  emit("ada_wallet_up", "1 when signerd is serving.", "gauge", [["", 1]]);
-  emit(
-    "ada_wallet_audit_events_total",
-    "Audit records written since this process started, by event.",
-    "counter",
-    [...eventCounts].map(([event, n]) => [`event="${esc(event)}"`, n] as [string, number]),
-  );
-  emit("ada_wallet_unauthorized_requests_total", "Requests rejected for a bad or missing bearer token.", "counter", [["", unauthorizedRequests]]);
-  emit("ada_wallet_audit_seq", "Sequence number of the last audit record.", "gauge", [["", auditSeq]]);
-  emit("ada_wallet_pending_approvals", "Payments waiting on a human right now.", "gauge", [["", pending.size]]);
-  emit("ada_wallet_inflight_utxos", "UTXOs committed to a handed-out payment that has not settled.", "gauge", [["", inflightNonces.size]]);
+  one("ada_wallet_up", "1 when signerd is serving.", "gauge", 1);
+  series("ada_wallet_audit_events_total", "Audit records written since this process started, by event.", "counter",
+    [...eventCounts].map(([event, n]): Sample => [`event="${esc(event)}"`, n]));
+  one("ada_wallet_unauthorized_requests_total", "Requests rejected for a bad or missing bearer token.", "counter", unauthorizedRequests);
+  one("ada_wallet_audit_seq", "Sequence number of the last audit record.", "gauge", auditSeq);
+  one("ada_wallet_pending_approvals", "Payments waiting on a human right now.", "gauge", pending.size);
+  one("ada_wallet_inflight_utxos", "UTXOs committed to a handed-out payment that has not settled.", "gauge", inflightNonces.size);
   if (hotBalance !== undefined) {
-    emit("ada_wallet_balance_lovelace", "Lovelace held by the wallet, as of the last refresh.", "gauge", [["", hotBalance.toString()]]);
-    emit("ada_wallet_balance_age_seconds", "Seconds since the balance was last refreshed.", "gauge", [["", Math.round((Date.now() - hotBalanceAt) / 1000)]]);
+    one("ada_wallet_balance_lovelace", "Lovelace held by the wallet, as of the last refresh.", "gauge", hotBalance.toString());
+    one("ada_wallet_balance_age_seconds", "Seconds since the balance was last refreshed.", "gauge", Math.round((Date.now() - hotBalanceAt) / 1000));
   }
   if (MAX_HOT_BALANCE !== undefined) {
-    emit("ada_wallet_balance_ceiling_lovelace", "Configured ceiling on what this hot wallet should hold.", "gauge", [["", MAX_HOT_BALANCE.toString()]]);
-    emit("ada_wallet_balance_over_ceiling", "1 when the wallet holds more than the configured ceiling.", "gauge",
-      [["", hotBalance !== undefined && hotBalance > MAX_HOT_BALANCE ? 1 : 0]]);
+    one("ada_wallet_balance_ceiling_lovelace", "Configured ceiling on what this hot wallet should hold.", "gauge", MAX_HOT_BALANCE.toString());
+    one("ada_wallet_balance_over_ceiling", "1 when the wallet holds more than the configured ceiling.", "gauge",
+      hotBalance !== undefined && hotBalance > MAX_HOT_BALANCE ? 1 : 0);
   }
 
-  let current: Policy | undefined;
+  let current: Policy;
   try {
     current = refreshPolicy();
   } catch {
-    emit("ada_wallet_policy_readable", "1 when the policy file parses.", "gauge", [["", 0]]);
+    one("ada_wallet_policy_readable", "1 when the policy file parses.", "gauge", 0);
     return out.join("\n") + "\n";
   }
-  emit("ada_wallet_policy_readable", "1 when the policy file parses.", "gauge", [["", 1]]);
+  one("ada_wallet_policy_readable", "1 when the policy file parses.", "gauge", 1);
 
-  const spent: Array<[string, string | number]> = [];
-  const capped: Array<[string, string | number]> = [];
-  const over: Array<[string, string | number]> = [];
+  const spent: Sample[] = [];
+  const capped: Sample[] = [];
+  const over: Sample[] = [];
   for (const agentId of Object.keys(current.agents)) {
     const r = remaining(current, effectiveLedger(), agentId);
     if (!r) continue;
@@ -751,15 +666,15 @@ function metrics(): string {
       over.push([labels, a.overBudget ? 1 : 0]);
     }
   }
-  emit("ada_wallet_daily_spent", "Spent in the rolling 24h window, smallest unit of the asset.", "gauge", spent);
-  emit("ada_wallet_daily_max", "The 24h cap, smallest unit of the asset.", "gauge", capped);
-  emit("ada_wallet_over_budget", "1 when the 24h cap has been exceeded.", "gauge", over);
+  series("ada_wallet_daily_spent", "Spent in the rolling 24h window, smallest unit of the asset.", "gauge", spent);
+  series("ada_wallet_daily_max", "The 24h cap, smallest unit of the asset.", "gauge", capped);
+  series("ada_wallet_over_budget", "1 when the 24h cap has been exceeded.", "gauge", over);
   return out.join("\n") + "\n";
 }
 
 type CheckLevel = "ok" | "warn" | "fail";
 
-/** The checks worth passing before this wallet holds anything you would miss. */
+/** What to look at before this wallet holds anything you would miss. */
 function preflight() {
   const checks: Array<{ level: CheckLevel; check: string; detail: string }> = [];
   const add = (level: CheckLevel, check: string, detail: string) => checks.push({ level, check, detail });
@@ -778,9 +693,7 @@ function preflight() {
     current?.network ?? "absent; caps carry no unit, so this file cannot tell preprod from mainnet",
   );
 
-  for (const note of permissionNotes) {
-    add(note.startsWith("WARNING") ? "warn" : "ok", "file permissions", note.replace(/^WARNING /, ""));
-  }
+  for (const note of permissionNotes) add(note.level, "file permissions", note.detail);
 
   add(
     KEYSTORE_FILE ? "ok" : IS_MAINNET ? "fail" : "warn",
@@ -892,9 +805,8 @@ function readBody(req: IncomingMessage) {
 
 const server = createServer((req, res) =>
   handle(req, res).catch(e => {
-    // Whatever went wrong, failing to report it must not be worse than the failure. A response
-    // that has already started cannot be replaced, and throwing here would surface as an unhandled
-    // rejection — which in Node means the signing daemon exits because one request was malformed.
+    // A response already started cannot be replaced, and throwing here would be an unhandled
+    // rejection — which in Node exits the daemon over one malformed request.
     console.error(`signerd: request failed: ${e instanceof Error ? e.message : e}`);
     try {
       if (res.headersSent) res.end();
@@ -906,8 +818,7 @@ const server = createServer((req, res) =>
 );
 
 /**
- * Stop cleanly: refuse new work, tell anyone waiting on an approval that it is not coming — rather
- * than leaving a `pending` the audit never closes — let any signature in flight finish, and flush.
+ * Refuse new work, answer anyone waiting on an approval, let a signature in flight finish, flush.
  */
 function shutdown(signal: string) {
   if (shuttingDown) return;
@@ -929,9 +840,8 @@ function shutdown(signal: string) {
     closeSync(auditFd);
     process.exit(0);
   };
-  // Waiting for the server to close lets the verdicts just handed to waiting callers reach the
-  // wire; queuing behind the wallet lock waits for whatever signature is in progress. Neither is
-  // allowed to hang the shutdown, so there is a deadline on both.
+  // Let the verdicts just handed to waiting callers reach the wire, and any signature in progress
+  // finish — neither allowed to hang the shutdown.
   server.close(() => void withWalletLock(async () => {}).then(finish));
   server.closeIdleConnections?.();
   setTimeout(finish, 10_000);
@@ -946,7 +856,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.error(`ledger: ${resolvePath(LEDGER_FILE)}  (${ledger.length} spends inside the 24h window)`);
   console.error(`agents: ${Object.keys(policy.agents).join(", ")}`);
   console.error(`key:    ${KEYSTORE_FILE ? "encrypted keystore" : "plaintext mnemonic"}`);
-  for (const note of permissionNotes) console.error(`  ${note}`);
+  for (const note of permissionNotes) console.error(`  ${note.level === "warn" ? "WARNING " : ""}${note.detail}`);
   console.error(`neither the policy nor the audit file may be writable by the agent's user`);
   console.error(`run "walletctl preflight" before pointing this at real money`);
 });

@@ -10,16 +10,11 @@ export interface GatedSignerConfig {
   agentId: string;
   /** Called per payment to supply the reason logged in the audit trail. */
   reason: () => string;
-  /**
-   * Called per payment for the URL being paid for, which signerd checks against
-   * `allowedResources`. The reference `@x402/cardano` client does not pass the resource through to
-   * the signer, so it has to come from the caller that knows it.
-   */
+  /** The URL being paid for, for `allowedResources`. The reference client does not pass it on. */
   resource?: () => string | undefined;
   /**
-   * Called with the verdict before it is thrown. `@x402/fetch` rethrows whatever the signer
-   * throws as a plain `new Error(message)` with no `cause`, so a caller that only catches
-   * cannot recover the rule, detail or pending id — it has to be handed them here.
+   * The verdict, handed over before it is thrown: `@x402/fetch` rethrows as a plain Error with no
+   * `cause`, so catching alone loses the rule, detail and pending id.
    */
   onDenied?: (denied: PolicyDenied) => void;
 }
@@ -32,7 +27,14 @@ export class PolicyDenied extends Error {
 
 export async function createGatedSigner(cfg: GatedSignerConfig): Promise<ClientCardanoSigner> {
   const headers = { authorization: `Bearer ${cfg.token}`, "content-type": "application/json" };
-  const status = await fetch(`${cfg.signerdUrl}/status`, { headers }).then(r => r.json() as Promise<{ address: string }>);
+  const res = await fetch(`${cfg.signerdUrl}/status`, { headers }).catch(e => {
+    throw new Error(`signerd is not answering at ${cfg.signerdUrl}: ${e instanceof Error ? e.message : e}`);
+  });
+  const status = (await res.json().catch(() => ({}))) as { address?: string; error?: string };
+  // Without this, a 401 or a 503 left `address` undefined and every payment was built against it.
+  if (!res.ok) throw new Error(`signerd refused /status (${res.status}${status.error ? `: ${status.error}` : ""})`);
+  if (typeof status.address !== "string" || !status.address)
+    throw new Error("signerd /status returned no wallet address");
   const address = status.address;
   return {
     getAddress: () => address,

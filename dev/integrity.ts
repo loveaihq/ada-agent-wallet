@@ -1,10 +1,6 @@
 /**
- * Regression check for the one thing the spend cap rests on: that it cannot be reset by deleting
- * a file.
- *
- * The cap used to be a replay of `audit.jsonl`, so `rm audit.jsonl` restored a spent agent to a
- * full daily budget, and log rotation did the same by accident. The ledger is now its own
- * checkpoint, and the audit is a hash-chained log that the checkpoint points into:
+ * The spend cap must not be resettable by deleting a file. The ledger is its own checkpoint and the
+ * audit is a hash-chained log the checkpoint points into, so:
  *
  *   A. deleting the checkpoint changes nothing — it is rebuilt from the log
  *   B. deleting the log the checkpoint points into is refused at startup
@@ -14,8 +10,7 @@
  *      the deployment contract exist to cover, stated here rather than left to be discovered
  *   E. restarting over a pre-chain audit log does not re-count what the checkpoint already holds
  *
- * Nothing here is broadcast: `/sign` builds and signs, and the facilitator is what publishes. It
- * does need chain access and a funded wallet, because signing reads the wallet's UTXOs.
+ * Spends nothing, but needs chain access and a funded wallet: signing reads the wallet's UTXOs.
  *
  * Env: SIGNERD_TOKEN, WALLET_MNEMONIC_FILE, SELLER_ADDRESS, CARDANO_NETWORK
  */
@@ -116,11 +111,10 @@ try {
   );
   await stop(child);
 
-  // --- E: restarting must not invent spending ---------------------------------------------------
-  // Audit records written before the chain existed carry no sequence number. The first version of
-  // this replay read "no seq" as "the checkpoint cannot have seen this" and added them again on
-  // every start, so recorded spend grew without bound across restarts until nothing could be paid
-  // at all. It only shows up on a log that predates the checkpoint, which is what this seeds.
+  // --- E ---------------------------------------------------------------------------------------
+  // Pre-chain records have no sequence number. Reading that as "the checkpoint cannot have seen
+  // this" re-counted them on every start, without bound. Only reproducible on a log that predates
+  // the checkpoint, which is what this seeds.
   console.log("\nE. restart repeatedly over a pre-chain audit log");
   const legacyDir = mkdtempSync(join(tmpdir(), "ada-wallet-legacy-"));
   const legacyPolicy = join(legacyDir, "policy.json");

@@ -33,37 +33,24 @@ export interface AgentPolicy {
   /** Above this amount (per asset) a human must approve. Missing => never. */
   approvalAbove?: AmountMap;
   /**
-   * Cardano asset transfer methods this agent may use. Defaults to ["default"].
-   *
-   * "masumi" is not in the default set because its cost is not only `amount`: the escrow also
-   * locks buyer collateral, which no field here can see and which stays locked until the
-   * contract's submit_result_time. Enabling it means accepting a lovelace charge on top of the
-   * payment, bounded by signerd's MASUMI_MAX_COLLATERAL_LOVELACE rather than by this policy.
+   * Defaults to ["default"]. "masumi" is excluded because its cost is not only `amount` — the
+   * escrow also locks collateral no field here can see, bounded only by signerd's
+   * MASUMI_MAX_COLLATERAL_LOVELACE.
    */
   allowedAssetTransferMethods?: string[];
   /**
-   * Resources this agent may buy from: exact URLs, prefixes ending in `/*`, or ["*"] for any.
-   * Omitted means any.
+   * Exact URLs, prefixes ending in `/*`, or ["*"] for any; omitted means any.
    *
-   * Unlike every other field here, this is checked against a URL the agent process reports rather
-   * than against anything in the transaction, because the reference `@x402/cardano` client does
-   * not pass the resource through to the signer. It therefore constrains an agent that is running
-   * our code and being steered — the prompt-injection case — and not one whose process has been
-   * replaced. `allowedPayees` is the control that binds the transaction itself; treat this as the
-   * layer above it, not as a substitute.
+   * Checked against a URL the agent process reports, not against the transaction, so it constrains
+   * a steered agent rather than a replaced one. `allowedPayees` is what binds the transaction.
    */
   allowedResources?: string[];
 }
 
 export interface Policy {
   /**
-   * The x402 network these limits are written for, e.g. "cardano:preprod".
-   *
-   * signerd refuses to start when this disagrees with CARDANO_NETWORK, and refuses to run on
-   * mainnet at all unless it is stated. Caps are bare numbers with no unit attached: a policy
-   * tuned against 10,000 faucet tADA says exactly the same thing to a mainnet wallet, where it
-   * means real money. Declaring the network makes reusing the wrong file an error rather than a
-   * very expensive no-op.
+   * The network these limits are written for. signerd refuses to start on a mismatch, and refuses
+   * mainnet unless it is stated: caps are bare numbers, and a preprod file reads identically.
    */
   network?: string;
   agents: Record<string, AgentPolicy>;
@@ -117,10 +104,8 @@ export function parsePolicy(raw: unknown): Policy {
     throw new Error(`policy: network must be a CAIP-2 style id such as "cardano:mainnet"`);
   const agents = (raw as Policy).agents;
   for (const [id, p] of Object.entries(agents)) {
-    // Reject unknown keys rather than ignoring them. Every field here either forbids something or
-    // bounds it, so a misspelled one does not degrade to a stricter policy — it degrades to no
-    // policy at all: `approvalabove` is not a typo that trips an error, it is a threshold that
-    // silently never fires.
+    // Every field here forbids or bounds something, so a misspelling does not degrade to a
+    // stricter policy but to none: `approvalabove` is a threshold that silently never fires.
     for (const key of Object.keys(p)) {
       if (!AGENT_POLICY_KEYS.includes(key))
         throw new Error(`policy: agent ${id} has unknown field "${key}" (known: ${AGENT_POLICY_KEYS.join(", ")})`);
@@ -163,12 +148,9 @@ export function parsePolicy(raw: unknown): Policy {
 }
 
 /**
- * Exact match, or a `/*` suffix matching that path prefix. No regex, and no partial-segment
- * matches: the prefix keeps its trailing slash, so `https://api.example.com/v1/*` does not match
- * `https://api.example.com/v1evil/x`.
- *
- * Both sides are normalized through `URL` first, because `https://api.example.com/v1/../admin`
- * begins with an allowed prefix as a string and does not as a request.
+ * Exact match, or a `/*` suffix matching that path prefix. The prefix keeps its trailing slash so
+ * `/v1/*` does not match `/v1evil/x`, and both sides go through `URL` first so `/v1/../admin` does
+ * not match either.
  */
 function resourceMatches(pattern: string, resource: string): boolean {
   const target = normalizeUrl(resource);
@@ -212,8 +194,7 @@ export function decide(policy: Policy, ledger: readonly SpendRecord[], req: Paym
     return { verdict: "deny", rule: "payee", detail: `payee ${req.payTo} not in allowlist` };
 
   if (ap.allowedResources && !ap.allowedResources.includes("*")) {
-    // Fail closed: a caller that reports no resource cannot be checked against the allowlist,
-    // and an unverifiable payment is the thing the allowlist exists to prevent.
+    // Fail closed: an unreported resource cannot be checked, which is what the list exists for.
     if (!req.resource)
       return { verdict: "deny", rule: "resource", detail: `agent ${req.agentId} has allowedResources but the payment named no resource` };
     if (!ap.allowedResources.some(pattern => resourceMatches(pattern, req.resource!)))
@@ -251,12 +232,9 @@ export function decide(policy: Policy, ledger: readonly SpendRecord[], req: Paym
 }
 
 /**
- * Human-readable remaining budget, for wallet_status.
- *
- * `dailyRemaining` is clamped at zero because a negative budget is not a thing you can spend,
- * but the clamp must not be the only number reported: a cap that was exceeded and a cap that was
- * exactly consumed both read as zero, and those are very different facts for an operator. So
- * `dailySpent`, `dailyMax` and an explicit `overBudget` are reported alongside it.
+ * Remaining budget, for wallet_status. `dailyRemaining` is clamped at zero, so `dailySpent`,
+ * `dailyMax` and `overBudget` are reported too — an exceeded cap and an exactly spent one both
+ * clamp to the same number, and they are not the same fact.
  */
 export function remaining(policy: Policy, ledger: readonly SpendRecord[], agentId: string, now = Date.now()) {
   const ap = policy.agents[agentId];

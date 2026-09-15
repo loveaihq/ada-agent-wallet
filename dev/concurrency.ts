@@ -1,17 +1,9 @@
 /**
- * Regression check for the spend-cap race, against a real signerd.
+ * Fires several payments at once against a cap that fits one, and fails unless exactly one signs.
+ * Without the agent lock all of them did, on one shared nonce.
  *
- * Before the agent lock existed, `decide` read the ledger and the spend was only recorded after
- * the transaction had been built — and building queries the chain. Two concurrent requests
- * therefore both read the same pre-spend ledger and both passed a cap that fits one. Measured on
- * preprod: a 2 ADA daily cap signed two 1.5 ADA payments, and both picked the same UTXO as their
- * nonce, so only one of them could ever have settled.
- *
- * This spends nothing. `/sign` builds and signs; broadcasting is the facilitator's job during
- * settle, and nothing here is ever handed to a facilitator.
- *
- * It does need chain access and a funded wallet, because signing reads the wallet's UTXOs — so it
- * lives in dev/ next to the other preprod checks rather than in the unit suite.
+ * Spends nothing: `/sign` builds and signs, and only a facilitator broadcasts. Needs chain access
+ * and a funded wallet, since signing reads the wallet's UTXOs.
  *
  * Env: SIGNERD_TOKEN, WALLET_MNEMONIC_FILE, SELLER_ADDRESS, CARDANO_NETWORK
  */

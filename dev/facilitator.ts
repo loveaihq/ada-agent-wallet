@@ -1,16 +1,9 @@
 /**
- * Local x402 facilitator for preprod.
+ * Local x402 facilitator for preprod: verifies the buyer's signed transaction, broadcasts it, and
+ * waits for the evidence the confirmation policy requires. No key and no funds — the buyer's
+ * transaction is already signed and pays its own fee.
  *
- * Verifies the buyer's signed-but-unbroadcast transaction against the payment requirements,
- * broadcasts it, and waits (bounded) for the evidence the confirmation policy requires.
- *
- * It holds no key and no funds: the buyer's transaction is already signed and balances its own
- * fee, so this only reads the chain and submits. `toFacilitatorCardanoSigner` runs provider-only.
- *
- * Endpoints — the contract @x402/core's HTTPFacilitatorClient speaks:
- *   GET  /supported
- *   POST /verify   {x402Version, paymentPayload, paymentRequirements}
- *   POST /settle   {x402Version, paymentPayload, paymentRequirements}
+ * Speaks what @x402/core's HTTPFacilitatorClient expects: GET /supported, POST /verify, POST /settle.
  *
  * Env: FACILITATOR_PORT (7403), CARDANO_NETWORK, BLOCKFROST_PROJECT_ID | KOIOS_TOKEN
  */
@@ -23,10 +16,8 @@ import { cardanoProvider, readBody, json } from "./provider.js";
 const PORT = Number(process.env.FACILITATOR_PORT ?? 7403);
 const NETWORK = (process.env.CARDANO_NETWORK ?? "cardano:preprod") as `${string}:${string}`;
 
-// Budget chain, widest first, so a slow block is waited out rather than reported as mempool:
-//   resource server's facilitator-client timeout (dev/resource.ts, 115s)
-//     > this provider's requestTimeoutMs, which bounds awaitTx (100s)
-//       > a preprod block (~20s typical, 80s gaps observed)
+// Must exceed a preprod block (~20s typical, 80s gaps seen) and stay under the resource server's
+// 115s facilitator-client timeout, or a slow block is reported as mempool.
 const AWAIT_TX_BUDGET_MS = Number(process.env.PROVIDER_TIMEOUT_MS ?? 100_000);
 
 const signer = toFacilitatorCardanoSigner({
@@ -34,12 +25,8 @@ const signer = toFacilitatorCardanoSigner({
   provider: cardanoProvider(NETWORK, AWAIT_TX_BUDGET_MS),
 });
 
-const facilitator = new x402Facilitator().register(
-  NETWORK,
-  // A preprod block gap of 80s has been observed; core retries settle() once, so the
-  // effective budget is roughly twice this.
-  new ExactCardanoScheme(signer, { confirmationTimeoutMs: 75_000 }),
-);
+// core retries settle() once, so the effective wait is roughly twice this.
+const facilitator = new x402Facilitator().register(NETWORK, new ExactCardanoScheme(signer, { confirmationTimeoutMs: 75_000 }));
 
 async function handle(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? "/", "http://localhost");

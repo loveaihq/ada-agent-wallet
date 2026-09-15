@@ -1,21 +1,17 @@
 #!/usr/bin/env node
 /**
- * Verifies the vendored @x402 packages.
- *
- * Two levels, because they answer different questions:
+ * Verifies the vendored @x402 packages, at two levels.
  *
  *   npm run verify:vendor
- *     Are the tarballs in vendor/ the exact bytes this project was built and tested against?
- *     SHA-256 against vendor/checksums.txt. Cheap, offline, and what CI should run every time.
+ *     SHA-256 against vendor/checksums.txt: are these the bytes we tested against? Offline, and
+ *     what CI should run every time.
  *
- *   npm run verify:vendor -- --provenance <path-to-an-x402-checkout>
- *     Were those bytes built from the upstream commit vendor/PROVENANCE.md names?
- *     The published bundles carry `sourcesContent` in their .map files, so the original TypeScript
- *     can be recovered from the artifact itself and diffed against the checkout. That is a stronger
- *     claim than a checksum — it says what the code *is*, not merely that it has not changed —
- *     without needing to reproduce the build byte for byte.
+ *   npm run verify:vendor -- --provenance <x402 checkout>
+ *     And were those bytes built from the commit vendor/PROVENANCE.md names? The bundles ship
+ *     `sourcesContent`, so the original TypeScript is recoverable from the artifact and can be
+ *     diffed against the checkout without reproducing the build.
  *
- * What neither level does: tell you the code is correct or safe. Provenance is not review.
+ * Neither says the code is correct. Provenance is not review.
  */
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";

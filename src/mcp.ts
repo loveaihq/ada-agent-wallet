@@ -21,13 +21,9 @@ const AGENT_ID = process.env.AGENT_ID ?? "default";
 const headers = { authorization: `Bearer ${TOKEN}` };
 
 /**
- * Per-call state, carried by async context rather than by module-level slots.
- *
- * An MCP server may have several tool calls in flight, and the signer callbacks below are reached
- * through `@x402/fetch` with no argument of ours to thread state through. Module-level slots would
- * let one call's reason be written into another call's audit record — and tying a payment to the
- * reason the agent gave for it is the whole point of that record. AsyncLocalStorage follows the
- * await chain into the callbacks instead, so each payment reads its own.
+ * Per-call state. The signer callbacks below are reached through `@x402/fetch` with no argument of
+ * ours to thread state through, and module-level slots would let one concurrent tool call's reason
+ * land in another's audit record.
  */
 interface CallContext {
   reason: string;
@@ -63,7 +59,7 @@ server.tool("wallet_status", "Wallet address, per-agent remaining budget (rollin
     const s = await fetch(`${SIGNERD_URL}/status`, { headers }).then(r => r.json());
     return { content: [{ type: "text", text: JSON.stringify({ agentId: AGENT_ID, ...s }, null, 2) }] };
   } catch (e) {
-    // The agent can act on "the wallet daemon is not running"; it cannot act on a fetch stack trace.
+    // An agent can act on "the daemon is not running"; it cannot act on a fetch stack trace.
     return {
       content: [{ type: "text", text: `wallet unavailable: signerd is not answering at ${SIGNERD_URL} (${e instanceof Error ? e.message : String(e)})` }],
       isError: true,
@@ -75,8 +71,7 @@ server.tool(
   "x402_fetch",
   "Fetch a URL that may require x402 payment on Cardano. If it returns 402, the wallet pays within policy and retries. Always give a concrete reason — it goes in the audit log.",
   {
-    // `z.string().url()` accepts any scheme the URL parser does, file: and data: included. This
-    // tool exists to fetch paid HTTP resources; nothing else belongs in it.
+    // `z.string().url()` accepts every scheme the URL parser does, file: and data: included.
     url: z
       .string()
       .url()
@@ -96,8 +91,7 @@ server.tool(
           content: [
             {
               type: "text",
-              // Say so when the body is cut: an agent that does not know it is reading a fragment
-              // will happily draw conclusions from the half it got.
+              // An agent that does not know it is reading a fragment will reason from the half it got.
               text: JSON.stringify(
                 { status: r.status, paid: Boolean(paid), truncated: text.length > LIMIT, bytes: text.length, body: text.slice(0, LIMIT) },
                 null,
@@ -107,8 +101,8 @@ server.tool(
           ],
         };
       } catch (e) {
-        // `@x402/fetch` rethrows the signer's error as a plain Error with no `cause`, so the
-        // verdict is recovered from this call's context rather than from the caught value.
+        // `@x402/fetch` rethrows as a plain Error with no `cause`, so the verdict comes from the
+        // call context rather than from the caught value.
         const denied = e instanceof PolicyDenied ? e : callContext.getStore()?.denial;
         if (denied) {
           return { content: [{ type: "text", text: JSON.stringify({ denied: true, rule: denied.rule, detail: denied.detail, pendingId: denied.pendingId }) }], isError: true };
