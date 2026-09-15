@@ -41,9 +41,31 @@ export interface AgentPolicy {
    * payment, bounded by signerd's MASUMI_MAX_COLLATERAL_LOVELACE rather than by this policy.
    */
   allowedAssetTransferMethods?: string[];
+  /**
+   * Resources this agent may buy from: exact URLs, prefixes ending in `/*`, or ["*"] for any.
+   * Omitted means any.
+   *
+   * Unlike every other field here, this is checked against a URL the agent process reports rather
+   * than against anything in the transaction, because the reference `@x402/cardano` client does
+   * not pass the resource through to the signer. It therefore constrains an agent that is running
+   * our code and being steered — the prompt-injection case — and not one whose process has been
+   * replaced. `allowedPayees` is the control that binds the transaction itself; treat this as the
+   * layer above it, not as a substitute.
+   */
+  allowedResources?: string[];
 }
 
 export interface Policy {
+  /**
+   * The x402 network these limits are written for, e.g. "cardano:preprod".
+   *
+   * signerd refuses to start when this disagrees with CARDANO_NETWORK, and refuses to run on
+   * mainnet at all unless it is stated. Caps are bare numbers with no unit attached: a policy
+   * tuned against 10,000 faucet tADA says exactly the same thing to a mainnet wallet, where it
+   * means real money. Declaring the network makes reusing the wrong file an error rather than a
+   * very expensive no-op.
+   */
+  network?: string;
   agents: Record<string, AgentPolicy>;
 }
 
@@ -62,6 +84,8 @@ export interface PaymentRequest {
   reason: string;
   /** From the 402's `extra.assetTransferMethod`; absent means the "default" address-to-address flow. */
   assetTransferMethod?: string;
+  /** The URL the agent reports it is paying for; see AgentPolicy.allowedResources. */
+  resource?: string;
   now?: number;
 }
 
@@ -80,6 +104,7 @@ const AGENT_POLICY_KEYS = [
   "maxPerHour",
   "approvalAbove",
   "allowedAssetTransferMethods",
+  "allowedResources",
 ];
 const DEFAULT_TRANSFER_METHODS = ["default"];
 
@@ -87,6 +112,9 @@ export function parsePolicy(raw: unknown): Policy {
   if (typeof raw !== "object" || raw === null || typeof (raw as Policy).agents !== "object") {
     throw new Error("policy: expected { agents: { <id>: {...} } }");
   }
+  const net = (raw as Policy).network;
+  if (net !== undefined && (typeof net !== "string" || !/^[a-z0-9]+:[a-z0-9-]+$/.test(net)))
+    throw new Error(`policy: network must be a CAIP-2 style id such as "cardano:mainnet"`);
   const agents = (raw as Policy).agents;
   for (const [id, p] of Object.entries(agents)) {
     // Reject unknown keys rather than ignoring them. Every field here either forbids something or
@@ -110,6 +138,18 @@ export function parsePolicy(raw: unknown): Policy {
     }
     if (p.maxPerHour !== undefined && (!Number.isInteger(p.maxPerHour) || p.maxPerHour < 1))
       throw new Error(`policy: agent ${id} maxPerHour must be a positive integer`);
+    if (p.allowedResources !== undefined) {
+      if (!Array.isArray(p.allowedResources) || p.allowedResources.length === 0)
+        throw new Error(`policy: agent ${id} allowedResources must be a non-empty array (use ["*"] for any)`);
+      for (const r of p.allowedResources) {
+        if (typeof r !== "string" || r.length === 0)
+          throw new Error(`policy: agent ${id} allowedResources entries must be non-empty strings`);
+        if (r === "*") continue;
+        const bare = r.endsWith("/*") ? r.slice(0, -2) : r;
+        if (!/^https?:\/\/[^\s]+$/.test(bare))
+          throw new Error(`policy: agent ${id} allowedResources entry "${r}" must be an http(s) URL, optionally ending in /*`);
+      }
+    }
     if (p.allowedAssetTransferMethods !== undefined) {
       if (!Array.isArray(p.allowedAssetTransferMethods) || p.allowedAssetTransferMethods.length === 0)
         throw new Error(`policy: agent ${id} allowedAssetTransferMethods must be a non-empty array`);
@@ -120,6 +160,31 @@ export function parsePolicy(raw: unknown): Policy {
     }
   }
   return raw as Policy;
+}
+
+/**
+ * Exact match, or a `/*` suffix matching that path prefix. No regex, and no partial-segment
+ * matches: the prefix keeps its trailing slash, so `https://api.example.com/v1/*` does not match
+ * `https://api.example.com/v1evil/x`.
+ *
+ * Both sides are normalized through `URL` first, because `https://api.example.com/v1/../admin`
+ * begins with an allowed prefix as a string and does not as a request.
+ */
+function resourceMatches(pattern: string, resource: string): boolean {
+  const target = normalizeUrl(resource);
+  if (target === undefined) return false;
+  if (pattern.endsWith("/*")) {
+    const prefix = normalizeUrl(pattern.slice(0, -1)); // keep the trailing slash
+    return prefix !== undefined && target.startsWith(prefix);
+  }
+  return normalizeUrl(pattern) === target;
+}
+function normalizeUrl(value: string): string | undefined {
+  try {
+    return new URL(value).href;
+  } catch {
+    return undefined;
+  }
 }
 
 export function decide(policy: Policy, ledger: readonly SpendRecord[], req: PaymentRequest): Decision {
@@ -145,6 +210,15 @@ export function decide(policy: Policy, ledger: readonly SpendRecord[], req: Paym
 
   if (!ap.allowedPayees.includes("*") && !ap.allowedPayees.includes(req.payTo))
     return { verdict: "deny", rule: "payee", detail: `payee ${req.payTo} not in allowlist` };
+
+  if (ap.allowedResources && !ap.allowedResources.includes("*")) {
+    // Fail closed: a caller that reports no resource cannot be checked against the allowlist,
+    // and an unverifiable payment is the thing the allowlist exists to prevent.
+    if (!req.resource)
+      return { verdict: "deny", rule: "resource", detail: `agent ${req.agentId} has allowedResources but the payment named no resource` };
+    if (!ap.allowedResources.some(pattern => resourceMatches(pattern, req.resource!)))
+      return { verdict: "deny", rule: "resource", detail: `resource ${req.resource} not in allowlist` };
+  }
 
   if (req.amount > BigInt(perTx))
     return { verdict: "deny", rule: "per_tx_max", detail: `${req.amount} > perTxMax ${perTx} (${req.asset})` };

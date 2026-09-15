@@ -102,6 +102,42 @@ test("parsePolicy rejects bad input", () => {
     parsePolicy({ agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: ["*"], allowedAssetTransferMethods: [] } } }),
   );
 });
+test("resource allowlist: exact, prefix, and fail closed when unreported", () => {
+  const p = parsePolicy({
+    agents: {
+      a: {
+        perTxMax: { lovelace: "5000000" },
+        allowedPayees: ["*"],
+        allowedResources: ["https://api.example.com/v1/*", "https://exact.example.com/one"],
+      },
+    },
+  });
+  const r = (over: Record<string, unknown>) => ({ agentId: "a", payTo: PAYEE, asset: "lovelace", amount: 1_000_000n, reason: "buy data", now: T0, ...over });
+  assert.equal(decide(p, [], r({ resource: "https://api.example.com/v1/quote" })).verdict, "allow");
+  assert.equal(decide(p, [], r({ resource: "https://exact.example.com/one" })).verdict, "allow");
+  assert.equal(decide(p, [], r({ resource: "https://exact.example.com/two" })).rule, "resource");
+  assert.equal(decide(p, [], r({ resource: "https://evil.example.com/v1/quote" })).rule, "resource");
+  // the prefix keeps its slash, so a sibling path that merely starts with the same characters loses
+  assert.equal(decide(p, [], r({ resource: "https://api.example.com/v1evil/quote" })).rule, "resource");
+  // ".." begins with the prefix as a string but not as a request
+  assert.equal(decide(p, [], r({ resource: "https://api.example.com/v1/../admin" })).rule, "resource");
+  // a payment that names no resource cannot be checked, so it is refused
+  assert.equal(decide(p, [], r({})).rule, "resource");
+  assert.equal(decide(p, [], r({ resource: "not a url" })).rule, "resource");
+});
+test("resource allowlist is optional and [\"*\"] means any", () => {
+  const any = parsePolicy({ agents: { a: { perTxMax: { lovelace: "5000000" }, allowedPayees: ["*"], allowedResources: ["*"] } } });
+  const none = parsePolicy({ agents: { a: { perTxMax: { lovelace: "5000000" }, allowedPayees: ["*"] } } });
+  const r = (over: Record<string, unknown>) => ({ agentId: "a", payTo: PAYEE, asset: "lovelace", amount: 1_000_000n, reason: "buy data", now: T0, ...over });
+  assert.equal(decide(any, [], r({ resource: "https://anywhere.example.com/x" })).verdict, "allow");
+  assert.equal(decide(none, [], r({})).verdict, "allow");
+});
+test("parsePolicy validates network and allowedResources", () => {
+  assert.equal(parsePolicy({ network: "cardano:mainnet", agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: ["*"] } } }).network, "cardano:mainnet");
+  assert.throws(() => parsePolicy({ network: "mainnet", agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: ["*"] } } }));
+  assert.throws(() => parsePolicy({ agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: ["*"], allowedResources: [] } } }));
+  assert.throws(() => parsePolicy({ agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: ["*"], allowedResources: ["ftp://x/y"] } } }));
+});
 test("parsePolicy rejects a misspelled field instead of ignoring it", () => {
   // `approvalabove` would otherwise parse as "this agent never needs approval".
   assert.throws(

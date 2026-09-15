@@ -1,9 +1,11 @@
 {
+  "network": "cardano:preprod",
   "agents": {
     "default": {
       "perTxMax":                    { "lovelace": "5000000" },
       "dailyMax":                    { "lovelace": "20000000" },
       "allowedPayees":               ["*"],
+      "allowedResources":            ["https://api.example.com/v1/*"],
       "maxPerHour":                  20,
       "approvalAbove":               { "lovelace": "3000000" },
       "allowedAssetTransferMethods": ["default"]
