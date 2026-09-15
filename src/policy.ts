@@ -121,6 +121,17 @@ export function parsePolicy(raw: unknown): Policy {
         if (!/^[0-9]+$/.test(v)) throw new Error(`policy: agent ${id} amount for ${asset} must be a decimal integer string`);
       }
     }
+    // An asset absent from perTxMax is denied outright, so a cap or threshold for one is a typo
+    // that quietly does nothing.
+    for (const [label, m] of [
+      ["dailyMax", p.dailyMax],
+      ["approvalAbove", p.approvalAbove],
+    ] as const) {
+      for (const asset of Object.keys(m ?? {})) {
+        if (!(asset in p.perTxMax))
+          throw new Error(`policy: agent ${id} has ${label} for "${asset}", which is not in perTxMax and so is never allowed`);
+      }
+    }
     if (p.maxPerHour !== undefined && (!Number.isInteger(p.maxPerHour) || p.maxPerHour < 1))
       throw new Error(`policy: agent ${id} maxPerHour must be a positive integer`);
     if (p.allowedResources !== undefined) {

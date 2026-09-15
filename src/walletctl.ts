@@ -22,16 +22,35 @@ function die(msg: string): never {
   process.exit(1);
 }
 
-async function call(path: string, body?: unknown): Promise<{ status: number; data: unknown }> {
+const request = (path: string, body?: unknown) =>
+  fetch(URL_ + path, { method: body ? "POST" : "GET", headers, body: body ? JSON.stringify(body) : undefined });
+
+/**
+ * `anyStatus` is for the callers that inspect the status themselves. Everyone else gets a message:
+ * printing a 503 body as though it were a result is how you read "no pending approvals" off an
+ * error.
+ */
+async function call(path: string, body?: unknown, anyStatus = false): Promise<{ status: number; data: unknown }> {
   let res: Response;
   try {
-    res = await fetch(URL_ + path, { method: body ? "POST" : "GET", headers, body: body ? JSON.stringify(body) : undefined });
+    res = await request(path, body);
   } catch (e) {
     die(`cannot reach signerd at ${URL_} (${e instanceof Error ? e.message : String(e)}) — is it running?`);
   }
   if (res.status === 401) die(`signerd rejected the token; SIGNERD_TOKEN does not match the one it was started with`);
   const data = await res.json().catch(() => ({}));
+  if (!anyStatus && !res.ok) die(`signerd returned ${res.status} for ${path}: ${JSON.stringify(data)}`);
   return { status: res.status, data };
+}
+
+/** Best effort, for the one question worth asking a signerd that may not be running. */
+async function ask(path: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const res = await request(path);
+    return res.ok ? ((await res.json()) as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 switch (cmd) {
@@ -84,7 +103,7 @@ switch (cmd) {
     console.log(`  amount  ${entry.amount} ${entry.asset}`);
     console.log(`  payTo   ${entry.payTo}`);
     console.log(`  reason  ${entry.reason}`);
-    const { status, data } = await call(`/${cmd}`, { id: arg });
+    const { status, data } = await call(`/${cmd}`, { id: arg }, true);
     console.log(JSON.stringify(data));
     // exitCode rather than exit(): a hard exit here aborts inside libuv on Windows while the
     // fetch handles are still closing.
@@ -92,10 +111,14 @@ switch (cmd) {
     break;
   }
   case "audit": {
-    const f = process.env.AUDIT_FILE ?? "./audit.jsonl";
-    if (!existsSync(f)) die(`no audit file at ${resolvePath(f)} — set AUDIT_FILE, or run from signerd's working directory`);
+    // Ask signerd where it writes rather than guessing from the working directory, where a
+    // different audit.jsonl reads as "nothing ever happened".
+    const f = process.env.AUDIT_FILE ?? ((await ask("/preflight"))?.auditFile as string | undefined) ?? "./audit.jsonl";
+    if (!existsSync(f)) die(`no audit file at ${resolvePath(f)} — set AUDIT_FILE, or start signerd so it can say where it writes`);
+    const n = Number(arg ?? 20);
+    if (!Number.isInteger(n) || n <= 0) die(`audit takes a positive number of records, got "${arg}"`);
     const lines = readFileSync(f, "utf8").trim().split("\n").filter(Boolean);
-    console.log(lines.slice(-Number(arg ?? 20)).join("\n"));
+    console.log(lines.slice(-n).join("\n"));
     break;
   }
   default:

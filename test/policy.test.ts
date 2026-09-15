@@ -145,3 +145,18 @@ test("parsePolicy rejects a misspelled field instead of ignoring it", () => {
     /unknown field "approvalabove"/,
   );
 });
+test("parsePolicy rejects a cap for an asset that is never allowed", () => {
+  // A malformed asset id is already caught; this is the valid-but-absent one, which is what
+  // copying a policy between networks leaves behind. The asset is denied outright, so a dailyMax
+  // or threshold for it silently does nothing.
+  const base = { perTxMax: { lovelace: "5000000" }, allowedPayees: ["*"] };
+  assert.throws(
+    () => parsePolicy({ agents: { a: { ...base, dailyMax: { [USDM]: "9" } } } }),
+    /dailyMax for ".*", which is not in perTxMax/,
+  );
+  assert.throws(
+    () => parsePolicy({ agents: { a: { ...base, approvalAbove: { [USDM]: "9" } } } }),
+    /approvalAbove for ".*", which is not in perTxMax/,
+  );
+  assert.doesNotThrow(() => parsePolicy({ agents: { a: { ...base, dailyMax: { lovelace: "9" } } } }));
+});
