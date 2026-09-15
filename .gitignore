@@ -5,3 +5,5 @@ audit.jsonl
 .env.local
 *.log
 .mcp.json
+ledger.json
+ledger.json.tmp

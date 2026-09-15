@@ -25,17 +25,21 @@
  *   BLOCKFROST_PROJECT_ID   optional; without it the daemon uses Koios (free, no key)
  *   KOIOS_TOKEN             optional
  *   POLICY_FILE       default ./policy.json
- *   AUDIT_FILE        default ./audit.jsonl
+ *   AUDIT_FILE        default ./audit.jsonl   (append-only log; chained)
+ *   LEDGER_FILE       default ./ledger.json  (the spend state the cap is computed from)
+ *   ALLOW_UNVERIFIED_AUDIT  set to 1 to start when the audit chain no longer covers the checkpoint
+ *                           (a deliberate rotation). It waives the check, not the ledger: recorded
+ *                           spends come from the checkpoint and survive.
  *   SIGNERD_PORT      default 7402
  *   SIGNERD_TOKEN     shared secret (required)
  *   MASUMI_MAX_COLLATERAL_LOVELACE  ceiling on the collateral a masumi escrow may lock
  *   NONCE_HOLD_SECONDS              how long a handed-out UTXO is treated as in flight
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { readFileSync, existsSync, statSync, openSync, writeSync, fsyncSync, closeSync, createReadStream } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, statSync, openSync, writeSync, fsyncSync, closeSync, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { resolve as resolvePath } from "node:path";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { toClientCardanoSigner, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
 import { decide, parsePolicy, remaining, type Policy, type SpendRecord } from "./policy.js";
 import { createKeyedLock, createLock } from "./serialize.js";
@@ -45,6 +49,8 @@ const TOKEN = process.env.SIGNERD_TOKEN;
 const NETWORK = process.env.CARDANO_NETWORK ?? "cardano:preprod";
 const POLICY_FILE = process.env.POLICY_FILE ?? "./policy.json";
 const AUDIT_FILE = process.env.AUDIT_FILE ?? "./audit.jsonl";
+const LEDGER_FILE = process.env.LEDGER_FILE ?? "./ledger.json";
+const ALLOW_UNVERIFIED_AUDIT = process.env.ALLOW_UNVERIFIED_AUDIT === "1";
 const MNEMONIC_FILE = process.env.WALLET_MNEMONIC_FILE;
 const IS_MAINNET = NETWORK.endsWith("mainnet");
 const MAX_BODY_BYTES = 1 << 20;
@@ -138,43 +144,148 @@ checkFileMode("audit", AUDIT_FILE);
 if (MNEMONIC_FILE) checkFileMode("mnemonic", MNEMONIC_FILE);
 
 /**
- * Ledger = replay of the audit file. Streamed rather than read whole, and windowed to the last
- * 24h, so a long-lived deployment neither loads a multi-gigabyte string nor keeps every payment it
- * has ever made in memory.
+ * The spend ledger and the audit log are two different things, and conflating them was a hole.
  *
- * A malformed line is fatal unless it is the last one: a truncated final record is what a crash
- * mid-append looks like, while a broken line in the middle means the ledger this cap is computed
- * from is not the ledger that was written.
+ * The cap used to be a replay of `audit.jsonl` alone, so deleting that file reset the day's spend
+ * to zero and rotating it did the same by accident. The ledger now lives in its own checkpoint —
+ * rewritten atomically after every signed payment, holding only the 24h window any rule consults —
+ * and the audit is what it says on the tin: an append-only log.
+ *
+ * They check each other. Every audit record carries a sequence number and the hash of the record
+ * before it, and the checkpoint remembers where in that chain it was written. On startup the chain
+ * is verified and the checkpoint must be found inside it, so:
+ *
+ *   - deleting the checkpoint changes nothing; it is rebuilt from the audit
+ *   - deleting or over-rotating the audit is refused, because the record the checkpoint names is
+ *     gone, and a removed record and an erased spend look the same from here
+ *   - rotation stays possible: keep everything from the last checkpointed record onward
+ *
+ * Resetting the budget therefore takes two coordinated deletions rather than one `rm`, on top of
+ * the file permissions meant to prevent either.
  */
+interface Checkpoint {
+  version: 1;
+  seq: number;
+  hash: string;
+  updatedAt: number;
+  spends: Array<{ ts: number; agentId: string; asset: string; amount: string }>;
+}
+
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 const ledger: SpendRecord[] = [];
+let auditSeq = 0;
+let auditPrevHash = "";
 let replayedSkipped = 0;
-if (existsSync(AUDIT_FILE)) {
-  const cutoff = Date.now() - LEDGER_WINDOW_MS;
-  const lines = createInterface({ input: createReadStream(AUDIT_FILE, "utf8"), crlfDelay: Infinity });
-  let lineNo = 0;
-  let pendingMalformed: number | undefined;
-  for await (const line of lines) {
-    lineNo++;
-    if (!line.trim()) continue;
-    if (pendingMalformed !== undefined) fail(`audit ${AUDIT_FILE} line ${pendingMalformed} is malformed`);
-    let e: { event?: string; ts?: number; agentId?: string; asset?: string; amount?: string };
-    try {
-      e = JSON.parse(line);
-    } catch {
-      pendingMalformed = lineNo; // tolerated only if nothing follows it
-      continue;
-    }
-    if (e.event !== "signed" || typeof e.ts !== "number") continue;
-    if (e.ts < cutoff) {
-      replayedSkipped++;
-      continue;
-    }
-    ledger.push({ ts: e.ts, agentId: e.agentId!, asset: e.asset!, amount: BigInt(e.amount!) });
-  }
-  if (pendingMalformed !== undefined) {
-    console.error(`signerd: audit ${AUDIT_FILE} ends in a truncated record (line ${pendingMalformed}); ignoring it`);
+const openPending: Array<{ id: string; agentId: string; reason?: string }> = [];
+
+function readCheckpoint(): Checkpoint | undefined {
+  if (!existsSync(LEDGER_FILE)) return undefined;
+  try {
+    const c = JSON.parse(readFileSync(LEDGER_FILE, "utf8")) as Checkpoint;
+    if (c.version !== 1 || !Array.isArray(c.spends)) throw new Error("unrecognized checkpoint shape");
+    return c;
+  } catch (e) {
+    fail(`ledger checkpoint ${resolvePath(LEDGER_FILE)} is unreadable: ${e instanceof Error ? e.message : e}`);
   }
 }
+
+/** Replaces the checkpoint atomically: a torn write is indistinguishable from a tampered one. */
+function writeCheckpoint() {
+  const body: Checkpoint = {
+    version: 1,
+    seq: auditSeq,
+    hash: auditPrevHash,
+    updatedAt: Date.now(),
+    spends: ledger.map(r => ({ ts: r.ts, agentId: r.agentId, asset: r.asset, amount: r.amount.toString() })),
+  };
+  const tmp = `${LEDGER_FILE}.tmp`;
+  writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
+  renameSync(tmp, LEDGER_FILE);
+}
+
+{
+  const checkpoint = readCheckpoint();
+  const cutoff = Date.now() - LEDGER_WINDOW_MS;
+  const afterCheckpoint: SpendRecord[] = [];
+  const terminated = new Set<string>();
+  const pendingSeen = new Map<string, { id: string; agentId: string; reason?: string }>();
+  let sawCheckpointRecord = checkpoint === undefined || checkpoint.seq === 0;
+  let auditHasRecords = false;
+  let chainBroken: number | undefined;
+  let malformedTail: number | undefined;
+
+  if (existsSync(AUDIT_FILE)) {
+    const lines = createInterface({ input: createReadStream(AUDIT_FILE, "utf8"), crlfDelay: Infinity });
+    let lineNo = 0;
+    for await (const line of lines) {
+      lineNo++;
+      if (!line.trim()) continue;
+      // A truncated record is tolerated only as the very last thing in the file, which is what a
+      // crash mid-append looks like. One in the middle means the log is not the log that was written.
+      if (malformedTail !== undefined) fail(`audit ${resolvePath(AUDIT_FILE)} line ${malformedTail} is malformed`);
+      let e: Record<string, unknown>;
+      try {
+        e = JSON.parse(line);
+      } catch {
+        malformedTail = lineNo;
+        continue;
+      }
+      auditHasRecords = true;
+      const seq = typeof e.seq === "number" ? e.seq : undefined;
+      // Records written before this scheme carry no seq and no prev; they are simply not chained.
+      if (seq !== undefined) {
+        if (chainBroken === undefined && typeof e.prev === "string" && e.prev !== auditPrevHash) chainBroken = lineNo;
+        auditSeq = seq;
+      }
+      auditPrevHash = sha256(line);
+      if (checkpoint && seq === checkpoint.seq && auditPrevHash === checkpoint.hash) sawCheckpointRecord = true;
+
+      const event = e.event;
+      if (event === "pending") {
+        pendingSeen.set(String(e.id), { id: String(e.id), agentId: String(e.agentId), reason: e.reason as string });
+      } else if (
+        event === "approved" ||
+        event === "approval_denied" ||
+        event === "approval_timeout" ||
+        event === "shutdown_denied" ||
+        event === "approval_sign_error" ||
+        event === "pending_abandoned"
+      ) {
+        terminated.add(String(e.id));
+      } else if (event === "signed" && typeof e.ts === "number") {
+        if (e.ts < cutoff) replayedSkipped++;
+        else if (checkpoint === undefined || seq === undefined || seq > checkpoint.seq)
+          afterCheckpoint.push({ ts: e.ts, agentId: String(e.agentId), asset: String(e.asset), amount: BigInt(String(e.amount)) });
+      }
+    }
+    if (malformedTail !== undefined)
+      console.error(`signerd: audit ends in a truncated record (line ${malformedTail}); ignoring it`);
+  }
+
+  if (chainBroken !== undefined && !ALLOW_UNVERIFIED_AUDIT)
+    fail(`audit ${resolvePath(AUDIT_FILE)} line ${chainBroken} does not follow the record before it; the log has been rewritten`);
+
+  if (checkpoint && !sawCheckpointRecord && !ALLOW_UNVERIFIED_AUDIT)
+    fail(
+      `audit ${resolvePath(AUDIT_FILE)} no longer contains record #${checkpoint.seq}, which the ledger checkpoint was written against. ` +
+        `Rotation must keep everything from the last checkpointed record onward. Set ALLOW_UNVERIFIED_AUDIT=1 if the gap is one you made on purpose; recorded spends come from the checkpoint either way.`,
+    );
+
+  if (checkpoint) {
+    for (const spend of checkpoint.spends) {
+      if (spend.ts >= cutoff) ledger.push({ ts: spend.ts, agentId: spend.agentId, asset: spend.asset, amount: BigInt(spend.amount) });
+    }
+    auditSeq = Math.max(auditSeq, checkpoint.seq);
+  } else if (auditHasRecords) {
+    console.error(`signerd: no ledger checkpoint yet; rebuilding the 24h window from the audit log`);
+  }
+  // Anything the audit recorded after the checkpoint was written: a crash between the two.
+  ledger.push(...afterCheckpoint);
+  ledger.sort((a, b) => a.ts - b.ts);
+
+  for (const [id, entry] of pendingSeen) if (!terminated.has(id)) openPending.push(entry);
+}
+
 /** Ledger entries are appended in time order, so what has expired is always a prefix. */
 function pruneLedger(now = Date.now()) {
   const cutoff = now - LEDGER_WINDOW_MS;
@@ -194,11 +305,28 @@ const effectiveLedger = (): readonly SpendRecord[] =>
 
 const auditFd = openSync(AUDIT_FILE, "a");
 function audit(event: string, data: Record<string, unknown>) {
-  const entry = { ts: Date.now(), event, ...data };
-  writeSync(auditFd, JSON.stringify(entry, (_k, v) => (typeof v === "bigint" ? v.toString() : v)) + "\n");
+  // `seq` and `prev` make the log a chain: a record that is removed or edited stops matching the
+  // one after it, which is what lets the ledger checkpoint refuse a log that has been rewritten.
+  const entry = { ts: Date.now(), seq: ++auditSeq, prev: auditPrevHash, event, ...data };
+  const line = JSON.stringify(entry, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+  writeSync(auditFd, line + "\n");
   fsyncSync(auditFd); // an audit record lost in a crash is not an audit record
+  auditPrevHash = sha256(line);
   return entry;
 }
+
+// A hard kill cannot drain the approval queue the way a signal handler does, so the log is
+// reconciled here instead: a request left open by a previous run is closed now rather than sitting
+// in the audit forever as a `pending` that nothing ever answers.
+for (const abandoned of openPending)
+  audit("pending_abandoned", { id: abandoned.id, agentId: abandoned.agentId, reason: abandoned.reason });
+if (openPending.length)
+  console.error(`signerd: closed ${openPending.length} approval request(s) left open by a previous run`);
+
+// Re-establish the checkpoint now rather than at the next payment. Without this there is a window
+// — arbitrarily long, on a wallet that is idle — in which no checkpoint exists and deleting the
+// audit log would silently reset the cap, which is the whole thing the checkpoint prevents.
+writeCheckpoint();
 
 const signer: ClientCardanoSigner = toClientCardanoSigner({
   mnemonic: mnemonic!,
@@ -271,6 +399,9 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
     ledger.push({ ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
     pruneLedger();
     audit("signed", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce, network: input.network });
+    // After the audit record, so the checkpoint names it. A crash between the two is recoverable:
+    // startup replays anything the log has beyond the checkpoint.
+    writeCheckpoint();
     return res;
   });
 }
@@ -443,6 +574,16 @@ function preflight() {
     add(note.startsWith("WARNING") ? "warn" : "ok", "file permissions", note.replace(/^WARNING /, ""));
   }
 
+  const cp = existsSync(LEDGER_FILE);
+  add(cp ? "ok" : ledger.length ? "warn" : "ok", "spend ledger checkpoint",
+    cp
+      ? `${resolvePath(LEDGER_FILE)} (seq ${auditSeq})`
+      : "not written yet; until the first payment the cap is rebuilt from the audit log alone");
+  add(ALLOW_UNVERIFIED_AUDIT ? "warn" : "ok", "audit chain enforcement",
+    ALLOW_UNVERIFIED_AUDIT
+      ? "ALLOW_UNVERIFIED_AUDIT=1 — a rewritten or truncated audit log is accepted instead of refused"
+      : "a rewritten or truncated audit log refuses to start");
+
   add(
     process.env.BLOCKFROST_PROJECT_ID || !IS_MAINNET ? "ok" : "warn",
     "chain provider",
@@ -545,7 +686,8 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 server.listen(PORT, "127.0.0.1", () => {
   console.error(`signerd listening on 127.0.0.1:${PORT}  network=${NETWORK}  address=${address}`);
   console.error(`policy: ${resolvePath(POLICY_FILE)}`);
-  console.error(`audit:  ${resolvePath(AUDIT_FILE)}  (${ledger.length} spends inside the 24h window, ${replayedSkipped} older records skipped)`);
+  console.error(`audit:  ${resolvePath(AUDIT_FILE)}  (chain at #${auditSeq}, ${replayedSkipped} records older than the window)`);
+  console.error(`ledger: ${resolvePath(LEDGER_FILE)}  (${ledger.length} spends inside the 24h window)`);
   console.error(`agents: ${Object.keys(policy.agents).join(", ")}`);
   for (const note of permissionNotes) console.error(`  ${note}`);
   console.error(`neither the policy nor the audit file may be writable by the agent's user`);
