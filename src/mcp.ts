@@ -19,8 +19,16 @@ const TOKEN = process.env.SIGNERD_TOKEN ?? "";
 const AGENT_ID = process.env.AGENT_ID ?? "default";
 const headers = { authorization: `Bearer ${TOKEN}` };
 
+// One payment at a time: both slots are set when a tool call starts and cleared when it ends.
 let currentReason = "";
-const signer = await createGatedSigner({ signerdUrl: SIGNERD_URL, token: TOKEN, agentId: AGENT_ID, reason: () => currentReason });
+let currentDenial: PolicyDenied | undefined;
+const signer = await createGatedSigner({
+  signerdUrl: SIGNERD_URL,
+  token: TOKEN,
+  agentId: AGENT_ID,
+  reason: () => currentReason,
+  onDenied: d => (currentDenial = d),
+});
 // spendControls: false — the per-payment USD cap in @x402/core is replaced by signerd's policy
 // (per-tx, rolling daily, hourly rate, payee allowlist, human approval), enforced where the key lives.
 const client = x402Client.fromConfig({
@@ -42,18 +50,23 @@ server.tool(
   { url: z.string().url(), reason: z.string().min(3), method: z.enum(["GET", "POST"]).default("GET"), body: z.string().optional() },
   async ({ url, reason, method, body }) => {
     currentReason = reason;
+    currentDenial = undefined;
     try {
       const r = await payingFetch(url, { method, body, headers: body ? { "content-type": "application/json" } : undefined });
       const text = await r.text();
       const paid = r.headers.get("payment-response") ?? r.headers.get("x-payment-response");
       return { content: [{ type: "text", text: JSON.stringify({ status: r.status, paid: Boolean(paid), body: text.slice(0, 20000) }, null, 2) }] };
     } catch (e) {
-      if (e instanceof PolicyDenied) {
-        return { content: [{ type: "text", text: JSON.stringify({ denied: true, rule: e.rule, detail: e.detail, pendingId: e.pendingId }) }], isError: true };
+      // `@x402/fetch` rethrows the signer's error as a plain Error with no `cause`, so the
+      // verdict is recovered from the onDenied slot rather than from the caught value.
+      const denied = e instanceof PolicyDenied ? e : currentDenial;
+      if (denied) {
+        return { content: [{ type: "text", text: JSON.stringify({ denied: true, rule: denied.rule, detail: denied.detail, pendingId: denied.pendingId }) }], isError: true };
       }
       return { content: [{ type: "text", text: `error: ${String(e)}` }], isError: true };
     } finally {
       currentReason = "";
+      currentDenial = undefined;
     }
   },
 );

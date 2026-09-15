@@ -10,6 +10,12 @@ export interface GatedSignerConfig {
   agentId: string;
   /** Called per payment to supply the reason logged in the audit trail. */
   reason: () => string;
+  /**
+   * Called with the verdict before it is thrown. `@x402/fetch` rethrows whatever the signer
+   * throws as a plain `new Error(message)` with no `cause`, so a caller that only catches
+   * cannot recover the rule, detail or pending id — it has to be handed them here.
+   */
+  onDenied?: (denied: PolicyDenied) => void;
 }
 
 export class PolicyDenied extends Error {
@@ -31,7 +37,11 @@ export async function createGatedSigner(cfg: GatedSignerConfig): Promise<ClientC
         body: JSON.stringify({ agentId: cfg.agentId, reason: cfg.reason(), input }),
       });
       const data = (await r.json()) as Record<string, string>;
-      if (!r.ok) throw new PolicyDenied(data.rule ?? data.error ?? "error", data.detail ?? "", data.id);
+      if (!r.ok) {
+        const denied = new PolicyDenied(data.rule ?? data.error ?? "error", data.detail ?? "", data.id);
+        cfg.onDenied?.(denied);
+        throw denied;
+      }
       return { transaction: data.transaction, nonce: data.nonce };
     },
   };
