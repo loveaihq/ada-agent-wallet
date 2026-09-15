@@ -59,21 +59,53 @@ const payingFetch = wrapFetchWithPayment(fetch, client);
 const server = new McpServer({ name: "ada-agent-wallet", version: "0.1.0" });
 
 server.tool("wallet_status", "Wallet address, per-agent remaining budget (rolling 24h), pending approvals.", {}, async () => {
-  const s = await fetch(`${SIGNERD_URL}/status`, { headers }).then(r => r.json());
-  return { content: [{ type: "text", text: JSON.stringify({ agentId: AGENT_ID, ...s }, null, 2) }] };
+  try {
+    const s = await fetch(`${SIGNERD_URL}/status`, { headers }).then(r => r.json());
+    return { content: [{ type: "text", text: JSON.stringify({ agentId: AGENT_ID, ...s }, null, 2) }] };
+  } catch (e) {
+    // The agent can act on "the wallet daemon is not running"; it cannot act on a fetch stack trace.
+    return {
+      content: [{ type: "text", text: `wallet unavailable: signerd is not answering at ${SIGNERD_URL} (${e instanceof Error ? e.message : String(e)})` }],
+      isError: true,
+    };
+  }
 });
 
 server.tool(
   "x402_fetch",
   "Fetch a URL that may require x402 payment on Cardano. If it returns 402, the wallet pays within policy and retries. Always give a concrete reason — it goes in the audit log.",
-  { url: z.string().url(), reason: z.string().min(3), method: z.enum(["GET", "POST"]).default("GET"), body: z.string().optional() },
+  {
+    // `z.string().url()` accepts any scheme the URL parser does, file: and data: included. This
+    // tool exists to fetch paid HTTP resources; nothing else belongs in it.
+    url: z
+      .string()
+      .url()
+      .refine(u => /^https?:$/.test(new URL(u).protocol), { message: "url must be http or https" }),
+    reason: z.string().min(3),
+    method: z.enum(["GET", "POST"]).default("GET"),
+    body: z.string().optional(),
+  },
   async ({ url, reason, method, body }) =>
     callContext.run({ reason, resource: url }, async () => {
       try {
         const r = await payingFetch(url, { method, body, headers: body ? { "content-type": "application/json" } : undefined });
         const text = await r.text();
         const paid = r.headers.get("payment-response") ?? r.headers.get("x-payment-response");
-        return { content: [{ type: "text", text: JSON.stringify({ status: r.status, paid: Boolean(paid), body: text.slice(0, 20000) }, null, 2) }] };
+        const LIMIT = 20000;
+        return {
+          content: [
+            {
+              type: "text",
+              // Say so when the body is cut: an agent that does not know it is reading a fragment
+              // will happily draw conclusions from the half it got.
+              text: JSON.stringify(
+                { status: r.status, paid: Boolean(paid), truncated: text.length > LIMIT, bytes: text.length, body: text.slice(0, LIMIT) },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
       } catch (e) {
         // `@x402/fetch` rethrows the signer's error as a plain Error with no `cause`, so the
         // verdict is recovered from this call's context rather than from the caught value.
