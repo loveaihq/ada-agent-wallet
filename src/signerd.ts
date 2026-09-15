@@ -7,15 +7,17 @@
  *
  * Endpoints (JSON):
  *   GET  /status                       -> address, network, per-agent spend against cap
- *   POST /sign     {agentId, reason, input}  -> {transaction, nonce} | {pending: id} | 4xx
+ *   GET  /preflight                    -> the checks worth passing before real money is involved
+ *   POST /sign     {agentId, reason, resource?, input}  -> {transaction, nonce} | 4xx
  *   GET  /pending                      -> approval queue
  *   POST /approve  {id}                -> signs the queued request
  *   POST /deny     {id}
  *
  * Deployment contract: the ledger enforcing the daily cap is a replay of AUDIT_FILE, and the
- * limits are re-read from POLICY_FILE on every decision. An agent that can write either file can
- * raise its own budget without touching this process — deleting the audit file alone resets the
- * day's spend to zero. Both must live where the agent's user has no write access.
+ * limits are re-read from POLICY_FILE when it changes. An agent that can write either file can
+ * raise its own budget without going near this process — deleting the audit file alone resets the
+ * day's spend to zero. Both must live where the agent's user has no write access; signerd checks
+ * the mode bits at startup and refuses to run on mainnet if they are loose.
  *
  * Env:
  *   WALLET_MNEMONIC   24 words (required)   — or WALLET_MNEMONIC_FILE
@@ -27,9 +29,11 @@
  *   SIGNERD_PORT      default 7402
  *   SIGNERD_TOKEN     shared secret (required)
  *   MASUMI_MAX_COLLATERAL_LOVELACE  ceiling on the collateral a masumi escrow may lock
+ *   NONCE_HOLD_SECONDS              how long a handed-out UTXO is treated as in flight
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { readFileSync, existsSync, openSync, writeSync, fsyncSync } from "node:fs";
+import { readFileSync, existsSync, statSync, openSync, writeSync, fsyncSync, closeSync, createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { resolve as resolvePath } from "node:path";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { toClientCardanoSigner, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
@@ -41,36 +45,142 @@ const TOKEN = process.env.SIGNERD_TOKEN;
 const NETWORK = process.env.CARDANO_NETWORK ?? "cardano:preprod";
 const POLICY_FILE = process.env.POLICY_FILE ?? "./policy.json";
 const AUDIT_FILE = process.env.AUDIT_FILE ?? "./audit.jsonl";
+const MNEMONIC_FILE = process.env.WALLET_MNEMONIC_FILE;
+const IS_MAINNET = NETWORK.endsWith("mainnet");
 const MAX_BODY_BYTES = 1 << 20;
 const MAX_APPROVAL_SECONDS = 900;
 // Long enough to cover one settle attempt (facilitator awaitTx 100s inside a 115s client timeout
 // in dev/), short enough that a failed settlement does not strand the wallet.
 const NONCE_HOLD_SECONDS = Number(process.env.NONCE_HOLD_SECONDS ?? 120);
-
-if (!TOKEN) fail("SIGNERD_TOKEN is required");
-const mnemonic =
-  process.env.WALLET_MNEMONIC ??
-  (process.env.WALLET_MNEMONIC_FILE ? readFileSync(process.env.WALLET_MNEMONIC_FILE, "utf8").trim() : undefined);
-if (!mnemonic) fail("WALLET_MNEMONIC or WALLET_MNEMONIC_FILE is required");
+// The longest window any rule looks at. Nothing older can change a decision, so nothing older is
+// kept: the ledger stays bounded however long the process runs and however large the audit grows.
+const LEDGER_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 function fail(msg: string): never {
   console.error(`signerd: ${msg}`);
   process.exit(1);
 }
 
-let policy: Policy = loadPolicy();
-function loadPolicy(): Policy {
-  return parsePolicy(JSON.parse(readFileSync(POLICY_FILE, "utf8")));
+if (!TOKEN) fail("SIGNERD_TOKEN is required");
+const mnemonic =
+  process.env.WALLET_MNEMONIC ?? (MNEMONIC_FILE ? readFileSync(MNEMONIC_FILE, "utf8").trim() : undefined);
+if (!mnemonic) fail("WALLET_MNEMONIC or WALLET_MNEMONIC_FILE is required");
+
+/**
+ * Mode bits on the files that decide what this wallet may spend.
+ *
+ * On mainnet a loose mode is fatal, because "the agent cannot raise its own limits" stops being
+ * true the moment the agent's user can write either file. Elsewhere it is a warning: a preprod
+ * wallet is not worth refusing to start over. Windows mode bits do not carry this meaning, so the
+ * check reports that it could not run rather than pretending to pass.
+ */
+const permissionNotes: string[] = [];
+function checkFileMode(label: string, file: string) {
+  if (process.platform === "win32") {
+    // Not a pass. The check could not run, and reporting that as "ok" is how a deployment ends up
+    // believing it verified something it never looked at.
+    permissionNotes.push(`WARNING ${label}: not checked — Windows mode bits do not carry this meaning; verify the ACL by hand`);
+    return;
+  }
+  if (!existsSync(file)) return;
+  const mode = statSync(file).mode & 0o777;
+  if (mode & 0o022) {
+    const msg = `${label} ${file} is writable by group or other (mode ${mode.toString(8)})`;
+    if (IS_MAINNET) fail(`refusing to run on ${NETWORK}: ${msg}`);
+    permissionNotes.push(`WARNING ${msg}`);
+  } else {
+    permissionNotes.push(`${label}: mode ${mode.toString(8)}`);
+  }
 }
 
-// Ledger = replay of the audit file (only signed payments count against budgets).
+/**
+ * The policy declares the network its numbers were written for.
+ *
+ * Caps are bare integers with no unit attached, so a file tuned against 10,000 faucet tADA says
+ * exactly the same thing to a mainnet wallet — where it means real money. Requiring mainnet to be
+ * stated turns "wrong file" from an expensive no-op into a refusal to start.
+ */
+function assertPolicyNetwork(p: Policy) {
+  if (p.network && p.network !== NETWORK)
+    throw new Error(`policy declares network "${p.network}" but CARDANO_NETWORK is "${NETWORK}"`);
+  if (IS_MAINNET && !p.network)
+    throw new Error(`refusing to run on ${NETWORK} with a policy that does not declare "network": "${NETWORK}"`);
+}
+
+let policy: Policy;
+let policyMtimeMs = -1;
+function readPolicy(): Policy {
+  const next = parsePolicy(JSON.parse(readFileSync(POLICY_FILE, "utf8")));
+  assertPolicyNetwork(next);
+  return next;
+}
+/**
+ * Re-reads only when the file changed. A parse failure belongs to the caller and is fatal to the
+ * request rather than to the process: an unreadable policy must never mean an unlimited one.
+ */
+function refreshPolicy(): Policy {
+  const mtime = statSync(POLICY_FILE).mtimeMs;
+  if (mtime === policyMtimeMs) return policy;
+  const next = readPolicy();
+  policy = next;
+  policyMtimeMs = mtime;
+  return policy;
+}
+
+try {
+  policy = readPolicy();
+  policyMtimeMs = statSync(POLICY_FILE).mtimeMs;
+} catch (e) {
+  fail(String(e instanceof Error ? e.message : e));
+}
+checkFileMode("policy", POLICY_FILE);
+checkFileMode("audit", AUDIT_FILE);
+if (MNEMONIC_FILE) checkFileMode("mnemonic", MNEMONIC_FILE);
+
+/**
+ * Ledger = replay of the audit file. Streamed rather than read whole, and windowed to the last
+ * 24h, so a long-lived deployment neither loads a multi-gigabyte string nor keeps every payment it
+ * has ever made in memory.
+ *
+ * A malformed line is fatal unless it is the last one: a truncated final record is what a crash
+ * mid-append looks like, while a broken line in the middle means the ledger this cap is computed
+ * from is not the ledger that was written.
+ */
 const ledger: SpendRecord[] = [];
+let replayedSkipped = 0;
 if (existsSync(AUDIT_FILE)) {
-  for (const line of readFileSync(AUDIT_FILE, "utf8").split("\n")) {
+  const cutoff = Date.now() - LEDGER_WINDOW_MS;
+  const lines = createInterface({ input: createReadStream(AUDIT_FILE, "utf8"), crlfDelay: Infinity });
+  let lineNo = 0;
+  let pendingMalformed: number | undefined;
+  for await (const line of lines) {
+    lineNo++;
     if (!line.trim()) continue;
-    const e = JSON.parse(line);
-    if (e.event === "signed") ledger.push({ ts: e.ts, agentId: e.agentId, asset: e.asset, amount: BigInt(e.amount) });
+    if (pendingMalformed !== undefined) fail(`audit ${AUDIT_FILE} line ${pendingMalformed} is malformed`);
+    let e: { event?: string; ts?: number; agentId?: string; asset?: string; amount?: string };
+    try {
+      e = JSON.parse(line);
+    } catch {
+      pendingMalformed = lineNo; // tolerated only if nothing follows it
+      continue;
+    }
+    if (e.event !== "signed" || typeof e.ts !== "number") continue;
+    if (e.ts < cutoff) {
+      replayedSkipped++;
+      continue;
+    }
+    ledger.push({ ts: e.ts, agentId: e.agentId!, asset: e.asset!, amount: BigInt(e.amount!) });
   }
+  if (pendingMalformed !== undefined) {
+    console.error(`signerd: audit ${AUDIT_FILE} ends in a truncated record (line ${pendingMalformed}); ignoring it`);
+  }
+}
+/** Ledger entries are appended in time order, so what has expired is always a prefix. */
+function pruneLedger(now = Date.now()) {
+  const cutoff = now - LEDGER_WINDOW_MS;
+  let drop = 0;
+  while (drop < ledger.length && ledger[drop].ts < cutoff) drop++;
+  if (drop) ledger.splice(0, drop);
 }
 
 /**
@@ -137,9 +247,7 @@ const withWalletLock = createLock();
  * an agent overspending is the ledger; this is only an optimization against wasted signatures, and
  * a real double-spend is refused by the chain regardless. Holding too long is the worse mistake:
  * a settlement that fails is never reported back here, so an over-long hold wedges the wallet —
- * on a single-UTXO wallet, completely — for no safety gained. One settle attempt finishes inside
- * the resource server's facilitator timeout, so by then the outcome is known and a retry should be
- * allowed to proceed.
+ * on a single-UTXO wallet, completely — for no safety gained.
  */
 const inflightNonces = new Map<string, number>();
 function claimNonce(nonce: string, ttlSeconds: number): boolean {
@@ -161,6 +269,7 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
       throw new Error(`utxo ${res.nonce} is already committed to an unsettled payment; retry once it settles`);
     }
     ledger.push({ ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
+    pruneLedger();
     audit("signed", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce, network: input.network });
     return res;
   });
@@ -183,38 +292,62 @@ type SignOutcome =
   | { kind: "error"; error: unknown }
   | { kind: "queued"; id: string; settled: Promise<Settled> };
 
+let shuttingDown = false;
+
 async function handle(req: IncomingMessage, res: ServerResponse) {
   if (!authorized(req.headers.authorization)) return json(res, 401, { error: "unauthorized" });
+  if (shuttingDown) return json(res, 503, { error: "shutting_down" });
   const url = new URL(req.url ?? "/", "http://localhost");
   const body = req.method === "POST" ? JSON.parse((await readBody(req)) || "{}") : {};
 
   if (req.method === "GET" && url.pathname === "/status") {
-    policy = loadPolicy(); // hot-reload so edits to policy.json apply without restart
+    let current: Policy;
+    try {
+      current = refreshPolicy();
+    } catch (e) {
+      return json(res, 503, { error: "policy_unreadable", detail: String(e instanceof Error ? e.message : e) });
+    }
     const agents: Record<string, unknown> = {};
-    for (const id of Object.keys(policy.agents)) agents[id] = remaining(policy, effectiveLedger(), id);
+    for (const id of Object.keys(current.agents)) agents[id] = remaining(current, effectiveLedger(), id);
     return json(res, 200, { address, network: NETWORK, agents, pending: pending.size });
   }
 
+  if (req.method === "GET" && url.pathname === "/preflight") return json(res, 200, preflight());
+
   if (req.method === "POST" && url.pathname === "/sign") {
-    const { agentId, reason, input } = body as { agentId: string; reason: string; input: ClientCardanoSignInput };
+    const { agentId, reason, resource, input } = body as {
+      agentId: string;
+      reason: string;
+      resource?: string;
+      input: ClientCardanoSignInput;
+    };
     if (!agentId || !input?.payTo || !input?.asset || !input?.amount)
       return json(res, 400, { error: "agentId, reason, input{payTo,asset,amount} required" });
 
     // Everything from reading the ledger to recording the spend runs under this agent's lock.
     const outcome = await withAgentLock(agentId, async (): Promise<SignOutcome> => {
-      policy = loadPolicy();
+      let current: Policy;
+      try {
+        current = refreshPolicy();
+      } catch (e) {
+        // Fail closed, and say so in the audit: an unreadable policy is not a permissive one.
+        const detail = String(e instanceof Error ? e.message : e);
+        audit("policy_error", { agentId, reason, detail });
+        return { kind: "deny", rule: "policy_unreadable", detail };
+      }
       const method = input.extra?.assetTransferMethod;
-      const d = decide(policy, effectiveLedger(), {
+      const d = decide(current, effectiveLedger(), {
         agentId,
         payTo: input.payTo,
         asset: input.asset,
         amount: BigInt(input.amount),
         reason,
         assetTransferMethod: typeof method === "string" ? method : undefined,
+        resource: typeof resource === "string" ? resource : undefined,
       });
 
       if (d.verdict === "deny") {
-        audit("denied", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, rule: d.rule, detail: d.detail });
+        audit("denied", { agentId, reason, resource, payTo: input.payTo, asset: input.asset, amount: input.amount, rule: d.rule, detail: d.detail });
         return { kind: "deny", rule: d.rule, detail: d.detail };
       }
 
@@ -223,7 +356,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         // Hold the budget while the operator decides, but release the lock: a human may take
         // minutes, and nothing else for this agent should be stalled behind them.
         reserved.set(id, { ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
-        audit("pending", { id, agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, detail: d.detail });
+        audit("pending", { id, agentId, reason, resource, payTo: input.payTo, asset: input.asset, amount: input.amount, detail: d.detail });
         const settled = new Promise<Settled>(resolve => {
           pending.set(id, { id, createdAt: Date.now(), agentId, reason, input, resolve });
           setTimeout(() => {
@@ -285,6 +418,74 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   json(res, 404, { error: "not found" });
 }
 
+type CheckLevel = "ok" | "warn" | "fail";
+
+/** The checks worth passing before this wallet holds anything you would miss. */
+function preflight() {
+  const checks: Array<{ level: CheckLevel; check: string; detail: string }> = [];
+  const add = (level: CheckLevel, check: string, detail: string) => checks.push({ level, check, detail });
+
+  let current: Policy | undefined;
+  try {
+    current = refreshPolicy();
+    add("ok", "policy readable", resolvePath(POLICY_FILE));
+  } catch (e) {
+    add("fail", "policy readable", String(e instanceof Error ? e.message : e));
+  }
+
+  add(
+    current?.network ? "ok" : IS_MAINNET ? "fail" : "warn",
+    "policy declares its network",
+    current?.network ?? "absent; caps carry no unit, so this file cannot tell preprod from mainnet",
+  );
+
+  for (const note of permissionNotes) {
+    add(note.startsWith("WARNING") ? "warn" : "ok", "file permissions", note.replace(/^WARNING /, ""));
+  }
+
+  add(
+    process.env.BLOCKFROST_PROJECT_ID || !IS_MAINNET ? "ok" : "warn",
+    "chain provider",
+    process.env.BLOCKFROST_PROJECT_ID
+      ? "blockfrost: transaction evidence available, so a facilitator on it can require confirmations"
+      : "koios: no evidence hook, so a facilitator on it can only settle at l1Confirmations 0",
+  );
+
+  for (const [id, ap] of Object.entries(current?.agents ?? {})) {
+    const where = `agent ${id}`;
+    const anyPayee = ap.allowedPayees.includes("*");
+    add(anyPayee ? "warn" : "ok", `${where}: payee allowlist`,
+      anyPayee ? '["*"] accepts any payee' : `${ap.allowedPayees.length} payee(s)`);
+    add(ap.allowedResources ? "ok" : "warn", `${where}: resource allowlist`,
+      ap.allowedResources ? `${ap.allowedResources.length} pattern(s)` : "absent; this agent may buy from any URL it is pointed at");
+    add(ap.approvalAbove ? "ok" : "warn", `${where}: human approval`,
+      ap.approvalAbove
+        ? Object.entries(ap.approvalAbove).map(([a, v]) => `${a} > ${v}`).join(", ")
+        : "no threshold; nothing this agent does ever reaches a human");
+    const methods = ap.allowedAssetTransferMethods ?? ["default"];
+    add(methods.includes("masumi") ? "warn" : "ok", `${where}: asset transfer methods`,
+      methods.includes("masumi")
+        ? `masumi enabled; its collateral sits outside these caps, bounded only by MASUMI_MAX_COLLATERAL_LOVELACE (${process.env.MASUMI_MAX_COLLATERAL_LOVELACE ?? "unset, so the SDK default"})`
+        : methods.join(", "));
+  }
+
+  return {
+    network: NETWORK,
+    address,
+    policyFile: resolvePath(POLICY_FILE),
+    auditFile: resolvePath(AUDIT_FILE),
+    ledgerEntries: ledger.length,
+    auditRecordsOutsideWindow: replayedSkipped,
+    pending: pending.size,
+    checks,
+    summary: {
+      fail: checks.filter(c => c.level === "fail").length,
+      warn: checks.filter(c => c.level === "warn").length,
+      ok: checks.filter(c => c.level === "ok").length,
+    },
+  };
+}
+
 function authorized(header: string | undefined): boolean {
   const expected = Buffer.from(`Bearer ${TOKEN}`);
   const got = Buffer.from(header ?? "");
@@ -314,10 +515,39 @@ function readBody(req: IncomingMessage) {
   });
 }
 
-createServer((req, res) => handle(req, res).catch(e => json(res, 500, { error: String(e) }))).listen(PORT, "127.0.0.1", () => {
+const server = createServer((req, res) => handle(req, res).catch(e => json(res, 500, { error: String(e) })));
+
+/**
+ * Stop cleanly: refuse new work, tell anyone waiting on an approval that it is not coming — rather
+ * than leaving a `pending` the audit never closes — let any signature in flight finish, and flush.
+ */
+function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`signerd: ${signal} received, shutting down`);
+  server.close();
+  for (const p of pending.values()) {
+    reserved.delete(p.id);
+    audit("shutdown_denied", { id: p.id, agentId: p.agentId, reason: p.reason });
+    p.resolve({ denied: "signerd shut down before this request was approved" });
+  }
+  pending.clear();
+  // Queuing behind the wallet lock waits for whatever signature is in progress.
+  void withWalletLock(async () => {}).then(() => {
+    fsyncSync(auditFd);
+    closeSync(auditFd);
+    process.exit(0);
+  });
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+server.listen(PORT, "127.0.0.1", () => {
   console.error(`signerd listening on 127.0.0.1:${PORT}  network=${NETWORK}  address=${address}`);
   console.error(`policy: ${resolvePath(POLICY_FILE)}`);
-  console.error(`audit:  ${resolvePath(AUDIT_FILE)}`);
+  console.error(`audit:  ${resolvePath(AUDIT_FILE)}  (${ledger.length} spends inside the 24h window, ${replayedSkipped} older records skipped)`);
   console.error(`agents: ${Object.keys(policy.agents).join(", ")}`);
-  console.error(`neither file may be writable by the agent's user: the daily cap is a replay of the audit file, and the limits are re-read from the policy file on every decision`);
+  for (const note of permissionNotes) console.error(`  ${note}`);
+  console.error(`neither the policy nor the audit file may be writable by the agent's user`);
+  console.error(`run "walletctl preflight" before pointing this at real money`);
 });
