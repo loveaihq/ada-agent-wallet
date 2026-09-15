@@ -25,8 +25,10 @@ const RESOURCE_URL = process.env.RESOURCE_URL ?? "http://127.0.0.1:7401";
 
 const MODES = {
   auto: { path: "/quote", reason: "round-trip check: buy a price quote under the approval threshold" },
-  approve: { path: "/report", reason: "round-trip check: buy the full report, over the approval threshold" },
-  deny: { path: "/premium", reason: "round-trip check: premium data, deliberately over perTxMax" },
+  approve: { path: "/report", reason: "round-trip check: buy the full report, over the approval threshold", queues: true },
+  // `rule` matters: "denied" alone passes for any reason at all, including a daemon that is simply
+  // broken, which is the opposite of what this is meant to prove.
+  deny: { path: "/premium", reason: "round-trip check: premium data, deliberately over perTxMax", rule: "per_tx_max" },
 } as const;
 
 const mode = (process.argv[2] ?? "auto") as keyof typeof MODES;
@@ -67,24 +69,48 @@ if (mode === "approve") {
   step("this will block until you approve it: npm run walletctl -- pending, then approve <id>");
 }
 
+// Watch the approval queue while the call is in flight. Without this, "200 and paid" is all the
+// approve run ever checks — and a threshold misconfigured low enough to sign unattended looks
+// exactly the same from here.
+let everQueued = false;
+const watching = "queues" in MODES[mode] ? setInterval(pollPending, 1000) : undefined;
+async function pollPending() {
+  try {
+    const r = await fetch(`${process.env.SIGNERD_URL ?? "http://127.0.0.1:7402"}/pending`, {
+      headers: { authorization: `Bearer ${process.env.SIGNERD_TOKEN}` },
+    });
+    if (r.ok && ((await r.json()) as unknown[]).length > 0) everQueued = true;
+  } catch {
+    // signerd will be asked again in a second
+  }
+}
+
 const started = Date.now();
 const out = await client.callTool(
   { name: "x402_fetch", arguments: { url: `${RESOURCE_URL}${path}`, reason } },
   undefined,
   { timeout: 15 * 60 * 1000 },
 );
+clearInterval(watching);
 step(`x402_fetch returned after ${((Date.now() - started) / 1000).toFixed(1)}s:`);
 console.log(text(out));
 
 await client.close();
 
-const body = text(out);
-const ok =
-  mode === "deny"
-    ? /"denied":\s*true/.test(body)
-    : /"status":\s*200/.test(body) && /"paid":\s*true/.test(body);
-step(ok ? `PASS (${mode})` : `FAIL (${mode}) — see the output above`);
-process.exit(ok ? 0 : 1);
+const result = JSON.parse(text(out)) as { status?: number; paid?: boolean; denied?: boolean; rule?: string };
+const expect = MODES[mode];
+const problems: string[] = [];
+if ("rule" in expect) {
+  if (result.denied !== true) problems.push("expected the payment to be denied");
+  else if (result.rule !== expect.rule) problems.push(`expected rule ${expect.rule}, got ${result.rule}`);
+} else {
+  if (result.status !== 200) problems.push(`expected HTTP 200, got ${result.status}`);
+  if (result.paid !== true) problems.push("the response carried no payment receipt");
+  if ("queues" in expect && !everQueued) problems.push("the payment never appeared in the approval queue");
+}
+for (const p of problems) console.error(`  FAIL: ${p}`);
+step(problems.length ? `FAIL (${mode})` : `PASS (${mode})`);
+process.exit(problems.length ? 1 : 0);
 
 function text(result: unknown): string {
   const content = (result as { content?: Array<{ type: string; text?: string }> }).content ?? [];
