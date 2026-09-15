@@ -83,6 +83,7 @@ npm run concurrency         # regression check for the spend-cap race (spends no
 npm run walletctl -- preflight   # deployment checks; see "Before mainnet"
 npm run verify:vendor            # sha256 of vendor/; runs automatically before npm test
 npm run integrity                # proves no single deletion resets the spend cap
+npm run approvals                # every way out of the approval queue gives the budget back
 npm run keystore -- create ...   # encrypt the mnemonic at rest
 ```
 
@@ -109,7 +110,10 @@ the same budget chain, or Blockfrost.
   plus the vendor checksums, which gate the rest. None of them needs a chain.
 - `npm run integrity`: no single deletion resets the spend cap, and restarting does not re-count
   what the checkpoint already holds
-- `npm run concurrency`: the cap holds under simultaneous requests
+- `npm run concurrency`: the cap holds under simultaneous requests, and two agents sharing one
+  wallet contend for its UTXO without either being handed a transaction that cannot settle
+- `npm run approvals`: approved, denied and timed out all give the held budget back, and two
+  queued payments cannot promise the same budget twice
 - mcp: tool listing and `wallet_status` through a real MCP client
 - deny path, end to end: MCP `x402_fetch` → 402 → gated signer → signerd → `per_tx_max` →
   structured verdict back at the tool, `denied` in `audit.jsonl`
