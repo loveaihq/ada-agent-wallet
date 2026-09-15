@@ -13,7 +13,8 @@
     "dev:facilitator": "tsx dev/facilitator.ts",
     "dev:resource": "tsx dev/resource.ts",
     "roundtrip": "tsx dev/roundtrip.ts",
-    "balance": "tsx dev/balance.ts"
+    "balance": "tsx dev/balance.ts",
+    "concurrency": "tsx dev/concurrency.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
