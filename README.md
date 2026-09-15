@@ -72,6 +72,7 @@ npm run roundtrip approve   # GET /report   4 tADA, queues -> npm run walletctl 
 npm run roundtrip deny      # GET /premium  6 tADA, over perTxMax -> denied, nothing signed
 npm run balance             # BUYER_ADDRESS / SELLER_ADDRESS balances, to see the faucet land
 npm run concurrency         # regression check for the spend-cap race (spends nothing)
+npm run walletctl -- preflight   # deployment checks; see "Before mainnet"
 ```
 
 `npm run concurrency` starts a throwaway signerd with a cap that fits one payment, fires several
@@ -115,6 +116,46 @@ the same budget chain, or Blockfrost.
 - the spend cap holds under concurrency (`npm run concurrency`): four simultaneous requests against
   a cap that fits one produce one `signed` and three `daily_max` denials. Before the agent lock the
   same probe signed every one of them, on one shared nonce.
+
+## Before mainnet
+```
+npm run walletctl -- preflight     # fails on anything that must be fixed, warns on every decision
+```
+`preflight` refuses to pass until the policy declares `"network": "cardano:mainnet"`, and signerd
+refuses to start on mainnet without it: caps here are bare integers with no unit, so a file tuned
+against 10,000 faucet tADA says exactly the same thing to a wallet holding real ADA. It also warns
+on each choice that is yours rather than a bug — a payee allowlist of `["*"]`, a missing resource
+allowlist, no approval threshold, masumi enabled, Koios as the provider.
+
+On mainnet signerd additionally refuses to start when the policy or audit file is group- or
+world-writable, because "the agent cannot raise its own limits" stops being true the moment the
+agent's user can write either one. On Windows the mode bits do not carry that meaning, so the check
+reports that it could not run rather than passing: verify the ACL yourself.
+
+`allowedResources` bounds which URLs an agent may buy from. It is checked against a URL the agent
+process reports, because the reference `@x402/cardano` client does not pass the resource through to
+the signer — so it constrains an agent that is running this code and being steered, which is the
+prompt-injection case, and not one whose process has been replaced. `allowedPayees` is the control
+that binds the transaction itself; treat the resource list as the layer above it.
+
+### What this still does not do
+Naming these is the point; none is fixed by more policy code.
+- **The key is a plaintext mnemonic on disk.** That is the design: signerd is a hot wallet. There is
+  no hardware-wallet or KMS path here. Run it as its own user, on an encrypted disk, and keep the
+  balance to what you would accept losing outright — the daily cap bounds an agent, not an attacker
+  who can read the file.
+- **`vendor/` is a self-built `@x402/cardano`**, not a published package. For mainnet, rebuild it
+  from a pinned upstream commit and record the checksum, or wait for npm. Unreviewed vendored code
+  signing real transactions is a supply-chain decision, not a convenience.
+- **Nothing is monitored.** `denied`, `policy_error`, `nonce_collision`, `approval_timeout` and
+  `overBudget` are the audit signals worth alerting on; nothing here emits them anywhere.
+- **Rotating `audit.jsonl` can raise the cap.** The ledger is a replay of it, windowed to 24h, so
+  rotation must never remove a record younger than that.
+- **A crash still leaves an orphaned `pending`.** A signal shutdown resolves the queue and records
+  `shutdown_denied`; a hard kill cannot.
+- **On mainnet you want more than zero confirmations**, which needs Blockfrost: Koios exposes no
+  transaction-evidence hook, so a facilitator on it can only settle at `l1Confirmations: 0`. As a
+  buyer you do not choose this — the seller's 402 does — but it governs any facilitator you run.
 
 ## Known behaviour worth expecting
 - **A signed payment counts against the budget even if settlement then fails.** signerd records the
