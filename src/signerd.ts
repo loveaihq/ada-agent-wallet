@@ -8,6 +8,7 @@
  * Endpoints (JSON):
  *   GET  /status                       -> address, network, per-agent spend against cap
  *   GET  /preflight                    -> the checks worth passing before real money is involved
+ *   GET  /metrics                      -> Prometheus exposition, same bearer token
  *   POST /sign     {agentId, reason, resource?, input}  -> {transaction, nonce} | 4xx
  *   GET  /pending                      -> approval queue
  *   POST /approve  {id}                -> signs the queued request
@@ -304,7 +305,16 @@ const effectiveLedger = (): readonly SpendRecord[] =>
   reserved.size === 0 ? ledger : [...ledger, ...reserved.values()];
 
 const auditFd = openSync(AUDIT_FILE, "a");
+/**
+ * Every audit record passes through here, so this is also where they get counted. The events that
+ * matter operationally — denied, policy_error, nonce_collision, approval_timeout — are exactly the
+ * ones nobody notices until someone goes looking, which is what /metrics is for.
+ */
+const eventCounts = new Map<string, number>();
+let unauthorizedRequests = 0;
+
 function audit(event: string, data: Record<string, unknown>) {
+  eventCounts.set(event, (eventCounts.get(event) ?? 0) + 1);
   // `seq` and `prev` make the log a chain: a record that is removed or edited stops matching the
   // one after it, which is what lets the ledger checkpoint refuse a log that has been rewritten.
   const entry = { ts: Date.now(), seq: ++auditSeq, prev: auditPrevHash, event, ...data };
@@ -426,7 +436,10 @@ type SignOutcome =
 let shuttingDown = false;
 
 async function handle(req: IncomingMessage, res: ServerResponse) {
-  if (!authorized(req.headers.authorization)) return json(res, 401, { error: "unauthorized" });
+  if (!authorized(req.headers.authorization)) {
+    unauthorizedRequests++;
+    return json(res, 401, { error: "unauthorized" });
+  }
   if (shuttingDown) return json(res, 503, { error: "shutting_down" });
   const url = new URL(req.url ?? "/", "http://localhost");
   const body = req.method === "POST" ? JSON.parse((await readBody(req)) || "{}") : {};
@@ -444,6 +457,11 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   }
 
   if (req.method === "GET" && url.pathname === "/preflight") return json(res, 200, preflight());
+
+  if (req.method === "GET" && url.pathname === "/metrics") {
+    res.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
+    return res.end(metrics());
+  }
 
   if (req.method === "POST" && url.pathname === "/sign") {
     const { agentId, reason, resource, input } = body as {
@@ -549,6 +567,66 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
   json(res, 404, { error: "not found" });
 }
 
+/**
+ * Prometheus exposition, behind the same bearer token as everything else — it reports what this
+ * wallet has spent, which is not public.
+ *
+ * Counters restart at zero with the process, which is the convention: a scrape sees the reset and
+ * rates stay correct across it. The gauges are the live view the counters cannot give you —
+ * remaining budget, whether a cap has been breached, how long the approval queue is.
+ *
+ * Worth alerting on: any increase in denied, policy_error or nonce_collision; over_budget going to
+ * 1; pending staying above zero for longer than a human should take.
+ */
+function metrics(): string {
+  const out: string[] = [];
+  const emit = (name: string, help: string, type: "counter" | "gauge", samples: Array<[string, string | number]>) => {
+    if (samples.length === 0) return;
+    out.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`);
+    for (const [labels, value] of samples) out.push(labels ? `${name}{${labels}} ${value}` : `${name} ${value}`);
+  };
+  const esc = (v: string) => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+  emit("ada_wallet_up", "1 when signerd is serving.", "gauge", [["", 1]]);
+  emit(
+    "ada_wallet_audit_events_total",
+    "Audit records written since this process started, by event.",
+    "counter",
+    [...eventCounts].map(([event, n]) => [`event="${esc(event)}"`, n] as [string, number]),
+  );
+  emit("ada_wallet_unauthorized_requests_total", "Requests rejected for a bad or missing bearer token.", "counter", [["", unauthorizedRequests]]);
+  emit("ada_wallet_audit_seq", "Sequence number of the last audit record.", "gauge", [["", auditSeq]]);
+  emit("ada_wallet_pending_approvals", "Payments waiting on a human right now.", "gauge", [["", pending.size]]);
+  emit("ada_wallet_inflight_utxos", "UTXOs committed to a handed-out payment that has not settled.", "gauge", [["", inflightNonces.size]]);
+
+  let current: Policy | undefined;
+  try {
+    current = refreshPolicy();
+  } catch {
+    emit("ada_wallet_policy_readable", "1 when the policy file parses.", "gauge", [["", 0]]);
+    return out.join("\n") + "\n";
+  }
+  emit("ada_wallet_policy_readable", "1 when the policy file parses.", "gauge", [["", 1]]);
+
+  const spent: Array<[string, string | number]> = [];
+  const capped: Array<[string, string | number]> = [];
+  const over: Array<[string, string | number]> = [];
+  for (const agentId of Object.keys(current.agents)) {
+    const r = remaining(current, effectiveLedger(), agentId);
+    if (!r) continue;
+    for (const [asset, a] of Object.entries(r.assets)) {
+      const labels = `agent="${esc(agentId)}",asset="${esc(asset)}"`;
+      spent.push([labels, a.dailySpent]);
+      capped.push([labels, a.dailyMax]);
+      over.push([labels, a.overBudget ? 1 : 0]);
+    }
+  }
+  emit("ada_wallet_daily_spent", "Spent in the rolling 24h window, smallest unit of the asset.", "gauge", spent);
+  emit("ada_wallet_daily_max", "The 24h cap, smallest unit of the asset.", "gauge", capped);
+  emit("ada_wallet_over_budget", "1 when the 24h cap has been exceeded.", "gauge", over);
+  return out.join("\n") + "\n";
+}
+
 type CheckLevel = "ok" | "warn" | "fail";
 
 /** The checks worth passing before this wallet holds anything you would miss. */
@@ -589,7 +667,9 @@ function preflight() {
     "chain provider",
     process.env.BLOCKFROST_PROJECT_ID
       ? "blockfrost: transaction evidence available, so a facilitator on it can require confirmations"
-      : "koios: no evidence hook, so a facilitator on it can only settle at l1Confirmations 0",
+      : IS_MAINNET
+        ? "koios: a free public service with no SLA, and no evidence hook — so a facilitator on it can only settle at l1Confirmations 0. As a buyer the confirmation policy is the seller's choice, but the rate limits are yours"
+        : "koios: no evidence hook, so a facilitator on it can only settle at l1Confirmations 0",
   );
 
   for (const [id, ap] of Object.entries(current?.agents ?? {})) {

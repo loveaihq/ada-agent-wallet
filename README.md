@@ -139,6 +139,17 @@ the signer — so it constrains an agent that is running this code and being ste
 prompt-injection case, and not one whose process has been replaced. `allowedPayees` is the control
 that binds the transaction itself; treat the resource list as the layer above it.
 
+### Monitoring
+`GET /metrics` is Prometheus exposition behind the same bearer token — it reports what this wallet
+has spent, which is not public. Counters restart with the process, as is conventional; the gauges
+carry the live state counters cannot.
+
+Alert on: any increase in `ada_wallet_audit_events_total{event="denied"}`, `{event="policy_error"}`
+or `{event="nonce_collision"}`; `ada_wallet_over_budget` reaching 1; `ada_wallet_pending_approvals`
+staying above zero longer than a human should take; `ada_wallet_policy_readable` reaching 0. A
+denial is not by itself an incident — an agent hitting its cap is the system working — but a change
+in the rate of them is the first sign that something upstream is steering it somewhere new.
+
 ### What this still does not do
 Naming these is the point; none is fixed by more policy code.
 - **The key is a plaintext mnemonic on disk.** That is the design: signerd is a hot wallet. There is
@@ -152,12 +163,11 @@ Naming these is the point; none is fixed by more policy code.
   released `2.25.0` contains no Cardano package at all, and the vendored `@x402/core` differs from
   the published `@x402/core@2.25.0` in 25 files. Pinning is not review; this is unpublished code
   signing real transactions, so someone should still read it or wait for a real release.
-- **Nothing is monitored.** `denied`, `policy_error`, `nonce_collision`, `approval_timeout` and
-  `overBudget` are the audit signals worth alerting on; nothing here emits them anywhere.
-- **Rotating `audit.jsonl` can raise the cap.** The ledger is a replay of it, windowed to 24h, so
-  rotation must never remove a record younger than that.
-- **A crash still leaves an orphaned `pending`.** A signal shutdown resolves the queue and records
-  `shutdown_denied`; a hard kill cannot.
+- **Nothing scrapes `/metrics` for you.** The signals are exposed and the alerts worth writing are
+  listed above, but wiring them to something that pages a human is deployment work, not code here.
+- **Deleting both `ledger.json` and `audit.jsonl` together still resets the cap.** No single
+  deletion does — see `npm run integrity` — but two coordinated ones against files the agent is not
+  supposed to be able to write is the residual risk, and file permissions are what covers it.
 - **On mainnet you want more than zero confirmations**, which needs Blockfrost: Koios exposes no
   transaction-evidence hook, so a facilitator on it can only settle at `l1Confirmations: 0`. As a
   buyer you do not choose this — the seller's 402 does — but it governs any facilitator you run.
