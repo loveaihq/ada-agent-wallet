@@ -11,6 +11,12 @@ export interface GatedSignerConfig {
   /** Called per payment to supply the reason logged in the audit trail. */
   reason: () => string;
   /**
+   * Called per payment for the URL being paid for, which signerd checks against
+   * `allowedResources`. The reference `@x402/cardano` client does not pass the resource through to
+   * the signer, so it has to come from the caller that knows it.
+   */
+  resource?: () => string | undefined;
+  /**
    * Called with the verdict before it is thrown. `@x402/fetch` rethrows whatever the signer
    * throws as a plain `new Error(message)` with no `cause`, so a caller that only catches
    * cannot recover the rule, detail or pending id — it has to be handed them here.
@@ -34,7 +40,7 @@ export async function createGatedSigner(cfg: GatedSignerConfig): Promise<ClientC
       const r = await fetch(`${cfg.signerdUrl}/sign`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ agentId: cfg.agentId, reason: cfg.reason(), input }),
+        body: JSON.stringify({ agentId: cfg.agentId, reason: cfg.reason(), resource: cfg.resource?.(), input }),
       });
       const data = (await r.json()) as Record<string, string>;
       if (!r.ok) {

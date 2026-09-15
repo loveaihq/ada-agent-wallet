@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Operator CLI: walletctl status | pending | approve <id> | deny <id> | audit [n] */
+/** Operator CLI: walletctl status | preflight | pending | approve <id> | deny <id> | audit [n] */
 import { readFileSync, existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
@@ -41,6 +41,36 @@ switch (cmd) {
   case "pending":
     console.log(JSON.stringify((await call("/pending")).data, null, 2));
     break;
+  case "preflight": {
+    const { data } = await call("/preflight");
+    const r = data as {
+      network: string;
+      address: string;
+      policyFile: string;
+      auditFile: string;
+      ledgerEntries: number;
+      pending: number;
+      checks: Array<{ level: "ok" | "warn" | "fail"; check: string; detail: string }>;
+      summary: { fail: number; warn: number; ok: number };
+    };
+    console.log(`network   ${r.network}`);
+    console.log(`address   ${r.address}`);
+    console.log(`policy    ${r.policyFile}`);
+    console.log(`audit     ${r.auditFile}  (${r.ledgerEntries} spends in the last 24h)`);
+    console.log("");
+    const mark = { ok: "  ok  ", warn: " WARN ", fail: " FAIL " };
+    for (const c of r.checks) console.log(`[${mark[c.level]}] ${c.check}
+           ${c.detail}`);
+    console.log("");
+    console.log(`${r.summary.ok} ok, ${r.summary.warn} warning(s), ${r.summary.fail} failure(s)`);
+    if (r.summary.fail) {
+      console.log("Not ready: resolve the failures above.");
+      process.exitCode = 1;
+    } else if (r.summary.warn) {
+      console.log("Each warning is a decision, not a bug — make it deliberately before real money is involved.");
+    }
+    break;
+  }
   case "approve":
   case "deny": {
     if (!arg) die(`${cmd} needs a pending id — run: walletctl pending`);
@@ -69,5 +99,5 @@ switch (cmd) {
     break;
   }
   default:
-    console.log("walletctl status | pending | approve <id> | deny <id> | audit [n]");
+    console.log("walletctl status | preflight | pending | approve <id> | deny <id> | audit [n]");
 }

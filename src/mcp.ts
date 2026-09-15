@@ -31,6 +31,8 @@ const headers = { authorization: `Bearer ${TOKEN}` };
  */
 interface CallContext {
   reason: string;
+  /** The URL this call is fetching, so signerd can check it against the agent's allowedResources. */
+  resource: string;
   denial?: PolicyDenied;
 }
 const callContext = new AsyncLocalStorage<CallContext>();
@@ -40,6 +42,7 @@ const signer = await createGatedSigner({
   token: TOKEN,
   agentId: AGENT_ID,
   reason: () => callContext.getStore()?.reason ?? "",
+  resource: () => callContext.getStore()?.resource,
   onDenied: d => {
     const store = callContext.getStore();
     if (store) store.denial = d;
@@ -65,7 +68,7 @@ server.tool(
   "Fetch a URL that may require x402 payment on Cardano. If it returns 402, the wallet pays within policy and retries. Always give a concrete reason — it goes in the audit log.",
   { url: z.string().url(), reason: z.string().min(3), method: z.enum(["GET", "POST"]).default("GET"), body: z.string().optional() },
   async ({ url, reason, method, body }) =>
-    callContext.run({ reason }, async () => {
+    callContext.run({ reason, resource: url }, async () => {
       try {
         const r = await payingFetch(url, { method, body, headers: body ? { "content-type": "application/json" } : undefined });
         const text = await r.text();
