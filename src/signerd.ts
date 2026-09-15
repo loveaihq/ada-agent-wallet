@@ -142,13 +142,13 @@ const mnemonic = await loadMnemonic();
  */
 const permissionNotes: string[] = [];
 function checkFileMode(label: string, file: string) {
+  if (!existsSync(file)) return; // nothing to check, and saying otherwise is noise
   if (process.platform === "win32") {
     // Not a pass. The check could not run, and reporting that as "ok" is how a deployment ends up
     // believing it verified something it never looked at.
     permissionNotes.push(`WARNING ${label}: not checked — Windows mode bits do not carry this meaning; verify the ACL by hand`);
     return;
   }
-  if (!existsSync(file)) return;
   const mode = statSync(file).mode & 0o777;
   if (mode & 0o022) {
     const msg = `${label} ${file} is writable by group or other (mode ${mode.toString(8)})`;
@@ -316,7 +316,10 @@ function writeCheckpoint() {
         terminated.add(String(e.id));
       } else if (event === "signed" && typeof e.ts === "number") {
         if (e.ts < cutoff) replayedSkipped++;
-        else if (checkpoint === undefined || seq === undefined || seq > checkpoint.seq)
+        // Only what the checkpoint cannot already contain. A record with no seq predates the chain
+        // entirely, so it is necessarily older than the checkpoint and already counted in it —
+        // adding it again re-counted those spends on every single restart, without bound.
+        else if (checkpoint === undefined || (seq !== undefined && seq > checkpoint.seq))
           afterCheckpoint.push({ ts: e.ts, agentId: String(e.agentId), asset: String(e.asset), amount: BigInt(String(e.amount)) });
       }
     }
@@ -500,8 +503,13 @@ function claimNonce(nonce: string, ttlSeconds: number): boolean {
   return true;
 }
 
+/**
+ * How long an approval may wait. `maxTimeoutSeconds` arrives from the seller's 402, so it is not
+ * ours to trust: left unclamped, a zero or negative value made every approval time out the instant
+ * it was queued, which is a denial of service on the one path that involves a human.
+ */
 const approvalWindow = (input: ClientCardanoSignInput) =>
-  Math.min(input.maxTimeoutSeconds ?? 300, MAX_APPROVAL_SECONDS);
+  Math.max(30, Math.min(input.maxTimeoutSeconds ?? 300, MAX_APPROVAL_SECONDS));
 
 async function sign(agentId: string, reason: string, input: ClientCardanoSignInput) {
   return withWalletLock(async () => {
@@ -526,6 +534,8 @@ interface Pending {
   agentId: string;
   reason: string;
   input: ClientCardanoSignInput;
+  /** Cleared when the request resolves, so a settled approval stops holding the event loop open. */
+  timer: NodeJS.Timeout;
   resolve: (v: { transaction: string; nonce: string } | { denied: string }) => void;
 }
 const pending = new Map<string, Pending>();
@@ -576,6 +586,12 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     };
     if (!agentId || !input?.payTo || !input?.asset || !input?.amount)
       return json(res, 400, { error: "agentId, reason, input{payTo,asset,amount} required" });
+    // A bad amount is the caller's mistake, not ours: BigInt() would throw it into a 500 and an
+    // audit record nobody can act on.
+    if (typeof input.amount !== "string" || !/^[0-9]+$/.test(input.amount))
+      return json(res, 400, { error: "input.amount must be a decimal integer string" });
+    if (typeof input.payTo !== "string" || typeof input.asset !== "string")
+      return json(res, 400, { error: "input.payTo and input.asset must be strings" });
 
     // Everything from reading the ledger to recording the spend runs under this agent's lock.
     const outcome = await withAgentLock(agentId, async (): Promise<SignOutcome> => {
@@ -611,14 +627,14 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         reserved.set(id, { ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
         audit("pending", { id, agentId, reason, resource, payTo: input.payTo, asset: input.asset, amount: input.amount, detail: d.detail });
         const settled = new Promise<Settled>(resolve => {
-          pending.set(id, { id, createdAt: Date.now(), agentId, reason, input, resolve });
-          setTimeout(() => {
+          const timer = setTimeout(() => {
             if (pending.delete(id)) {
               reserved.delete(id);
               audit("approval_timeout", { id, agentId, reason, asset: input.asset, amount: input.amount });
               resolve({ denied: "approval timed out" });
             }
           }, approvalWindow(input) * 1000);
+          pending.set(id, { id, createdAt: Date.now(), agentId, reason, input, timer, resolve });
         });
         return { kind: "queued", id, settled };
       }
@@ -647,6 +663,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const p = pending.get(body.id);
     if (!p) return json(res, 404, { error: "no such pending id" });
     pending.delete(p.id);
+    clearTimeout(p.timer);
     if (url.pathname === "/deny") {
       reserved.delete(p.id);
       audit("approval_denied", { id: p.id, agentId: p.agentId });
@@ -873,7 +890,20 @@ function readBody(req: IncomingMessage) {
   });
 }
 
-const server = createServer((req, res) => handle(req, res).catch(e => json(res, 500, { error: String(e) })));
+const server = createServer((req, res) =>
+  handle(req, res).catch(e => {
+    // Whatever went wrong, failing to report it must not be worse than the failure. A response
+    // that has already started cannot be replaced, and throwing here would surface as an unhandled
+    // rejection — which in Node means the signing daemon exits because one request was malformed.
+    console.error(`signerd: request failed: ${e instanceof Error ? e.message : e}`);
+    try {
+      if (res.headersSent) res.end();
+      else json(res, 500, { error: String(e) });
+    } catch {
+      res.destroy();
+    }
+  }),
+);
 
 /**
  * Stop cleanly: refuse new work, tell anyone waiting on an approval that it is not coming — rather
@@ -885,17 +915,26 @@ function shutdown(signal: string) {
   console.error(`signerd: ${signal} received, shutting down`);
   server.close();
   for (const p of pending.values()) {
+    clearTimeout(p.timer);
     reserved.delete(p.id);
     audit("shutdown_denied", { id: p.id, agentId: p.agentId, reason: p.reason });
     p.resolve({ denied: "signerd shut down before this request was approved" });
   }
   pending.clear();
-  // Queuing behind the wallet lock waits for whatever signature is in progress.
-  void withWalletLock(async () => {}).then(() => {
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
     fsyncSync(auditFd);
     closeSync(auditFd);
     process.exit(0);
-  });
+  };
+  // Waiting for the server to close lets the verdicts just handed to waiting callers reach the
+  // wire; queuing behind the wallet lock waits for whatever signature is in progress. Neither is
+  // allowed to hang the shutdown, so there is a deadline on both.
+  server.close(() => void withWalletLock(async () => {}).then(finish));
+  server.closeIdleConnections?.();
+  setTimeout(finish, 10_000);
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));

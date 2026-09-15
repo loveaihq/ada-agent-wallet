@@ -12,6 +12,7 @@
  *      waives the check without discarding the ledger
  *   D. deleting both together does reset the budget — the residual risk that file permissions and
  *      the deployment contract exist to cover, stated here rather than left to be discovered
+ *   E. restarting over a pre-chain audit log does not re-count what the checkpoint already holds
  *
  * Nothing here is broadcast: `/sign` builds and signs, and the facilitator is what publishes. It
  * does need chain access and a funded wallet, because signing reads the wallet's UTXOs.
@@ -114,6 +115,31 @@ try {
     `the budget does reset (dailySpent ${afterBoth}) — two coordinated deletions, which is what the file permissions are for`,
   );
   await stop(child);
+
+  // --- E: restarting must not invent spending ---------------------------------------------------
+  // Audit records written before the chain existed carry no sequence number. The first version of
+  // this replay read "no seq" as "the checkpoint cannot have seen this" and added them again on
+  // every start, so recorded spend grew without bound across restarts until nothing could be paid
+  // at all. It only shows up on a log that predates the checkpoint, which is what this seeds.
+  console.log("\nE. restart repeatedly over a pre-chain audit log");
+  const legacyDir = mkdtempSync(join(tmpdir(), "ada-wallet-legacy-"));
+  const legacyPolicy = join(legacyDir, "policy.json");
+  const legacyAudit = join(legacyDir, "audit.jsonl");
+  const legacyLedger = join(legacyDir, "ledger.json");
+  writeFileSync(legacyPolicy, readFileSync(policyFile, "utf8"));
+  writeFileSync(
+    legacyAudit,
+    JSON.stringify({ ts: Date.now(), event: "signed", agentId: "default", asset: "lovelace", amount: "1000000" }) + "\n",
+  );
+  const overrides = { POLICY_FILE: legacyPolicy, AUDIT_FILE: legacyAudit, LEDGER_FILE: legacyLedger };
+  const seen: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const c = await start(overrides);
+    seen.push(await dailySpent());
+    await stop(c);
+  }
+  check(seen.every(v => v === "1000000"), `one 1000000 spend stays one across three restarts (saw ${seen.join(", ")})`);
+  rmSync(legacyDir, { recursive: true, force: true });
 
   console.log(problems.length ? `\nFAIL — ${problems.length} check(s) failed` : "\nPASS — no single deletion resets the cap");
   process.exitCode = problems.length ? 1 : 0;
