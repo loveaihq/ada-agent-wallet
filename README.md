@@ -191,6 +191,21 @@ the same budget chain, or Blockfrost.
   settlement itself (`src/receipt.ts`, tested against core's real header encoding), carry the
   transaction as a receipt, and say `unsettled` when signerd signed something that did not settle —
   checked on preprod against a real facilitator rejection on both transports.
+- **a paid MCP tool call, settled on preprod, 2026-09-16** — `x402_mcp_call` bought `quote` from
+  `dev/mcpresource.ts` and came back `paid: true` with its transaction in 33s. Facilitator
+  `verify isValid:true`, then `settle success:true status:"confirmed" confirmations:1`, transaction
+  `15f100abe211a43f711371c4854cc43aed18978d0ffed8630c6c17daeae9642b` in block 5183279. Not taken on
+  the facilitator's word: read back from Blockfrost, it pays the seller exactly 1.5 tADA, returns
+  the change to the buyer, pays nobody else, and spends only the buyer's inputs. `signed` in
+  `audit.jsonl` with the reason tagged `[mcp tool quote]`, and the chain replays clean through
+  `replayAudit`. The seller is `@x402/mcp`'s own `createPaymentWrapper`, so this is the wallet
+  against the official stack on both sides of the call.
+- the same run bought `/quote` over HTTP after the receipt change: `status 200, paid: true`,
+  transaction `ba269ae6f25b2ba505d3da251bbed9904f10466db05ed87c163edec66145eb3e` in block 5183281,
+  checked the same way. The fix that stopped failures reading as paid did not stop successes.
+- one MCP payment before that settled on Koios at `confirmations:0` (`37120eda…`, block 5183270),
+  between runs where Koios verify failed on the same wallet. Koios is intermittent for this, not
+  unusable; Blockfrost is what gets past it every time, and the only way to ask for depth.
 - deny path, end to end: MCP `x402_fetch` → 402 → gated signer → signerd → `per_tx_max` →
   structured verdict back at the tool, `denied` in `audit.jsonl`
 - **a whole 402 round-trip on preprod, 2026-09-15** — `x402_fetch GET /quote` returned
@@ -345,10 +360,10 @@ Naming these is the point; none is fixed by more policy code.
   (120s) only avoids handing back a transaction some other unsettled one has already doomed.
 
 ## Not yet
-- **a paid MCP tool call has never actually settled.** The seller exists (`dev/mcpresource.ts`) and a
-  denial over MCP is run, but the paying modes fail at the facilitator's verify on Koios —
-  `getUtxosByOutRef` again, the same failure the HTTP path has without Blockfrost. Closing it needs
-  `BLOCKFROST_PROJECT_ID`, and until then this is the one path whose settlement is unrun
+- `roundtrip approve mcp` has not been run. The queue is signerd's and the same for both
+  transports, and the wait it adds happens inside signing — before `@x402/mcp` sends the paid
+  request, so outside its request timeout — which is why nothing about MCP should change it. But
+  "should" is the word this list exists to stop taking on trust
 - direct `send` (non-x402 transfer) — needs our own submit path; v1 is x402 only
 - Masumi escrow flows (`assetTransferMethod: masumi`) pass through untouched; policy still applies to the amount
 - policy is per-agent, not per-resource; add `allowedResources` if needed
