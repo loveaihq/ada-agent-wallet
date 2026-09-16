@@ -81,7 +81,8 @@ const MNEMONIC_FILE = process.env.WALLET_MNEMONIC_FILE;
 const AGENT_TOKENS_FILE = process.env.AGENT_TOKENS_FILE;
 const KEYSTORE_FILE = process.env.WALLET_KEYSTORE_FILE;
 const PASSPHRASE_FILE = process.env.WALLET_PASSPHRASE_FILE;
-const MAX_HOT_BALANCE = process.env.MAX_HOT_BALANCE_LOVELACE ? BigInt(process.env.MAX_HOT_BALANCE_LOVELACE) : undefined;
+const MAX_HOT_BALANCE = lovelaceEnv("MAX_HOT_BALANCE_LOVELACE");
+const MASUMI_MAX_COLLATERAL = lovelaceEnv("MASUMI_MAX_COLLATERAL_LOVELACE");
 const MAX_BODY_BYTES = 1 << 20;
 /**
  * Caps on the free text a caller can put into the audit log.
@@ -116,8 +117,24 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
+/**
+ * A lovelace ceiling from the environment. `BigInt("10 ADA")` throws where it is read, which is
+ * before any of these checks run, so the operator got a stack trace out of the module loader
+ * instead of the line that says which variable they got wrong.
+ */
+function lovelaceEnv(name: string): bigint | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  if (!/^[0-9]+$/.test(raw)) fail(`${name} must be a decimal integer of lovelace, got "${raw}"`);
+  return BigInt(raw);
+}
+
 if (!TOKEN) fail("SIGNERD_TOKEN is required");
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) fail(`SIGNERD_PORT must be a port number, got "${process.env.SIGNERD_PORT}"`);
+// Not a number is NaN, and `NaN <= Date.now()` is false — so a nonce claimed under it would never
+// expire, and the first payment would leave the wallet answering utxo_busy for as long as it runs.
+if (!Number.isInteger(NONCE_HOLD_SECONDS) || NONCE_HOLD_SECONDS < 1)
+  fail(`NONCE_HOLD_SECONDS must be a positive whole number of seconds, got "${process.env.NONCE_HOLD_SECONDS}"`);
 // Resolved once, so "is this mainnet" is a fact about a known chain and not a suffix match that
 // would read `cardano:preview` as mainnet's opposite and point it at mainnet's providers.
 const IS_MAINNET = (() => {
@@ -360,7 +377,9 @@ const ledgerExcluding = (id: string): readonly SpendRecord[] => [
   ...[...reserved].filter(([held]) => held !== id).map(([, spend]) => spend),
 ];
 
-const auditFd = openSync(AUDIT_FILE, "a");
+// 0o600 on creation. The default is 0o666, so under a umask of 002 signerd created the log
+// group-writable — a mode it then refuses to run on, having written the file itself.
+const auditFd = openSync(AUDIT_FILE, "a", 0o600);
 /** Every record passes through here, so it is also where they are counted for /metrics. */
 const eventCounts = new Map<string, number>();
 let unauthorizedRequests = 0;
@@ -385,12 +404,15 @@ for (const abandoned of openPending)
 if (openPending.length)
   console.error(`signerd: closed ${openPending.length} approval request(s) left open by a previous run`);
 
+// Before the write, not after. The cap is computed from this checkpoint and an agent that can
+// rewrite it rewrites its own spend — but `writeCheckpoint` renames a fresh 0600 file over it, so
+// checking afterwards checked this daemon's own output and reported `mode 600` whatever the
+// operator had left there. A first start has no file to check, and the one it is about to write is
+// 0600 by construction.
+checkFileMode("ledger", LEDGER_FILE);
 // Now, not at the next payment: an idle wallet would otherwise sit with no checkpoint at all, and
 // so with nothing protecting the cap.
 writeCheckpoint();
-// After the write, so a first start has a file to check. The cap is computed from this checkpoint,
-// and an agent that can rewrite it rewrites its own spend.
-checkFileMode("ledger", LEDGER_FILE);
 
 const signer: ClientCardanoSigner = toClientCardanoSigner({
   mnemonic,
@@ -398,9 +420,7 @@ const signer: ClientCardanoSigner = toClientCardanoSigner({
   provider: providerConfig(),
   // Masumi collateral scales with datum size, and the datum carries the seller's own bytes: with
   // no ceiling, the seller chooses how much this wallet locks.
-  ...(process.env.MASUMI_MAX_COLLATERAL_LOVELACE
-    ? { masumiMaxCollateralLovelace: BigInt(process.env.MASUMI_MAX_COLLATERAL_LOVELACE) }
-    : {}),
+  ...(MASUMI_MAX_COLLATERAL !== undefined ? { masumiMaxCollateralLovelace: MASUMI_MAX_COLLATERAL } : {}),
 });
 function providerConfig() {
   if (process.env.BLOCKFROST_PROJECT_ID) {
@@ -679,8 +699,12 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       return json(res, 400, { error: "input.payTo and input.asset must be strings" });
     // The policy reads `reason` as text; anything else would fail inside the lock, as a 500.
     if (reason !== undefined && typeof reason !== "string") return json(res, 400, { error: "reason must be a string" });
-    if (input.maxTimeoutSeconds !== undefined && (typeof input.maxTimeoutSeconds !== "number" || !Number.isFinite(input.maxTimeoutSeconds)))
-      return json(res, 400, { error: "input.maxTimeoutSeconds must be a number" });
+    // Required, not optional: the builder sets the transaction's TTL from it, and `BigInt(undefined)`
+    // there is a 500 and a `sign_error` for what is the caller's omission. Defaulting it here would
+    // be inventing a validity window the seller never quoted, which is a chain-level fact about the
+    // transaction rather than a local one about how long to wait.
+    if (typeof input.maxTimeoutSeconds !== "number" || !Number.isFinite(input.maxTimeoutSeconds))
+      return json(res, 400, { error: "input.maxTimeoutSeconds is required and must be a number; it becomes the transaction's TTL" });
     // The SDK refuses to sign for another chain, but only after the decision has been made and
     // audited as a `sign_error`; a 402 for the wrong network is not an incident, it is a 400.
     if (typeof input.network !== "string" || !sameNetwork(input.network, NETWORK))

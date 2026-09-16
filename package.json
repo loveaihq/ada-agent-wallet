@@ -21,6 +21,8 @@
     "integrity": "tsx dev/integrity.ts",
     "keystore": "tsx scripts/keystore.ts",
     "approvals": "tsx dev/approvals.ts",
+    "queue": "tsx dev/queue.ts",
+    "posix": "tsx dev/posix.ts",
     "assets": "tsx dev/assets.ts",
     "identity": "tsx dev/identity.ts"
   },
