@@ -1,13 +1,19 @@
 # ada-agent-wallet
 
-Policy-gated Cardano wallet for AI agents. The agent gets an MCP tool that can pay x402 endpoints
-on Cardano; the key sits in a separate daemon that enforces spend policy and writes an audit log.
-Plugs into the official `@x402/cardano` client (merged into the x402 Foundation repo 2026-09-09)
-via its `ClientCardanoSigner` interface — nothing forked.
+Out-of-process spend control for AI agents that pay with x402. The agent gets MCP tools that can
+pay — for an HTTP endpoint, or for a paid tool on another MCP server — and never holds the key.
+That sits in a separate daemon, which enforces the spend policy, queues what needs a human, and
+writes a hash-chained audit log the agent cannot rewrite to hand itself more budget.
+
+Why a separate process: `@x402/core`'s spend controls and `@x402/mcp`'s `onPaymentRequested` hook —
+the two places the official stack puts a limit — both run *inside* the agent. An agent that has
+been steered can be steered through them. These limits live where the key lives.
+
+Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
 ```
 agent (Claude / any MCP client)
-   └── mcp.ts        wallet_status, x402_fetch(url, reason)      ← no keys here
+   └── mcp.ts        wallet_status · x402_fetch(url) · x402_mcp_tools/call(server, tool)  ← no keys
          └── gatedSigner.ts  implements ClientCardanoSigner, forwards to ↓
 signerd.ts   127.0.0.1 only, bearer token, holds the mnemonic
    ├── policy.ts    per-tx max · rolling-24h max · payee, resource, asset and transfer-method
@@ -26,7 +32,8 @@ walletctl.ts  status | preflight | pending | approve <id> | deny <id> | audit
 `ledger.json` and `audit.jsonl` are deliberately two files: the cap is state, the log is a log, and
 conflating them meant `rm audit.jsonl` handed a spent agent its budget back.
 
-What `@x402/core` already has: a per-payment USD cap and an asset allowlist, inside the agent process.
+What `@x402/core` already has: a per-payment USD cap and an asset allowlist, inside the agent
+process — and `@x402/mcp` puts its `onPaymentRequested` approval hook in the same place.
 What this adds: key isolation, rolling daily/hourly limits, payee allowlist, human approval, audit trail —
 enforced in the process that holds the key, so an agent cannot loosen its own limits.
 Masumi's Payment Service (the other Cardano agent-payment stack) has none of these on the buying side.
@@ -167,6 +174,9 @@ the same budget chain, or Blockfrost.
 - `npm run context`: two `x402_fetch` calls in flight at once each keep their own reason all the
   way into the audit, which is what the `AsyncLocalStorage` in mcp.ts exists for
 - mcp: tool listing and `wallet_status` through a real MCP client
+- `npm run mcptools`: the MCP-side tools register, and the payment client really survives being
+  handed from the vendored `@x402/core` to `@x402/mcp`, which is built against a different copy of
+  it. TypeScript is made to accept that with a cast, so running it is the only thing that shows it.
 - deny path, end to end: MCP `x402_fetch` → 402 → gated signer → signerd → `per_tx_max` →
   structured verdict back at the tool, `denied` in `audit.jsonl`
 - **a whole 402 round-trip on preprod, 2026-09-15** — `x402_fetch GET /quote` returned
@@ -319,6 +329,9 @@ Naming these is the point; none is fixed by more policy code.
   (120s) only avoids handing back a transaction some other unsettled one has already doomed.
 
 ## Not yet
+- **a paid MCP tool call has never actually been paid.** `x402_mcp_call` is wired to the official
+  client and the hand-off is checked, but closing the loop needs a seller-side MCP server, which
+  `dev/` does not have yet — so this is the one path here whose settlement is still unrun
 - direct `send` (non-x402 transfer) — needs our own submit path; v1 is x402 only
 - Masumi escrow flows (`assetTransferMethod: masumi`) pass through untouched; policy still applies to the amount
 - policy is per-agent, not per-resource; add `allowedResources` if needed
