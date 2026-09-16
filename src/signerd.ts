@@ -769,9 +769,15 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
           // for headers after 300s, and an approval signed after the caller has gone records a spend
           // for a transaction nobody will ever broadcast — so a caller that leaves takes its request
           // with it, and its budget comes back.
-          res.on("close", () => {
+          const withdraw = () => {
             if (!res.writableFinished) closePending(entry, "pending_abandoned", "the caller stopped waiting", { detail: "connection closed while queued" });
-          });
+          };
+          res.on("close", withdraw);
+          // The wait for the agent lock above is as long as a payment ahead of this one takes to
+          // sign, and a caller can leave during it. A listener attached after `close` has fired is
+          // a listener that never runs, which left the request in the queue with its budget held,
+          // for a human to approve into the void — the one thing the listener is here to prevent.
+          if (res.destroyed || res.socket?.destroyed) withdraw();
         });
         return { kind: "queued", id, settled };
       }
@@ -794,10 +800,19 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         return json(res, 409, { error: "insufficient_funds", detail, retryable: false, asset: input.asset, amount: input.amount });
       return json(res, 500, { error: "sign_failed", detail });
     }
-    if (outcome.kind === "signed") return json(res, 200, outcome.out);
+    if (outcome.kind === "signed") {
+      if (gone(res)) return undelivered(agentId, reason, outcome.out.nonce);
+      return json(res, 200, outcome.out);
+    }
 
     const verdict = await outcome.settled; // waited for outside the lock
-    if (res.destroyed || res.socket?.destroyed) return; // the caller left; the queue entry went with it
+    if (gone(res)) {
+      // Usually the queue entry left with its caller and `pending_abandoned` already says so. The
+      // exception is a signature that finished while this connection was closing: the spend is
+      // recorded, and the signed transaction has exactly one recipient, which is gone.
+      if (!("denied" in verdict)) return undelivered(agentId, reason, verdict.nonce, outcome.id);
+      return;
+    }
     if ("denied" in verdict) return json(res, 403, { error: "approval_denied", detail: verdict.denied, id: outcome.id });
     return json(res, 200, verdict);
   }
@@ -1077,6 +1092,24 @@ function identify(header: string | undefined): Caller | undefined {
   if (sameToken(header, TOKEN!)) return { kind: "operator" };
   for (const [token, agentId] of agentTokens) if (sameToken(header, token)) return { kind: "agent", agentId };
   return undefined;
+}
+
+/** Whether the request a verdict belongs to is still there to receive it. */
+function gone(res: ServerResponse): boolean {
+  return res.destroyed || res.socket?.destroyed === true;
+}
+
+/**
+ * A signature that reached nobody. The transaction is handed to one request and no other, so when
+ * that request has closed there is no second way to deliver it and nothing will broadcast it.
+ *
+ * The spend stays on the ledger: a transaction is not unsigned by nobody having read it, its UTXO
+ * is claimed either way, and a copy that did leak could still be submitted. So this is a record
+ * rather than a refund — and the only thing that ever says the payment the cap is counting did not
+ * happen. Alert on it.
+ */
+function undelivered(agentId: string, reason: string, nonce: string, id?: string) {
+  audit("signed_undelivered", { id, agentId, reason, nonce });
 }
 
 function json(res: ServerResponse, code: number, data: unknown) {

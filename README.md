@@ -235,6 +235,12 @@ staying above zero longer than a human should take; `ada_wallet_policy_readable`
 denial is not by itself an incident — an agent hitting its cap is the system working — but a change
 in the rate of them is the first sign that something upstream is steering it somewhere new.
 
+`{event="signed_undelivered"}` is the one that means the ledger and the world have come apart: a
+transaction was signed and its spend recorded, and the single request it could have been handed to
+had closed. Nothing will broadcast it, and the budget stays spent — a transaction is not unsigned
+by nobody having read it. It takes a caller leaving during the seconds a signature is in flight, so
+it should be rare; each one is a payment the agent will have to ask for again.
+
 ### What this still does not do
 Naming these is the point; none is fixed by more policy code.
 - **There is no hardware-wallet or KMS path.** The keystore means a file read is no longer enough,

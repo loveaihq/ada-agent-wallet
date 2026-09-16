@@ -23,6 +23,7 @@
     "approvals": "tsx dev/approvals.ts",
     "queue": "tsx dev/queue.ts",
     "posix": "tsx dev/posix.ts",
+    "delivery": "tsx dev/delivery.ts",
     "assets": "tsx dev/assets.ts",
     "identity": "tsx dev/identity.ts"
   },
