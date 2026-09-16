@@ -108,6 +108,21 @@ const MAX_APPROVAL_SECONDS = 900;
 // Long enough to cover one settle attempt (facilitator awaitTx 100s inside a 115s client timeout
 // in dev/), short enough that a failed settlement does not strand the wallet.
 const NONCE_HOLD_SECONDS = Number(process.env.NONCE_HOLD_SECONDS ?? 120);
+/**
+ * What bounds a build. The SDK's default is 10s, which the README names as a trap on the
+ * facilitator side and `dev/provider.ts` already overrides — but signerd was left on it, and
+ * signerd is the side that signs. Koios is a free public service with no SLA, and a loaded host
+ * adds its own delay on top: a lookup that answered 200 in a second from `curl` still overran 10s
+ * from inside a busy process. The cost was a `sign_error` and a 500, which an agent reads as a
+ * broken daemon rather than as something slow it could retry.
+ *
+ * It is not only the individual lookups. The SDK wraps `buildTransaction` in this same budget, and
+ * that one covers coin selection and the CPU it takes as well as the round trips — on a quiet host
+ * a build measures 1.3-3.2s, and on a busy single core the same build overran 30s. So the number
+ * has to cover the whole of the slowest build, not one request. 60s, well inside the caller's 300s;
+ * the SDK's ceiling is 120s.
+ */
+const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS ?? 60_000);
 // The longest window any rule looks at. Nothing older can change a decision, so nothing older is
 // kept: the ledger stays bounded however long the process runs and however large the audit grows.
 const LEDGER_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -135,6 +150,9 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) fail(`SIGNERD_PORT must
 // expire, and the first payment would leave the wallet answering utxo_busy for as long as it runs.
 if (!Number.isInteger(NONCE_HOLD_SECONDS) || NONCE_HOLD_SECONDS < 1)
   fail(`NONCE_HOLD_SECONDS must be a positive whole number of seconds, got "${process.env.NONCE_HOLD_SECONDS}"`);
+// 120_000 is what the SDK accepts; above it the setting is silently not the one in force.
+if (!Number.isInteger(PROVIDER_TIMEOUT_MS) || PROVIDER_TIMEOUT_MS < 1 || PROVIDER_TIMEOUT_MS > 120_000)
+  fail(`PROVIDER_TIMEOUT_MS must be a whole number of milliseconds from 1 to 120000, got "${process.env.PROVIDER_TIMEOUT_MS}"`);
 // Resolved once, so "is this mainnet" is a fact about a known chain and not a suffix match that
 // would read `cardano:preview` as mainnet's opposite and point it at mainnet's providers.
 const IS_MAINNET = (() => {
@@ -424,9 +442,12 @@ const signer: ClientCardanoSigner = toClientCardanoSigner({
 });
 function providerConfig() {
   if (process.env.BLOCKFROST_PROJECT_ID) {
-    return { blockfrost: { baseUrl: blockfrostBaseUrl(NETWORK), projectId: process.env.BLOCKFROST_PROJECT_ID } };
+    return {
+      blockfrost: { baseUrl: blockfrostBaseUrl(NETWORK), projectId: process.env.BLOCKFROST_PROJECT_ID },
+      requestTimeoutMs: PROVIDER_TIMEOUT_MS,
+    };
   }
-  return { koios: { baseUrl: koiosBaseUrl(NETWORK), token: process.env.KOIOS_TOKEN } };
+  return { koios: { baseUrl: koiosBaseUrl(NETWORK), token: process.env.KOIOS_TOKEN }, requestTimeoutMs: PROVIDER_TIMEOUT_MS };
 }
 const address = signer.getAddress();
 
