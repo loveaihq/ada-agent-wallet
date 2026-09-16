@@ -43,6 +43,11 @@ npm run signerd                                            # prints the address 
 The policy file declares the network it was written for, and signerd refuses to start on a mismatch.
 A plaintext mnemonic is fine for a faucet wallet; for anything else see "The key" below.
 
+Koios is enough to run signerd and every check in `dev/` except one. It is **not** enough to close a
+402 round-trip: the facilitator's verify step cannot read most UTXOs through it, for reasons that
+are not yours to fix and that the error does not explain. Set `BLOCKFROST_PROJECT_ID` before
+`npm run roundtrip` — see "Known behaviour worth expecting".
+
 **Where the policy, audit and ledger files live is part of the security model.** The daily cap is
 computed from `ledger.json`, rebuilt where needed by replaying `audit.jsonl`, and the limits
 themselves are re-read from `policy.json` on every decision. An agent that can write any of the
@@ -99,6 +104,11 @@ npm run integrity                # proves no single deletion resets the spend ca
 npm run approvals                # every way out of the approval queue gives the budget back
 npm run assets                   # per-asset caps and windows, and the rate they share
 npm run identity                 # whether an agent can spend a budget that is not its own
+npm run queue                    # every exit from the approval queue that does not sign — no chain,
+                                 # no wallet, so this one runs wherever the unit tests do
+npm run posix                    # mode bits and signals; Linux only, since Windows can check neither
+npm run delivery                 # a caller that leaves while a signature is in flight
+npm run context                  # two tool calls at once keep their own reasons in the audit
 npm run keystore -- create ...   # encrypt the mnemonic at rest
 ```
 
@@ -144,6 +154,18 @@ the same budget chain, or Blockfrost.
 - `npm run identity`: with `AGENT_TOKENS_FILE`, an agent cannot sign as another or read another's
   budget, and the operator token cannot sign at all. Without it, the same check demonstrates that
   it can.
+- `npm run queue`: every exit from the approval queue that does not sign — denied, timed out, the
+  caller leaving, the policy tightening underneath it, and a SIGKILL'd run's orphan closed at the
+  next start — each giving the held budget back. No chain and no wallet, so it runs in CI
+- `npm run posix`: on Linux, where the mode-bit checks and the shutdown signal can actually run.
+  SIGTERM drains the queue and answers whoever was waiting; a group-writable policy warns on
+  preprod and refuses to start on mainnet; malformed, oversize and wrong-chain requests are 4xx
+  without writing to the log; a torn append is repaired and an edited record refuses to start
+- `npm run delivery`: a caller that leaves while a payment ahead of it is signing takes its request
+  with it, and a signature that lands after its one recipient has gone is recorded as
+  `signed_undelivered` rather than counted silently
+- `npm run context`: two `x402_fetch` calls in flight at once each keep their own reason all the
+  way into the audit, which is what the `AsyncLocalStorage` in mcp.ts exists for
 - mcp: tool listing and `wallet_status` through a real MCP client
 - deny path, end to end: MCP `x402_fetch` → 402 → gated signer → signerd → `per_tx_max` →
   structured verdict back at the tool, `denied` in `audit.jsonl`
@@ -153,6 +175,12 @@ the same budget chain, or Blockfrost.
   `6d94fdc0617a8e58ca23402826f36767bab9a00a77dfe02de851d5828428e7e0` on preprod; `signed` in
   `audit.jsonl` with the agent's stated reason and the UTXO it spent as nonce; 1.5 tADA landed at
   the seller address. The first real signature and the facilitator settlement are no longer unrun.
+- **the same round-trip with a human in it, 2026-09-16** — `x402_fetch GET /report` at 4 tADA is
+  over `approvalAbove`, so it parked in the queue and held the agent's request open while
+  `walletctl approve 4df1a492` was run from another shell; `status 200, paid true` came back 179s
+  later, the audit reading `pending` → `signed` → `approved`. Over the same session the buyer went
+  from 169.638625 to 163.780519 tADA and the seller from nothing to 5.5 in two UTXOs, which is the
+  1.5 and the 4 arriving. On Blockfrost: this cannot be done on Koios, see below.
 - **approve → sign, on chain** — a 4 tADA route parked in the queue as `pending` with the agent's
   reason and the threshold that caught it, `walletctl approve` released it, and the same call
   returned `200 paid true` in 48.7s. Transaction
@@ -270,6 +298,18 @@ Naming these is the point; none is fixed by more policy code.
   deliberately so — refunding it would mean deciding "this will never land", which is exactly the
   question the facilitator cannot answer either. Observed once here: `dailySpent` of 16.5 tADA
   against 12.5 tADA actually delivered.
+- **A 402 round-trip cannot complete on Koios at all.** The facilitator's `verify` resolves each
+  input the buyer's transaction spends, and `@evolution-sdk`'s Koios provider fails that lookup for
+  almost all of them. Over one wallet's 19 UTXOs, asked three ways: the Koios provider resolved 3,
+  the Blockfrost provider resolved 19, and plain HTTP to the same Koios endpoint returned all 19.
+  So the data is there and Koios is serving it; the provider cannot read it. The failures are
+  deterministic, ~1.4s on an idle box, and grouped by the transaction that created the UTXO — not a
+  timeout, not rate limiting, not native assets, not a UTXO that is missing or spent. All you are
+  told is `Koios getUtxosByOutRef failed`, with the cause discarded. There is no steering around it
+  either, because the SDK always takes `utxos[0]` as the payment nonce: if the wallet's first UTXO
+  is one it cannot read, nothing that wallet does can pay. `BLOCKFROST_PROJECT_ID` is the answer and
+  the free tier covers it. Everything short of settlement — policy, signing, the approval queue, the
+  audit — works on Koios exactly as documented.
 - **Koios can refuse a submit moments after confirming the transaction it chains from.** A payment
   spending the change of a just-confirmed transaction was rejected with `Koios submitTx failed`,
   and the identical payment succeeded on retry: its query view had the new UTXO before its submit

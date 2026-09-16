@@ -24,6 +24,7 @@
     "queue": "tsx dev/queue.ts",
     "posix": "tsx dev/posix.ts",
     "delivery": "tsx dev/delivery.ts",
+    "context": "tsx dev/context.ts",
     "assets": "tsx dev/assets.ts",
     "identity": "tsx dev/identity.ts"
   },
