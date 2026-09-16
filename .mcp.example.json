@@ -4,7 +4,7 @@
       "command": "npx",
       "args": [
         "tsx",
-        "C:\\Projects\\Cardano\\ada-agent-wallet\\src\\mcp.ts"
+        "/path/to/ada-agent-wallet/src/mcp.ts"
       ],
       "env": {
         "SIGNERD_TOKEN": "${SIGNERD_TOKEN}",

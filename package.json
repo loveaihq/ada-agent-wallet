@@ -4,6 +4,25 @@
   "description": "Policy-gated Cardano wallet for AI agents: spend caps, payee allowlist, human approval, audit log. Plugs into the official @x402/cardano client.",
   "type": "module",
   "private": true,
+  "license": "Apache-2.0",
+  "author": "Vincent <loveaihqhq@gmail.com>",
+  "keywords": [
+    "cardano",
+    "x402",
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "agent-payments",
+    "wallet",
+    "spend-policy",
+    "x402-cardano"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/loveaihq/ada-agent-wallet.git"
+  },
+  "homepage": "https://github.com/loveaihq/ada-agent-wallet#readme",
+  "bugs": "https://github.com/loveaihq/ada-agent-wallet/issues",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.check.json",

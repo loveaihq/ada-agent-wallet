@@ -325,3 +325,11 @@ Naming these is the point; none is fixed by more policy code.
 
 `vendor/` holds `@x402/cardano` built from the Foundation repo, because it is not on npm yet
 (the publish workflow exists but hasn't run). Swap to the npm package when it lands.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
+
+`vendor/` is third-party code under the same licence: `@x402/cardano` and `@x402/core`, built from
+the x402 Foundation repository and pinned by sha256 to upstream `fdeda56`. See
+[vendor/PROVENANCE.md](vendor/PROVENANCE.md) for how that was verified, and what it does not prove.
