@@ -32,6 +32,7 @@
     "walletctl": "tsx src/walletctl.ts",
     "dev:facilitator": "tsx dev/facilitator.ts",
     "dev:resource": "tsx dev/resource.ts",
+    "dev:mcpresource": "tsx dev/mcpresource.ts",
     "roundtrip": "tsx dev/roundtrip.ts",
     "balance": "tsx dev/balance.ts",
     "concurrency": "tsx dev/concurrency.ts",

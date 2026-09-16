@@ -16,6 +16,8 @@ import { z } from "zod";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
 import { ExactCardanoScheme } from "@x402/cardano";
 import { createGatedSigner, PolicyDenied } from "./gatedSigner.js";
+import { decodePaymentResponseHeader } from "@x402/core/http";
+import { receiptOf, describePayment, type Receipt } from "./receipt.js";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -36,6 +38,8 @@ interface CallContext {
   /** The URL this call is fetching, so signerd can check it against the agent's allowedResources. */
   resource: string;
   denial?: PolicyDenied;
+  /** signerd signed during this call, so a spend is on the ledger whatever the seller does next. */
+  signed?: boolean;
 }
 const callContext = new AsyncLocalStorage<CallContext>();
 
@@ -48,6 +52,10 @@ const signer = await createGatedSigner({
   onDenied: d => {
     const store = callContext.getStore();
     if (store) store.denial = d;
+  },
+  onSigned: () => {
+    const store = callContext.getStore();
+    if (store) store.signed = true;
   },
 });
 // spendControls: false — the per-payment USD cap in @x402/core is replaced by signerd's policy
@@ -96,7 +104,17 @@ server.tool(
       try {
         const r = await payingFetch(url, { method, body, headers: body ? { "content-type": "application/json" } : undefined });
         const text = await r.text();
-        const paid = r.headers.get("payment-response") ?? r.headers.get("x-payment-response");
+        // That the header exists is not that the payment settled: core sends it with `success: false`
+        // on every settle failure, and this used to report each of those to the agent as paid.
+        const header = r.headers.get("payment-response") ?? r.headers.get("x-payment-response");
+        let receipt: Receipt | undefined;
+        if (header) {
+          try {
+            receipt = receiptOf(decodePaymentResponseHeader(header));
+          } catch {
+            receipt = { paid: false, reason: "the seller's settlement header could not be decoded" };
+          }
+        }
         const LIMIT = 20000;
         return {
           content: [
@@ -104,7 +122,13 @@ server.tool(
               type: "text",
               // An agent that does not know it is reading a fragment will reason from the half it got.
               text: JSON.stringify(
-                { status: r.status, paid: Boolean(paid), truncated: text.length > LIMIT, bytes: text.length, body: text.slice(0, LIMIT) },
+                {
+                  status: r.status,
+                  ...describePayment(receipt, Boolean(callContext.getStore()?.signed)),
+                  truncated: text.length > LIMIT,
+                  bytes: text.length,
+                  body: text.slice(0, LIMIT),
+                },
                 null,
                 2,
               ),
@@ -226,6 +250,9 @@ server.tool(
     callContext.run({ reason: `${reason} [mcp tool ${tool}]`, resource: serverUrl }, async () => {
       try {
         const result = await withRemote(serverUrl, transport, paid => paid.callTool(tool, args));
+        // `paymentMade` means a payment went out with the retry, not that it settled, and a seller
+        // whose facilitator rejects it still sets it. Settled is read from the settlement itself, and
+        // whether anything was spent from signerd, which is the one that knows.
         const text = JSON.stringify(result.content);
         const LIMIT = 20000;
         return {
@@ -235,7 +262,7 @@ server.tool(
               text: JSON.stringify(
                 {
                   tool,
-                  paid: Boolean(result.paymentMade),
+                  ...describePayment(receiptOf(result.paymentResponse), Boolean(callContext.getStore()?.signed)),
                   truncated: text.length > LIMIT,
                   bytes: text.length,
                   content: text.length > LIMIT ? text.slice(0, LIMIT) : result.content,

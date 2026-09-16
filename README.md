@@ -62,9 +62,10 @@ three raises its own budget without going near the key. Put all of them where th
 cannot write, and run signerd as a different user. signerd prints the absolute paths at startup so
 this is checkable rather than assumed.
 
-The example policy's `allowedResources` names the local dev endpoint (`http://127.0.0.1:7401/*`)
-alongside a placeholder, so the round-trip below works from a fresh copy; drop the dev entry before
-the file governs anything real.
+The example policy's `allowedResources` names the two local dev sellers — `http://127.0.0.1:7401/*` for
+HTTP, `http://127.0.0.1:7404/*` for MCP — alongside a placeholder, so the round-trips below work from
+a fresh copy; drop both dev entries before the file governs anything real. The list applies to MCP
+tool calls too: the resource checked is the MCP server's URL.
 
 Two defaults in `policy.example.json` are deliberately conservative and worth a look before you
 widen them: `allowedPayees: ["*"]` accepts any payee, which is only reasonable while the agent is
@@ -94,6 +95,8 @@ minutes, or expect the agent to have to ask again.
 npm run dev:facilitator   # 127.0.0.1:7403  verifies + broadcasts. No key, no funds: the buyer's
                           #                 transaction is already signed and pays its own fee.
 npm run dev:resource      # 127.0.0.1:7401  the paid endpoint, settles via the facilitator
+npm run dev:mcpresource   # 127.0.0.1:7404  the same three prices as paid MCP tools, through
+                          #                 @x402/mcp's own createPaymentWrapper
 npm run signerd           # 127.0.0.1:7402  the key + policy
 ```
 Then drive it with a real MCP client — `dev/roundtrip.ts` spawns `src/mcp.ts` over stdio and calls
@@ -103,6 +106,7 @@ Then drive it with a real MCP client — `dev/roundtrip.ts` spawns `src/mcp.ts` 
 npm run roundtrip           # GET /quote    1.5 tADA, under approvalAbove -> signs unattended
 npm run roundtrip approve   # GET /report   4 tADA, queues -> npm run walletctl -- approve <id>
 npm run roundtrip deny      # GET /premium  6 tADA, over perTxMax -> denied, nothing signed
+npm run roundtrip auto mcp  # the same three modes, bought as MCP tools through x402_mcp_call
 npm run balance             # BUYER_ADDRESS / SELLER_ADDRESS balances, to see the faucet land
 npm run concurrency         # regression check for the spend-cap race (spends nothing)
 npm run walletctl -- preflight   # deployment checks; see "Before mainnet"
@@ -177,6 +181,16 @@ the same budget chain, or Blockfrost.
 - `npm run mcptools`: the MCP-side tools register, and the payment client really survives being
   handed from the vendored `@x402/core` to `@x402/mcp`, which is built against a different copy of
   it. TypeScript is made to accept that with a cast, so running it is the only thing that shows it.
+- `npm run roundtrip deny mcp`: a paid MCP tool over perTxMax, bought through `x402_mcp_call` from a
+  seller built on `@x402/mcp`'s own `createPaymentWrapper`, comes back `per_tx_max` in 0.1s with
+  nothing signed. The seller's resource server is the vendored core crossing into `@x402/mcp`, so
+  this is also that hand-off, the other way round, run.
+- **both tools used to report a payment that did not settle as paid.** `x402_fetch` read "paid" off
+  whether a `PAYMENT-RESPONSE` header existed, and core sends one with `success: false` on every
+  settle failure; `x402_mcp_call` read it off `paymentMade`, which means sent. Both now read the
+  settlement itself (`src/receipt.ts`, tested against core's real header encoding), carry the
+  transaction as a receipt, and say `unsettled` when signerd signed something that did not settle —
+  checked on preprod against a real facilitator rejection on both transports.
 - deny path, end to end: MCP `x402_fetch` → 402 → gated signer → signerd → `per_tx_max` →
   structured verdict back at the tool, `denied` in `audit.jsonl`
 - **a whole 402 round-trip on preprod, 2026-09-15** — `x402_fetch GET /quote` returned
@@ -307,7 +321,9 @@ Naming these is the point; none is fixed by more policy code.
   transient submit failure costs budget without moving funds. This is the conservative direction and
   deliberately so — refunding it would mean deciding "this will never land", which is exactly the
   question the facilitator cannot answer either. Observed once here: `dailySpent` of 16.5 tADA
-  against 12.5 tADA actually delivered.
+  against 12.5 tADA actually delivered. The tools say so when it happens: `paid: false` with an
+  `unsettled` note, and the transaction if one was broadcast, since a settlement reported failed can
+  still confirm.
 - **A 402 round-trip cannot complete on Koios at all.** The facilitator's `verify` resolves each
   input the buyer's transaction spends, and `@evolution-sdk`'s Koios provider fails that lookup for
   almost all of them. Over one wallet's 19 UTXOs, asked three ways: the Koios provider resolved 3,
@@ -329,9 +345,10 @@ Naming these is the point; none is fixed by more policy code.
   (120s) only avoids handing back a transaction some other unsettled one has already doomed.
 
 ## Not yet
-- **a paid MCP tool call has never actually been paid.** `x402_mcp_call` is wired to the official
-  client and the hand-off is checked, but closing the loop needs a seller-side MCP server, which
-  `dev/` does not have yet — so this is the one path here whose settlement is still unrun
+- **a paid MCP tool call has never actually settled.** The seller exists (`dev/mcpresource.ts`) and a
+  denial over MCP is run, but the paying modes fail at the facilitator's verify on Koios —
+  `getUtxosByOutRef` again, the same failure the HTTP path has without Blockfrost. Closing it needs
+  `BLOCKFROST_PROJECT_ID`, and until then this is the one path whose settlement is unrun
 - direct `send` (non-x402 transfer) — needs our own submit path; v1 is x402 only
 - Masumi escrow flows (`assetTransferMethod: masumi`) pass through untouched; policy still applies to the amount
 - policy is per-agent, not per-resource; add `allowedResources` if needed

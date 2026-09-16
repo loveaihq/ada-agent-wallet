@@ -17,6 +17,11 @@ export interface GatedSignerConfig {
    * `cause`, so catching alone loses the rule, detail and pending id.
    */
   onDenied?: (denied: PolicyDenied) => void;
+  /**
+   * Called once signerd has signed. By then it has recorded the spend, so this is the moment the
+   * budget is gone, whether or not the seller goes on to settle what it was handed.
+   */
+  onSigned?: () => void;
 }
 
 export class PolicyDenied extends Error {
@@ -60,6 +65,7 @@ export async function createGatedSigner(cfg: GatedSignerConfig): Promise<ClientC
       }
       if (typeof data.transaction !== "string" || typeof data.nonce !== "string")
         throw new Error(`signerd returned a 200 with no transaction: ${JSON.stringify(data).slice(0, 200)}`);
+      cfg.onSigned?.();
       return { transaction: data.transaction, nonce: data.nonce };
     },
   };

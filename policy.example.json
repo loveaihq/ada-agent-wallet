@@ -15,7 +15,7 @@
         "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d": "1000000"
       },
       "allowedPayees": ["*"],
-      "allowedResources": ["https://api.example.com/v1/*", "http://127.0.0.1:7401/*"],
+      "allowedResources": ["https://api.example.com/v1/*", "http://127.0.0.1:7401/*", "http://127.0.0.1:7404/*"],
       "maxPerHour": 20,
       "allowedAssetTransferMethods": ["default"]
     }

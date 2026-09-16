@@ -7,12 +7,12 @@ import { fileURLToPath } from "node:url";
 const SRC = resolve(dirname(fileURLToPath(import.meta.url)), "../src");
 
 /**
- * Six files say "Pure logic: no chain, no keys, no I/O" in their headers, and nothing made that
+ * Seven files say "Pure logic: no chain, no keys, no I/O" in their headers, and nothing made that
  * true beyond nobody having broken it yet. These are the modules whose testability, and whose
  * usefulness as the place the rules live, depends on it — a `readFileSync` in policy.ts would not
  * fail anything, it would just quietly move a decision out of reach of the unit suite.
  */
-const PURE = ["policy.ts", "serialize.ts", "keystore.ts", "replay.ts", "verifyTx.ts", "network.ts"];
+const PURE = ["policy.ts", "serialize.ts", "keystore.ts", "replay.ts", "verifyTx.ts", "network.ts", "receipt.ts"];
 /** Computation, not I/O. Everything else a pure module needs, it should be given. */
 const ALLOWED = new Set(["node:crypto"]);
 
@@ -34,7 +34,7 @@ test("the pure modules import nothing that touches the world", () => {
 });
 
 test("the pure modules still say so, and the list is the files that do", () => {
-  // Keeps the claim and the check from drifting apart: a sixth file claiming purity, or one of
+  // Keeps the claim and the check from drifting apart: another file claiming purity, or one of
   // these dropping the claim, should show up here rather than silently going unchecked.
   const claiming = PURE.filter(f => /no chain, no keys, no I\/O|Pure logic/.test(readFileSync(resolve(SRC, f), "utf8")));
   assert.deepEqual(claiming, PURE, "a module in the pure list no longer claims to be pure");
