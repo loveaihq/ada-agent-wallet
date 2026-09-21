@@ -44,15 +44,6 @@ const resourceServer = new x402ResourceServer(
 resourceServer.register(NETWORK, new ExactCardanoScheme());
 await resourceServer.initialize();
 
-/**
- * The same two copies of `@x402/core` as in src/mcp.ts, crossed the other way: the resource server
- * is the vendored one, because that is the copy the Cardano scheme was built against, and
- * `createPaymentWrapper` is typed against the copy nested under `@x402/mcp`. It calls eight methods
- * on it and does no `instanceof`; all eight exist on the vendored copy. Running this is the check.
- */
-type Wrappable = Parameters<typeof createPaymentWrapper>[0];
-type Accepts = Parameters<typeof createPaymentWrapper>[1]["accepts"];
-
 async function priced(tool: string, description: string, lovelace: string, maxTimeoutSeconds: number) {
   const accepts = await resourceServer.buildPaymentRequirements({
     scheme: "exact",
@@ -64,8 +55,8 @@ async function priced(tool: string, description: string, lovelace: string, maxTi
   });
   // Without `resource` the wrapper cannot know which tool it is wrapping, and every 402 names itself
   // `mcp://tool/paid_tool` — which is what an agent reads when it decides whether to pay.
-  return createPaymentWrapper(resourceServer as unknown as Wrappable, {
-    accepts: accepts as unknown as Accepts,
+  return createPaymentWrapper(resourceServer, {
+    accepts,
     resource: { url: createToolResourceUrl(tool), description, mimeType: "application/json" },
   });
 }

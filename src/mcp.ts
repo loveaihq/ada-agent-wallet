@@ -170,26 +170,8 @@ const httpUrl = z
   .url()
   .refine(u => /^https?:$/.test(new URL(u).protocol), { message: "must be http or https" });
 
-/**
- * Two copies of `@x402/core` are installed: the vendored 2.25.0 this wallet is built against, and
- * the 2.26.0 that `@x402/mcp` declares. They are the same client structurally, but `x402Client`
- * carries a private field, so TypeScript compares the two nominally and refuses the hand-off.
- *
- * Checked before taking the cast rather than after: `@x402/mcp` does no `instanceof` on the payment
- * client and calls exactly two of its methods — `createPaymentPayload(paymentRequired)` and
- * `handlePaymentResponse(ctx)` — and both signatures match on both copies. The assertion fails at
- * startup rather than mid-payment if a later version widens that surface.
- *
- * All of this goes away when `@x402/cardano` is published and vendor/ can be dropped: one core.
- */
-for (const method of ["createPaymentPayload", "handlePaymentResponse"] as const) {
-  if (typeof (client as unknown as Record<string, unknown>)[method] !== "function")
-    throw new Error(`@x402/mcp needs x402Client.${method}, which the installed @x402/core does not have`);
-}
-const paymentClient = client as unknown as Parameters<typeof wrapMCPClientWithPayment>[1];
-
 async function withRemote<T>(serverUrl: string, kind: "http" | "sse", use: (paid: x402MCPClient) => Promise<T>): Promise<T> {
-  const paid = wrapMCPClientWithPayment(new McpClient({ name: "ada-agent-wallet", version: "0.1.0" }), paymentClient, {
+  const paid = wrapMCPClientWithPayment(new McpClient({ name: "ada-agent-wallet", version: "0.1.0" }), client, {
     autoPayment: true,
   });
   try {

@@ -37,9 +37,6 @@ behaviour worth expecting**. They are accepted limitations, not findings:
   mitigation is `MAX_HOT_BALANCE_LOVELACE` — keep in the wallet only what you would accept losing.
 - deleting `ledger.json` **and** `audit.jsonl` together resets the spend cap. No single deletion
   does. File permissions are what covers the pair.
-- `vendor/` is unreviewed third-party code, pinned by sha256 and traced to upstream `fdeda56`.
-  Pinning is not review. A flaw *inside* that code belongs to the x402 Foundation — but tell me as
-  well, since this repository ships it.
 - a signed payment counts against the budget even if settlement then fails.
 - on Koios a facilitator can only settle at `l1Confirmations: 0`; depth needs Blockfrost.
 - on Windows the file-mode check reports that it could not run, rather than passing.

@@ -1,10 +1,9 @@
 /**
  * The MCP-side x402 tools: that they register, and that the payment client survives the hand-off.
  *
- * `@x402/mcp` is built against `@x402/core` 2.26.0 and this wallet against the vendored 2.25.0, so
- * `wrapMCPClientWithPayment` is handed an `x402Client` from a different copy of the package than
- * the one it was compiled against. TypeScript is made to accept that with a cast, which means the
- * only thing that can show it is really true is running it. That is what this does.
+ * The tools are registered by `src/mcp.ts` and the payment client it builds is handed to
+ * `@x402/mcp`'s `wrapMCPClientWithPayment`. Types agree now that both come from one `@x402/core`,
+ * but agreeing at compile time is not the same as the hand-off working, which is what this runs.
  *
  * Not covered: an actual paid MCP tool call. That needs a seller-side MCP server and a chain;
  * everything here stops before a payment, so it runs anywhere.
@@ -88,11 +87,11 @@ try {
   console.log(`  tools: ${names.join(", ")}`);
   for (const want of EXPECTED) check(names.includes(want), `${want} registered`);
 
-  step("the cross-copy payment client is really handed over");
+  step("the payment client is really handed over");
   const dead = await client.callTool({ name: "x402_mcp_tools", arguments: { server: DEAD_SERVER } });
   const said = text(dead);
   // `wrapMCPClientWithPayment` runs before `connect`, so a connect error — rather than a TypeError
-  // out of the wrapper — is what says the vendored client was accepted.
+  // out of the wrapper — is what says the client was accepted.
   check(Boolean(dead.isError), "a dead server is an error, not a result");
   check(/could not connect to the MCP server/.test(said), "and a connect error the agent can act on", said.slice(0, 160));
   check(!/is not a function|undefined is not|TypeError/.test(said), "not a TypeError from inside the wrapper", said.slice(0, 160));

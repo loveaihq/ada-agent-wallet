@@ -110,7 +110,6 @@ npm run roundtrip auto mcp  # the same three modes, bought as MCP tools through 
 npm run balance             # BUYER_ADDRESS / SELLER_ADDRESS balances, to see the faucet land
 npm run concurrency         # regression check for the spend-cap race (spends nothing)
 npm run walletctl -- preflight   # deployment checks; see "Before mainnet"
-npm run verify:vendor            # sha256 of vendor/; runs automatically before npm test
 npm run integrity                # proves no single deletion resets the spend cap
 npm run approvals                # every way out of the approval queue gives the budget back
 npm run assets                   # per-asset caps and windows, and the rate they share
@@ -142,9 +141,8 @@ facilitator client 115s so the wait is not cut off one level up. Anything talkin
 the same budget chain, or Blockfrost.
 
 ## Verified
-- `npm test`: 66 unit tests over the policy engine, the startup replay, the locks, the keystore, the
-  network table and the signed-transaction check, plus the vendor checksums, which gate the rest.
-  None needs a chain. `npm run typecheck` covers `dev/`, `test/` and `scripts/` too, which `tsx`
+- `npm test`: 77 unit tests over the policy engine, the startup replay, the locks, the keystore, the
+  network table, the signed-transaction check and the settlement receipt. None needs a chain. `npm run typecheck` covers `dev/`, `test/` and `scripts/` too, which `tsx`
   runs without checking.
 - the modules that say "no chain, no keys, no I/O" are checked to import nothing that would make
   that false, and to still say it — the first run of that check found one that had stopped
@@ -178,13 +176,12 @@ the same budget chain, or Blockfrost.
 - `npm run context`: two `x402_fetch` calls in flight at once each keep their own reason all the
   way into the audit, which is what the `AsyncLocalStorage` in mcp.ts exists for
 - mcp: tool listing and `wallet_status` through a real MCP client
-- `npm run mcptools`: the MCP-side tools register, and the payment client really survives being
-  handed from the vendored `@x402/core` to `@x402/mcp`, which is built against a different copy of
-  it. TypeScript is made to accept that with a cast, so running it is the only thing that shows it.
+- `npm run mcptools`: the MCP-side tools register, and the payment client `src/mcp.ts` builds is
+  accepted by `@x402/mcp`'s `wrapMCPClientWithPayment`. Types agreeing is not the hand-off working,
+  so it is run rather than assumed.
 - `npm run roundtrip deny mcp`: a paid MCP tool over perTxMax, bought through `x402_mcp_call` from a
   seller built on `@x402/mcp`'s own `createPaymentWrapper`, comes back `per_tx_max` in 0.1s with
-  nothing signed. The seller's resource server is the vendored core crossing into `@x402/mcp`, so
-  this is also that hand-off, the other way round, run.
+  nothing signed.
 - **both tools used to report a payment that did not settle as paid.** `x402_fetch` read "paid" off
   whether a `PAYMENT-RESPONSE` header existed, and core sends one with `success: false` on every
   settle failure; `x402_mcp_call` read it off `paymentMade`, which means sent. Both now read the
@@ -208,6 +205,13 @@ the same budget chain, or Blockfrost.
   from Blockfrost: exactly 4 tADA to the seller and nothing to anyone else. The nonce it spent was
   an output of `01b6275f8f…`, a Plutus transaction — the case Koios cannot look up until
   evolution-sdk#544 ships, so this one is Blockfrost-only for now.
+- **off `vendor/` and onto the published packages, 2026-09-21** — `@x402/cardano` reached npm as
+  2.26.0 on 2026-09-18, so the vendored tarballs, their checksums and the second copy of
+  `@x402/core` are gone, and with them the casts that let one copy's client reach the other's API.
+  Re-run on preprod against the published build: `deny` and `auto` on both transports, `auto`
+  settling as `3eb923952376ce5299f8cba6a70e3979fca92d3bd6ec82a738c5f4204d8f5344` over MCP and
+  `1061f314b2ea23e906e3293a9f0bade743c2dd5bedd43b28dd659072e96d2319` over HTTP, each read back from
+  Blockfrost as exactly 1.5 tADA to the seller and nothing to anyone else.
 - the same run bought `/quote` over HTTP after the receipt change: `status 200, paid: true`,
   transaction `ba269ae6f25b2ba505d3da251bbed9904f10466db05ed87c163edec66145eb3e` in block 5183281,
   checked the same way. The fix that stopped failures reading as paid did not stop successes.
@@ -322,13 +326,6 @@ Naming these is the point; none is fixed by more policy code.
   but signerd still decrypts the mnemonic into its own memory and keeps it there. A key that never
   leaves a device is a different architecture, not a setting — and the honest mitigation for this
   one is the balance ceiling: keep in the wallet only what you would accept losing outright.
-- **`vendor/` is unreviewed code, now at least a known quantity.** Both tarballs are pinned by
-  sha256 (`npm test` checks them) and traced to upstream `fdeda56`, verified by recovering their
-  TypeScript from the shipped source maps and diffing it against that commit — see
-  [vendor/PROVENANCE.md](vendor/PROVENANCE.md). Note what the version number is not: upstream's
-  released `2.25.0` contains no Cardano package at all, and the vendored `@x402/core` differs from
-  the published `@x402/core@2.25.0` in 25 files. Pinning is not review; this is unpublished code
-  signing real transactions, so someone should still read it or wait for a real release.
 - **Nothing scrapes `/metrics` for you.** The signals are exposed and the alerts worth writing are
   listed above, but wiring them to something that pages a human is deployment work, not code here.
 - **Deleting both `ledger.json` and `audit.jsonl` together still resets the cap.** No single
@@ -364,6 +361,12 @@ Naming these is the point; none is fixed by more policy code.
   and the identical payment succeeded on retry: its query view had the new UTXO before its submit
   node had the block. Retry rather than treat it as fatal — and note this is why the in-flight UTXO
   hold is short, since an over-long one makes that retry impossible.
+- **A payment started moments after the previous one settled can fail at `sign_failed: Blockfrost
+  getUtxos failed`.** Seen once, about ten seconds after an MCP payment had settled: signerd's
+  provider call for the wallet's UTxOs failed in under a second, while the identical run passed on
+  its own a minute later, as did a direct query of the same endpoint. The cause was not captured —
+  a free key's burst limit is the obvious suspect and not a proven one — so treat it as retryable,
+  the way `Koios submitTx failed` above is.
 - The in-flight hold is not what keeps an agent inside its cap; the ledger is. `NONCE_HOLD_SECONDS`
   (120s) only avoids handing back a transaction some other unsettled one has already doomed.
 
@@ -372,13 +375,6 @@ Naming these is the point; none is fixed by more policy code.
 - Masumi escrow flows (`assetTransferMethod: masumi`) pass through untouched; policy still applies to the amount
 - policy is per-agent, not per-resource; add `allowedResources` if needed
 
-`vendor/` holds `@x402/cardano` built from the Foundation repo, because it is not on npm yet
-(the publish workflow exists but hasn't run). Swap to the npm package when it lands.
-
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).
-
-`vendor/` is third-party code under the same licence: `@x402/cardano` and `@x402/core`, built from
-the x402 Foundation repository and pinned by sha256 to upstream `fdeda56`. See
-[vendor/PROVENANCE.md](vendor/PROVENANCE.md) for how that was verified, and what it does not prove.

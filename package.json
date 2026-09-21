@@ -36,8 +36,6 @@
     "roundtrip": "tsx dev/roundtrip.ts",
     "balance": "tsx dev/balance.ts",
     "concurrency": "tsx dev/concurrency.ts",
-    "verify:vendor": "node scripts/verify-vendor.mjs",
-    "pretest": "node scripts/verify-vendor.mjs",
     "integrity": "tsx dev/integrity.ts",
     "keystore": "tsx scripts/keystore.ts",
     "approvals": "tsx dev/approvals.ts",
@@ -51,9 +49,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "@x402/cardano": "file:vendor/x402-cardano-2.25.0.tgz",
-    "@x402/core": "file:vendor/x402-core-2.25.0.tgz",
-    "@x402/fetch": "^2.25.0",
+    "@x402/cardano": "^2.26.0",
+    "@x402/core": "^2.26.0",
+    "@x402/fetch": "^2.26.0",
     "@x402/mcp": "^2.26.0",
     "zod": "^3.24.0"
   },
