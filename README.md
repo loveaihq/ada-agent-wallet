@@ -372,10 +372,11 @@ Naming these is the point; none is fixed by more policy code.
 
 ## Not yet
 - not on npm: `private: true` is still set, on purpose. The package is otherwise shaped for it — a
-  `dist/` build, a `files` list, and four commands (`ada-signerd`, `ada-wallet-mcp`,
-  `ada-walletctl`, `ada-keystore`) — checked by packing the tarball, installing it into an empty
-  directory and running `npx ada-wallet-mcp` against a running `ada-signerd` there. Publishing is
-  that flag and nothing else
+  `dist/` build, a `files` list, and commands for each entry point (`ada-signerd`,
+  `ada-wallet-mcp`, `ada-walletctl`, `ada-keystore`, and the package name itself for the MCP
+  server, so a published config line would be `npx -y ada-agent-wallet`) — checked by packing the
+  tarball, installing it into an empty directory and running them there. Publishing is that flag
+  and nothing else
 - direct `send` (non-x402 transfer) — needs our own submit path; v1 is x402 only
 - Masumi escrow flows (`assetTransferMethod: masumi`) pass through untouched; policy still applies to the amount
 - policy is per-agent, not per-resource; add `allowedResources` if needed
