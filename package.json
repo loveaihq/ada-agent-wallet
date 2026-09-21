@@ -3,6 +3,17 @@
   "version": "0.1.0",
   "description": "Out-of-process spend control for AI agents paying with x402: per-tx and rolling caps, payee allowlist, human approval, and a hash-chained audit log — enforced in a separate daemon that holds the key, not in the agent. Settles on Cardano.",
   "type": "module",
+  "bin": {
+    "ada-signerd": "dist/signerd.js",
+    "ada-wallet-mcp": "dist/mcp.js",
+    "ada-walletctl": "dist/walletctl.js",
+    "ada-keystore": "dist/keystoreCli.js"
+  },
+  "files": [
+    "dist",
+    "policy.example.json",
+    "SECURITY.md"
+  ],
   "private": true,
   "license": "Apache-2.0",
   "author": "Vincent <loveaihqhq@gmail.com>",
@@ -37,7 +48,7 @@
     "balance": "tsx dev/balance.ts",
     "concurrency": "tsx dev/concurrency.ts",
     "integrity": "tsx dev/integrity.ts",
-    "keystore": "tsx scripts/keystore.ts",
+    "keystore": "tsx src/keystoreCli.ts",
     "approvals": "tsx dev/approvals.ts",
     "queue": "tsx dev/queue.ts",
     "posix": "tsx dev/posix.ts",
@@ -45,7 +56,8 @@
     "context": "tsx dev/context.ts",
     "assets": "tsx dev/assets.ts",
     "identity": "tsx dev/identity.ts",
-    "mcptools": "tsx dev/mcptools.ts"
+    "mcptools": "tsx dev/mcptools.ts",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

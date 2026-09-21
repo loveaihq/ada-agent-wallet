@@ -142,8 +142,8 @@ the same budget chain, or Blockfrost.
 
 ## Verified
 - `npm test`: 77 unit tests over the policy engine, the startup replay, the locks, the keystore, the
-  network table, the signed-transaction check and the settlement receipt. None needs a chain. `npm run typecheck` covers `dev/`, `test/` and `scripts/` too, which `tsx`
-  runs without checking.
+  network table, the signed-transaction check and the settlement receipt. None needs a chain. `npm run typecheck` covers `dev/` and `test/` too, which `tsx` runs
+  without checking.
 - the modules that say "no chain, no keys, no I/O" are checked to import nothing that would make
   that false, and to still say it — the first run of that check found one that had stopped
 - signerd asks the socket what address it bound and refuses anything but the loopback, so the one
@@ -371,6 +371,11 @@ Naming these is the point; none is fixed by more policy code.
   (120s) only avoids handing back a transaction some other unsettled one has already doomed.
 
 ## Not yet
+- not on npm: `private: true` is still set, on purpose. The package is otherwise shaped for it — a
+  `dist/` build, a `files` list, and four commands (`ada-signerd`, `ada-wallet-mcp`,
+  `ada-walletctl`, `ada-keystore`) — checked by packing the tarball, installing it into an empty
+  directory and running `npx ada-wallet-mcp` against a running `ada-signerd` there. Publishing is
+  that flag and nothing else
 - direct `send` (non-x402 transfer) — needs our own submit path; v1 is x402 only
 - Masumi escrow flows (`assetTransferMethod: masumi`) pass through untouched; policy still applies to the amount
 - policy is per-agent, not per-resource; add `allowedResources` if needed

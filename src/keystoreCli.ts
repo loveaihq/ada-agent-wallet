@@ -14,8 +14,8 @@ import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { toClientCardanoSigner } from "@x402/cardano";
-import { encryptMnemonic, decryptMnemonic, assertKeystore } from "../src/keystore.js";
-import { koiosBaseUrl } from "../src/network.js";
+import { encryptMnemonic, decryptMnemonic, assertKeystore } from "./keystore.js";
+import { koiosBaseUrl } from "./network.js";
 
 const argv = process.argv.slice(2);
 const command = argv[0];

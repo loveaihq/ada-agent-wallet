@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * signerd — the only process that holds the mnemonic.
  *

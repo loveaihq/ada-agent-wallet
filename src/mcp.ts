@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * MCP server the agent talks to. Tools:
  *   wallet_status()                       — address, remaining budget, pending approvals
