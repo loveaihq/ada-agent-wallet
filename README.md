@@ -200,6 +200,14 @@ the same budget chain, or Blockfrost.
   `audit.jsonl` with the reason tagged `[mcp tool quote]`, and the chain replays clean through
   `replayAudit`. The seller is `@x402/mcp`'s own `createPaymentWrapper`, so this is the wallet
   against the official stack on both sides of the call.
+- **the approval queue over MCP, settled on preprod, 2026-09-21** — `x402_mcp_call report` (4 tADA,
+  over `approvalAbove`) parked as `pending` carrying the agent's reason tagged `[mcp tool report]`,
+  `walletctl approve` released it, and the call came back `paid: true` in 25.2s. `pending` →
+  `signed` → `approved` in `audit.jsonl`, transaction
+  `adb52eb1cdb6878fc72943894ee95477be992ccad49cd8b418bef0b4eb606285` in block 5202188, read back
+  from Blockfrost: exactly 4 tADA to the seller and nothing to anyone else. The nonce it spent was
+  an output of `01b6275f8f…`, a Plutus transaction — the case Koios cannot look up until
+  evolution-sdk#544 ships, so this one is Blockfrost-only for now.
 - the same run bought `/quote` over HTTP after the receipt change: `status 200, paid: true`,
   transaction `ba269ae6f25b2ba505d3da251bbed9904f10466db05ed87c163edec66145eb3e` in block 5183281,
   checked the same way. The fix that stopped failures reading as paid did not stop successes.
@@ -360,10 +368,6 @@ Naming these is the point; none is fixed by more policy code.
   (120s) only avoids handing back a transaction some other unsettled one has already doomed.
 
 ## Not yet
-- `roundtrip approve mcp` has not been run. The queue is signerd's and the same for both
-  transports, and the wait it adds happens inside signing — before `@x402/mcp` sends the paid
-  request, so outside its request timeout — which is why nothing about MCP should change it. But
-  "should" is the word this list exists to stop taking on trust
 - direct `send` (non-x402 transfer) — needs our own submit path; v1 is x402 only
 - Masumi escrow flows (`assetTransferMethod: masumi`) pass through untouched; policy still applies to the amount
 - policy is per-agent, not per-resource; add `allowedResources` if needed
