@@ -3,7 +3,7 @@
  *   wallet_status()                       — address, remaining budget, pending approvals
  *   x402_fetch(url, reason, method?, body?) — GET/POST a paid endpoint; pays automatically if the
  *                                           policy allows, otherwise returns the denial / pending id
- *   x402_mcp_tools(server)                — what a remote MCP server offers, and what it charges
+ *   x402_mcp_tools(server)                — what a remote MCP server offers (not what it charges)
  *   x402_mcp_call(server, tool, args, reason) — a paid MCP tool, through the same policy gate
  * The agent never sees a key. It never sees the signed tx either — @x402/core handles the 402 round-trip.
  *
@@ -68,7 +68,7 @@ const payingFetch = wrapFetchWithPayment(fetch, client);
 
 const server = new McpServer({ name: "ada-agent-wallet", version: "0.1.0" });
 
-server.tool("wallet_status", "Wallet address, per-agent remaining budget (rolling 24h), pending approvals.", {}, async () => {
+server.tool("wallet_status", "Wallet address, per-agent remaining budget (rolling 24h), pending approvals.", {}, { readOnlyHint: true, openWorldHint: false }, async () => {
   try {
     const r = await fetch(`${SIGNERD_URL}/status`, { headers });
     const s = (await r.json().catch(() => ({}))) as Record<string, unknown>;
@@ -99,6 +99,8 @@ server.tool(
     method: z.enum(["GET", "POST"]).default("GET"),
     body: z.string().optional(),
   },
+  // It spends, it cannot be undone, and the URL is whatever the agent names.
+  { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   async ({ url, reason, method, body }) =>
     callContext.run({ reason, resource: url }, async () => {
       try {
@@ -205,25 +207,14 @@ async function withRemote<T>(serverUrl: string, kind: "http" | "sse", use: (paid
 
 server.tool(
   "x402_mcp_tools",
-  "List the tools a remote MCP server offers, and what each one charges. Free: this asks, it does not buy.",
+  "List the tools a remote MCP server offers. Not their prices: the only way to learn a price is to call the tool and be refused, which runs it if it turns out to be free. Call x402_mcp_call to buy; the policy decides what is affordable, and a denial names the amount.",
   { server: httpUrl, transport: z.enum(["http", "sse"]).default("http") },
+  { readOnlyHint: true, openWorldHint: true },
   async ({ server: serverUrl, transport }) => {
     try {
-      const tools = await withRemote(serverUrl, transport, async paid => {
-        const { tools } = await paid.listTools();
-        // Price per tool, so the agent can choose before it spends rather than after.
-        return Promise.all(
-          tools.map(async t => {
-            const req = await paid.getToolPaymentRequirements(t.name).catch(() => null);
-            const accept = req?.accepts?.[0];
-            return {
-              name: t.name,
-              description: t.description,
-              price: accept ? { amount: accept.amount, asset: accept.asset, network: accept.network, payTo: accept.payTo } : "free",
-            };
-          }),
-        );
-      });
+      const tools = await withRemote(serverUrl, transport, async paid =>
+        (await paid.listTools()).tools.map(t => ({ name: t.name, description: t.description })),
+      );
       return { content: [{ type: "text", text: JSON.stringify({ server: serverUrl, tools }, null, 2) }] };
     } catch (e) {
       return { content: [{ type: "text", text: `error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
@@ -243,6 +234,8 @@ server.tool(
     reason: z.string().min(3).max(1000),
     transport: z.enum(["http", "sse"]).default("http"),
   },
+  // Same as x402_fetch: it spends, and the server is whatever the agent names.
+  { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   async ({ server: serverUrl, tool, args, reason, transport }) =>
     // The resource is the server, not the tool: it is the URL the agent reports it is paying for,
     // which is what `allowedResources` is written against. Per-tool allowlisting would need a
