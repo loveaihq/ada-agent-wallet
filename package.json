@@ -60,7 +60,7 @@
     "assets": "tsx dev/assets.ts",
     "identity": "tsx dev/identity.ts",
     "mcptools": "tsx dev/mcptools.ts",
-    "prepublishOnly": "npm run build"
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
