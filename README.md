@@ -219,6 +219,18 @@ the same budget chain, or Blockfrost.
   from Blockfrost: exactly 4 tADA to the seller and nothing to anyone else. The nonce it spent was
   an output of `01b6275f8f…`, a Plutus transaction — the case Koios cannot look up until
   evolution-sdk#544 ships, so this one is Blockfrost-only for now.
+- **the whole matrix on `@x402/*` 2.27.0, preprod, 2026-09-23** — 2.27.0 shipped on 2026-09-22 and
+  a `^2.26.0` range floats onto it, so what someone installs today is not the build the round-trips
+  had been run against. All six combinations of {`deny`, `auto`, `approve`} x {HTTP, MCP} pass on it.
+  `deny` denies on `per_tx_max` and broadcasts nothing on either transport; the payments read back
+  from Blockfrost as exactly 1.5, 1.5, 4 and 4 tADA to the seller, no output to a third address and
+  every input the buyer's — `b99226d5…` (block 5209209), `38046624…` (5209211), `ff9705f4…`
+  (5209214), and for approve over MCP `a92857ee…` (5209223). That last one is a re-run: on the
+  first pass the harness approved within a second of the entry appearing, so `roundtrip.ts`'s own
+  once-a-second watch on `/pending` never saw the queue non-empty and failed the run — the payment
+  itself had settled correctly as `5a59f437…` (5209217), and the audit recorded `pending` →
+  `signed` → `approved` for it. Both harnesses polling on the same interval is the whole of it.
+  `replayAudit` clean afterwards, and `dailyRemaining` and `paymentsLastHour` match what was spent.
 - **off `vendor/` and onto the published packages, 2026-09-21** — `@x402/cardano` reached npm as
   2.26.0 on 2026-09-18, so the vendored tarballs, their checksums and the second copy of
   `@x402/core` are gone, and with them the casts that let one copy's client reach the other's API.
