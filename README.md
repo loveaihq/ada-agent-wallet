@@ -44,6 +44,14 @@ What this adds: key isolation, rolling daily/hourly limits, payee allowlist, hum
 enforced in the process that holds the key, so an agent cannot loosen its own limits.
 Masumi's Payment Service (the other Cardano agent-payment stack) has none of these on the buying side.
 
+## Install
+```
+npm i -g ada-agent-wallet
+```
+Node 20 or newer. Five commands: `ada-signerd`, `ada-wallet-mcp`, `ada-walletctl`, `ada-keystore`,
+and `ada-agent-wallet` (the MCP server again, so an agent config line is `npx -y ada-agent-wallet`).
+To work on the code instead, clone this repo and use the flow below.
+
 ## Run (preprod)
 ```
 npm install
@@ -249,6 +257,11 @@ the same budget chain, or Blockfrost.
 - the spend cap holds under concurrency: four simultaneous requests against a cap that fits one
   produce one `signed` and three `daily_max` denials. Before the agent lock the same probe signed
   every one of them, on one shared nonce.
+- what the registry serves is what was built: installing `ada-agent-wallet` from npm into an empty
+  directory pulls the 17 published files (shasum `a6c269ca…`, the one `npm publish` printed), brings
+  no `typescript` or `tsx` with it because `dist/` ships prebuilt, and leaves five working commands —
+  `ada-walletctl` and `ada-keystore` print their usage, `ada-wallet-mcp` gets as far as its own
+  "signerd is not answering" check.
 
 ## Before mainnet
 ```
@@ -377,12 +390,6 @@ Naming these is the point; none is fixed by more policy code.
   (120s) only avoids handing back a transaction some other unsettled one has already doomed.
 
 ## Not yet
-- not on npm: `private: true` is still set, on purpose. The package is otherwise shaped for it — a
-  `dist/` build, a `files` list, and commands for each entry point (`ada-signerd`,
-  `ada-wallet-mcp`, `ada-walletctl`, `ada-keystore`, and the package name itself for the MCP
-  server, so a published config line would be `npx -y ada-agent-wallet`) — checked by packing the
-  tarball, installing it into an empty directory and running them there. Publishing is that flag
-  and nothing else
 - direct `send` (non-x402 transfer) — needs our own submit path; v1 is x402 only
 - Masumi escrow flows (`assetTransferMethod: masumi`) pass through untouched; policy still applies to the amount
 - policy is per-agent, not per-resource; add `allowedResources` if needed
