@@ -129,8 +129,9 @@ same answer a reused nonce gets today.
   refused: signerd sizes deposits at `BATCH_DEPOSIT_REQUESTS` (default 100) times the price, within
   `channelDepositMax`.
 - Installable: a build to `dist/` (TypeScript rewrites the `.ts` imports), type declarations, an
-  `exports` map and a `prepare` script. The wallet pins a commit on GitHub; subbit-x402 goes to npm
-  before the wallet's next npm release, since a published package should not pull from git.
+  `exports` map and a `prepare` script. Published to npm as `subbit-x402@0.1.0`, which the wallet
+  depends on exactly, so an install never pulls from git and never floats onto a version nothing
+  here has run against.
 
 ## Scope
 
