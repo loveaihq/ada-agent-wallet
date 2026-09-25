@@ -63,6 +63,7 @@
     "batchseller": "tsx dev/batchseller.ts",
     "batch": "tsx dev/batch.ts",
     "batchexit": "tsx dev/batchexit.ts",
+    "batchend": "tsx dev/batchend.ts",
     "prepare": "npm run build"
   },
   "dependencies": {

@@ -6,6 +6,7 @@
  *   :7411  GET /data   0.1 tADA  the run's ordinary purchase
  *          GET /big    0.2 tADA  over the run's approvalAbove, so it queues for a human
  *          GET /lossy  0.1 tADA  settles its first request and drops the response, as a lost connection would
+ *          GET /token  0.001 tUSDM  the same in Moneta's preprod tUSDM, for a token channel
  *   :7412  GET /other  0.1 tADA  a seller whose channels would name a provider key the policy does not allow
  *   :7413  the facilitator: verifies, broadcasts, and waits for each deposit's block
  *
@@ -13,7 +14,9 @@
  *
  * Env: WALLET_MNEMONIC (the public test mnemonic: this key sells, it never holds anything of the
  *      user's), BLOCKFROST_PROJECT_ID, SUBBIT_REFERENCE_SCRIPT (optional txHash#index of the
- *      deployed validator), BATCH_SELLER_OUT (where the server keeps its channel records)
+ *      deployed validator), BATCH_SELLER_OUT (where the server keeps its channel records),
+ *      BATCH_SELLER_SETTLES=1 (run the watcher that settles a channel its buyer closes; off, the
+ *      seller never settles, which is what dev/batchexit.ts needs)
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -23,6 +26,7 @@ import { Address, Client, KeyHash, preprod } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH } from "subbit-x402/subbit";
 import { BlockfrostChain } from "subbit-x402/x402/chain";
 import { BatchSettlementCardanoFacilitator } from "subbit-x402/x402/facilitator";
+import { ChannelManager } from "subbit-x402/x402/manager";
 import { BatchSettlementCardanoServer, FileChannelStorage, walletProviderSigner } from "subbit-x402/x402/server";
 import { blockfrostBaseUrl } from "../src/network.js";
 import { readBody } from "./provider.js";
@@ -32,6 +36,8 @@ const MNEMONIC = process.env.WALLET_MNEMONIC;
 const PROJECT_ID = process.env.BLOCKFROST_PROJECT_ID;
 const OUT = process.env.BATCH_SELLER_OUT ?? "./.batch-seller";
 const REFERENCE_SCRIPT = process.env.SUBBIT_REFERENCE_SCRIPT;
+/** Moneta's preprod tUSDM, 6 decimals. */
+const TUSDM = "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d";
 if (!MNEMONIC || !PROJECT_ID) {
   console.error("batchseller: WALLET_MNEMONIC and BLOCKFROST_PROJECT_ID are required");
   process.exit(1);
@@ -60,30 +66,33 @@ await listen(7413, async (req, res) => {
 });
 const facilitatorClient = new HTTPFacilitatorClient({ url: "http://127.0.0.1:7413", timeoutMs: 300_000 });
 
-const accept = (lovelace: string) => ({ scheme: "batch-settlement", network: NETWORK, payTo, price: { asset: "lovelace", amount: lovelace }, maxTimeoutSeconds: 300, extra: {} });
-const shop = (receiverAuthorizer: string, dir: string, signs: boolean) =>
+const accept = (amount: string, asset = "lovelace") => ({ scheme: "batch-settlement", network: NETWORK, payTo, price: { asset, amount }, maxTimeoutSeconds: 300, extra: {} });
+const shop = (receiverAuthorizer: string, storage: FileChannelStorage, signs: boolean) =>
   new BatchSettlementCardanoServer({
     payTo,
     receiverAuthorizer,
     scriptHash: SUBBIT_HASH,
     ...(REFERENCE_SCRIPT ? { referenceScript: REFERENCE_SCRIPT } : {}),
     withdrawDelay: 900,
-    storage: new FileChannelStorage(`${OUT}/${dir}`),
+    storage,
     signAsProvider: signs
       ? walletProviderSigner(provider)
       : async () => {
           throw new Error("this seller holds no key");
         },
     chain,
+    assetDecimals: { [TUSDM]: 6 },
   });
 
-const main = new x402HTTPResourceServer(new x402ResourceServer(facilitatorClient).register(NETWORK, shop(providerKey, "main", true)), {
+const mainStorage = new FileChannelStorage(`${OUT}/main`);
+const main = new x402HTTPResourceServer(new x402ResourceServer(facilitatorClient).register(NETWORK, shop(providerKey, mainStorage, true)), {
   "GET /data": { accepts: accept("100000"), description: "one datum for 0.1 tADA" },
   "GET /big": { accepts: accept("200000"), description: "a bigger datum, over the run's approval threshold" },
   "GET /lossy": { accepts: accept("100000"), description: "one datum whose first response never arrives" },
+  "GET /token": { accepts: accept("1000", TUSDM), description: "one datum for 0.001 tUSDM" },
 } as RoutesConfig);
 await main.initialize();
-const other = new x402HTTPResourceServer(new x402ResourceServer(facilitatorClient).register(NETWORK, shop(otherKey, "other", false)), {
+const other = new x402HTTPResourceServer(new x402ResourceServer(facilitatorClient).register(NETWORK, shop(otherKey, new FileChannelStorage(`${OUT}/other`), false)), {
   "GET /other": { accepts: accept("100000"), description: "a seller the policy does not know" },
 } as RoutesConfig);
 await other.initialize();
@@ -113,6 +122,19 @@ const serve = (http: x402HTTPResourceServer, port: number) => async (req: Incomi
 };
 await listen(7411, serve(main, 7411));
 await listen(7412, serve(other, 7412));
+if (process.env.BATCH_SELLER_SETTLES === "1") {
+  // A seller that looks after its channels: when a buyer closes one, it settles the latest voucher.
+  const manager = new ChannelManager({ storage: mainStorage, wallet: provider, providerKeyHash: providerKey, chain, facilitator: facilitatorClient, network: NETWORK, payTo, scriptHash: SUBBIT_HASH, ...(REFERENCE_SCRIPT ? { referenceScript: REFERENCE_SCRIPT } : {}) });
+  manager.watch({
+    intervalMs: 15_000,
+    onEvent: e => {
+      if (e.kind === "closed") log(`watcher: ${e.channelId.slice(0, 16)}… closed by its buyer`);
+      else if (e.kind === "settled") for (const x of e.results) log(`watcher: settled ${x.channels.length} channel(s) in ${x.transaction}`);
+      else if (e.kind === "error") log(`watcher: a pass failed, the next one retries: ${String((e.error as Error)?.message ?? e.error).slice(0, 200)}`);
+    },
+  });
+  log("watcher on: channels their buyers close are settled");
+}
 console.log(JSON.stringify({ payTo, providerKey, otherKey }));
 log(`selling on 7411 and 7412, facilitator on 7413; provider ${payTo}`);
 

@@ -210,8 +210,9 @@ lock, so payments pause while one lands.
 
 Limits: preprod only, and only with `BLOCKFROST_PROJECT_ID` — the channel client reads the chain
 through Blockfrost, and Subbit's validator is alpha software. `x402_mcp_call` stays on `exact`:
-`batch-settlement` over paid MCP tools has not been tried. `npm run batchseller` and
-`npm run batch` are the preprod round trip; the results are under "Verified".
+`batch-settlement` over paid MCP tools has not been tried. `npm run batchseller` is the preprod
+seller, and `npm run batch`, `batchexit` and `batchend` are the round trips against it; the results
+are under "Verified".
 
 ## Verified
 - `npm test`: 101 unit tests over the policy engine, the startup replay, the locks, the keystore,
@@ -235,9 +236,15 @@ through Blockfrost, and Subbit's validator is alpha software. `x402_mcp_call` st
   `walletctl recover` found the closed channel on chain with its IOU key derived again, and
   `walletctl elapse` (`262b5b15…`) took everything back. The seller never settled, so it received
   nothing, and the wallet was down exactly the three fees, 0.751551 tADA; the three vouchers stay
-  spent in the ledger, as any signed payment does. Not run on chain yet: `end` after a seller's
-  settle, and `elapse` refused before `elapse_at` (the host slept through the close period, so the
-  run resumed after it).
+  spent in the ledger, as any signed payment does.
+- `npm run batchend` on preprod (2026-09-25), a token channel and the seller's side of an exit:
+  five purchases priced at 0.001 tUSDM opened a tUSDM channel through signerd (`6829d63d…`, 45 s,
+  then 36–53 ms a voucher); `walletctl close` (`b7dbfbba…`); an `elapse` straight after was
+  refused as `not_yet` rather than waited out inside the wallet lock; the seller's watcher settled
+  the latest voucher 20 s after it saw the close (`4c76972b…`); `walletctl end` (`71d076bc…`) took
+  the rest back. The seller received exactly 0.005 tUSDM and paid only its settle fee (0.275504
+  tADA); the wallet gave exactly 0.005 tUSDM and its ADA was down only its three fees, 0.687401 —
+  the channel's ADA reserve came back.
 - the modules that say "no chain, no keys, no I/O" are checked to import nothing that would make
   that false, and to still say it — the first run of that check found one that had stopped
 - signerd asks the socket what address it bound and refuses anything but the loopback, so the one

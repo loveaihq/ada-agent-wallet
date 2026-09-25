@@ -155,3 +155,5 @@ same answer a reused nonce gets today.
 - Preprod, `dev/batchexit.ts`: the way out without the seller — `walletctl close`, signerd losing
   its channel records, `walletctl recover` finding the channel again, `walletctl elapse` once the
   close period has run — reconciled on chain.
+- Preprod, `dev/batchend.ts`: a tUSDM channel opened through the wallet, `walletctl close`, an early
+  `elapse` refused, the seller settling, `walletctl end`; reconciled in both currencies.
