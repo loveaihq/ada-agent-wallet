@@ -349,11 +349,13 @@ through Blockfrost, and Subbit's validator is alpha software. `x402_mcp_call` st
 - the spend cap holds under concurrency: four simultaneous requests against a cap that fits one
   produce one `signed` and three `daily_max` denials. Before the agent lock the same probe signed
   every one of them, on one shared nonce.
-- what the registry serves is what was built: installing `ada-agent-wallet` from npm into an empty
-  directory pulls the 17 published files (shasum `a6c269ca…`, the one `npm publish` printed), brings
-  no `typescript` or `tsx` with it because `dist/` ships prebuilt, and leaves five working commands —
-  `ada-walletctl` and `ada-keystore` print their usage, `ada-wallet-mcp` gets as far as its own
-  "signerd is not answering" check.
+- what the registry serves is what was built: `ada-agent-wallet@0.2.0` on npm is byte for byte the
+  tarball checked before publishing (20 files, shasum `6edfe7ba…`, the one `npm publish` printed).
+  Installed from the registry into an empty directory, it brings `subbit-x402@0.1.0` and one copy of
+  the SDK, and no `typescript` or `tsx`, because both packages ship prebuilt; `ada-walletctl` and
+  `ada-keystore` print their usage, `ada-wallet-mcp` gets as far as its own "signerd is not
+  answering" check, and `ada-signerd` comes up on preprod with batch-settlement available. 0.1.0
+  was checked the same way (17 files, `a6c269ca…`).
 
 ## Before mainnet
 ```
