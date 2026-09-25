@@ -27,6 +27,10 @@ Anything that breaks one of these, because enforcing them is the whole reason th
 - the mnemonic, or a decrypted keystore, leaving the signerd process
 - the spend ledger being reset, rebuilt wrong, or made to under-count
 - signerd binding anything other than the loopback interface
+- batch-settlement: a voucher signed for more than the policy counted, a channel whose provider
+  key is outside `allowedProviderKeys`, a deposit past `channelDepositMax` or `channelLockedMax`,
+  a refund paying the seller more than was signed and not yet redeemed, or an IOU key reaching
+  anything but signerd's memory
 
 ## Already known — please do not report these as new
 

@@ -20,19 +20,25 @@ warranty; the risk of running it is yours.
 ```
 agent (Claude / any MCP client)
    └── mcp.ts        wallet_status · x402_fetch(url) · x402_mcp_tools/call(server, tool)  ← no keys
-         └── gatedSigner.ts  implements ClientCardanoSigner, forwards to ↓
+         ├── gatedSigner.ts  implements ClientCardanoSigner, forwards to ↓
+         └── batchProxy.ts   the batch-settlement scheme, forwards to ↓
 signerd.ts   127.0.0.1 only, bearer token, holds the mnemonic
    ├── policy.ts    per-tx max · rolling-24h max · payee, resource, asset and transfer-method
-   │                allowlists · per-hour rate · approval threshold
+   │                allowlists · per-hour rate · approval threshold · channel deposits and keys
    ├── replay.ts    rebuilds the 24h spend window at startup, and checks what it rebuilds from
    ├── serialize.ts one lock per agent for the cap, one per wallet for signing
    ├── keystore.ts  scrypt + AES-256-GCM, so the mnemonic is not plaintext at rest
    ├── verifyTx.ts  reads back the signed transaction: does it pay who was authorised, only them
+   ├── channelTx.ts the same for channel transactions: deposits, top-ups, refunds, exits
    ├── ledger.json  the spend state the cap is computed from, rewritten after every signature
    ├── audit.jsonl  every decision, hash-chained, the checkpoint pointing into it
    ├── tokens.json  optional: a token per agent, so `agentId` is not self-reported
+   ├── channels/    batch-settlement: what was signed on each channel (channelStore.ts), and
+   │                subbit-x402's channel records, one directory per agent
    └── @x402/cardano toClientCardanoSigner (Koios by default, Blockfrost optional)
+       subbit-x402   the batch-settlement channel client (preprod, Blockfrost)
 walletctl.ts  status | preflight | pending | approve <id> | deny <id> | audit
+              channels | refund | close | end | elapse | recover
 ```
 
 `ledger.json` and `audit.jsonl` are deliberately two files: the cap is state, the log is a log, and
@@ -154,10 +160,84 @@ gone, no goods. `dev/facilitator.ts` gives `awaitTx` 100s and `dev/resource.ts` 
 facilitator client 115s so the wait is not cut off one level up. Anything talking to mainnet needs
 the same budget chain, or Blockfrost.
 
+## batch-settlement (preprod)
+An `exact` payment on Cardano is a transaction whose output to the seller must hold about 0.97 ADA
+($0.23), plus a fee. Most of what x402 sells costs less than that. x402's `batch-settlement`
+scheme is the answer to small prices: the buyer locks funds in a payment channel once, pays each
+request with a signed cumulative voucher that stays off chain, and the seller redeems many at a
+time. This wallet pays it over [Subbit](https://github.com/kompact-io/subbit-xyz) channels, with
+the binding in [subbit-x402](https://github.com/loveaihq/subbit-x402); the design is in
+[DESIGN-batch-settlement.md](DESIGN-batch-settlement.md).
+
+**A voucher is money** — the seller can redeem up to the highest one signed, and signing one costs
+nothing — so the vouchers are signed where the policy is: signerd runs subbit-x402's client, with
+the wallet and the channels' IOU keys, and the agent's process gets `batchProxy.ts`, a scheme with
+no keys that forwards the 402 to signerd and the payload back. `x402_fetch` prefers
+`batch-settlement` when a seller offers it and the agent's policy allows it.
+
+```json
+"allowedSchemes": ["exact", "batch-settlement"],
+"allowedProviderKeys": ["<the seller's receiverAuthorizer>"],
+"channelDepositMax": { "lovelace": "5000000" },
+"channelLockedMax": { "lovelace": "10000000" },
+"maxWithdrawDelay": 86400,
+"maxVouchersPerHour": 600
+```
+
+- **A voucher spends what it adds** to the most signerd has signed on that channel, and that
+  increment goes through the same rules as an `exact` payment: payee, resource, `perTxMax`,
+  `dailyMax`, `approvalAbove`. A retry, or the re-sign after a corrective 402, adds nothing and
+  spends nothing. That record is signerd's own (`CHANNELS_DIR/index.json`): what sellers answer
+  moves the channel's count, never what the policy counts.
+- **A deposit is locked, not spent**: what the vouchers do not give the seller comes back. It has
+  its own limits — `channelDepositMax` per opening or top-up, `channelLockedMax` across the agent's
+  open channels, read from the chain — and does not touch `dailyMax`. A token channel's ADA
+  reserve counts as locked lovelace, so token channels need a lovelace entry too.
+- **The payee is a key.** A channel names the seller's `receiverAuthorizer`, which redeems, and the
+  validator does not restrict where a redemption pays — so `allowedPayees` alone binds nothing
+  here, and `allowedProviderKeys` must list the key.
+- **The close period is the seller's**, up to 30 days, and leaving without the seller keeps the
+  money that long; a channel asking for more than `maxWithdrawDelay` is not opened.
+- **Every channel transaction is read back before it leaves**, as `exact` ones are: the channel
+  step it claims to be, every other output to this wallet, a refund paying the seller no more than
+  was signed and not yet redeemed, a fee under 2 ADA and collateral under 5 ADA.
+
+The operator's side: `walletctl channels`, `walletctl refund <channelId> <url>` (the seller
+co-signs; signerd builds and signs it but talks to no seller, walletctl carries the messages),
+`close`, `end` and `elapse` to leave without the seller, and `recover <agentId>` to find an agent's
+channels on chain again after losing the records. An exit waits for its block inside the wallet
+lock, so payments pause while one lands.
+
+Limits: preprod only, and only with `BLOCKFROST_PROJECT_ID` — the channel client reads the chain
+through Blockfrost, and Subbit's validator is alpha software. `x402_mcp_call` stays on `exact`:
+`batch-settlement` over paid MCP tools has not been tried. `npm run batchseller` and
+`npm run batch` are the preprod round trip; the results are under "Verified".
+
 ## Verified
-- `npm test`: 77 unit tests over the policy engine, the startup replay, the locks, the keystore, the
-  network table, the signed-transaction check and the settlement receipt. None needs a chain. `npm run typecheck` covers `dev/` and `test/` too, which `tsx` runs
-  without checking.
+- `npm test`: 101 unit tests over the policy engine, the startup replay, the locks, the keystore,
+  the network table, the signed-transaction and channel-transaction checks, the channel index, the
+  batch-settlement proxy and the settlement receipt. None needs a chain. `npm run typecheck` covers
+  `dev/` and `test/` too, which `tsx` runs without checking.
+- `npm run batch` on preprod (2026-09-25), a real MCP client paying `dev/batchseller.ts` through
+  `x402_fetch`, 0.1 tADA a request: the first purchase opened a channel in 38 s (deposit 2.732620
+  tADA, reserve included), the next nine were vouchers at 33–39 ms each; a response the seller
+  dropped was retried with the same voucher and spent nothing twice (`voucher_resigned`); a 0.2
+  tADA purchase over `approvalAbove` queued, was approved with the operator's token, and paid;
+  the channel was topped up twice as it ran short; the 25th voucher was refused by `dailyMax`; a
+  seller naming a provider key outside `allowedProviderKeys` was refused and got no channel; and
+  `walletctl refund` closed the channel with the seller co-signing. 24 vouchers for 2.500000 tADA
+  in the audit log, in the ledger and in signerd's channel index alike; on chain the seller
+  received exactly 2.500000 and the wallet lost exactly that plus the four transactions' fees,
+  0.923814 (opening `1ea7adcb…` 0.178173, top-ups `4b373326…` and `38170b84…` 0.253535 and
+  0.253533, refund `13808a96…` 0.238573).
+- `npm run batchexit` on preprod (2026-09-25), the way out without the seller: three purchases,
+  `walletctl close` (`95f5f833…`), then signerd restarted with its channel directory deleted;
+  `walletctl recover` found the closed channel on chain with its IOU key derived again, and
+  `walletctl elapse` (`262b5b15…`) took everything back. The seller never settled, so it received
+  nothing, and the wallet was down exactly the three fees, 0.751551 tADA; the three vouchers stay
+  spent in the ledger, as any signed payment does. Not run on chain yet: `end` after a seller's
+  settle, and `elapse` refused before `elapse_at` (the host slept through the close period, so the
+  run resumed after it).
 - the modules that say "no chain, no keys, no I/O" are checked to import nothing that would make
   that false, and to still say it — the first run of that check found one that had stopped
 - signerd asks the socket what address it bound and refuses anything but the loopback, so the one

@@ -7,3 +7,5 @@ audit.jsonl
 .mcp.json
 ledger.json
 ledger.json.tmp
+channels/
+.batch-seller/

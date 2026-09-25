@@ -18,9 +18,23 @@
  *   POST /approve  {id}                -> signs the queued request, if the policy still allows it
  *   POST /deny     {id}
  *
+ * batch-settlement (preprod, with BLOCKFROST_PROJECT_ID; see DESIGN-batch-settlement.md):
+ *   POST /batch/payload   {agentId, reason, resource?, x402Version, requirements} -> {x402Version, payload}
+ *                         a voucher, or a channel opening or top-up with one; 403, 409 and the
+ *                         approval queue as for /sign
+ *   POST /batch/response  {paymentPayload, requirements, settleResponse?, paymentRequired?} -> {recovered}
+ *                         the seller's answer, for the channel's count
+ *   GET  /channels                                  -> every channel, whose, and what was signed on it
+ *   POST /channels/refund         {channelId, paymentRequired}           -> {paymentPayload}
+ *   POST /channels/refund/result  {channelId, paymentPayload, settleResponse}
+ *   POST /channels/close | /channels/end | /channels/elapse  {channelId}  -> {transaction}
+ *   POST /channels/recover        {agentId}                              -> channels found on chain
+ *   The first two take an agent's token; the rest are the operator's.
+ *
  * None of POLICY_FILE, AUDIT_FILE or LEDGER_FILE may be writable by the agent's user: between them
  * they are the limits, the spending they are measured against, and the checkpoint the cap is
- * computed from. See README, "Before mainnet".
+ * computed from. Nor may CHANNELS_DIR, which holds what was signed on each channel. See README,
+ * "Before mainnet".
  *
  * Env:
  *   WALLET_KEYSTORE_FILE    passphrase-encrypted mnemonic (preferred; see scripts/keystore.ts)
@@ -44,7 +58,12 @@
  *                     boundary; with it, a token is an identity and cannot claim another.
  *   MASUMI_MAX_COLLATERAL_LOVELACE  ceiling on the collateral a masumi escrow may lock
  *   NONCE_HOLD_SECONDS              how long a handed-out UTXO is treated as in flight
+ *   CHANNELS_DIR            default ./channels (batch-settlement's records; like the ledger, not
+ *                           writable by the agent's user)
+ *   BATCH_DEPOSIT_REQUESTS  how many requests at the asked price a channel deposit is sized for,
+ *                           within channelDepositMax (default 100)
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
   readFileSync,
@@ -59,12 +78,31 @@ import {
   ftruncateSync,
   closeSync,
   createReadStream,
+  mkdirSync,
 } from "node:fs";
 import { createInterface } from "node:readline";
-import { resolve as resolvePath, dirname } from "node:path";
+import { resolve as resolvePath, dirname, join } from "node:path";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { toClientCardanoSigner, decodeCardanoTransaction, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
-import { decide, parsePolicy, remaining, type Policy, type SpendRecord } from "./policy.js";
+import type { PaymentPayload, PaymentPayloadResult, PaymentRequired, PaymentRequirements, SettleResponse } from "@x402/core/types";
+import { Address, Client, KeyHash, preprod } from "@evolution-sdk/evolution";
+import { SUBBIT_HASH } from "subbit-x402/subbit";
+import { BlockfrostChain } from "subbit-x402/x402/chain";
+import { currencyOf, subbedOf, txHashOf, type ChannelView } from "subbit-x402/x402/cardano";
+import { channelOutputIndex, decodeTx } from "subbit-x402/x402/txcheck";
+import { parseExtra } from "subbit-x402/x402/types";
+import {
+  BatchSettlementCardanoClient,
+  FileClientStorage,
+  PENDING_MS,
+  derivedIouSigner,
+  iouRootOf,
+  type Authorization,
+  type ClientChannel,
+} from "subbit-x402/x402/client";
+import { BATCH, decide, decideDeposit, parsePolicy, remaining, type Decision, type Policy, type SpendRecord } from "./policy.js";
+import { ChannelStore, type ChannelEntry } from "./channelStore.js";
+import { stepProblem, summarize, summaryProblem, type ChannelStep } from "./channelTx.js";
 import { createKeyedLock, createLock } from "./serialize.js";
 import { replayAudit, sha256, type Checkpoint } from "./replay.js";
 import { mismatch } from "./verifyTx.js";
@@ -127,6 +165,8 @@ const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS ?? 60_000);
 // The longest window any rule looks at. Nothing older can change a decision, so nothing older is
 // kept: the ledger stays bounded however long the process runs and however large the audit grows.
 const LEDGER_WINDOW_MS = 24 * 60 * 60 * 1000;
+const CHANNELS_DIR = process.env.CHANNELS_DIR ?? "./channels";
+const BATCH_DEPOSIT_REQUESTS = Number(process.env.BATCH_DEPOSIT_REQUESTS ?? 100);
 
 function fail(msg: string): never {
   console.error(`signerd: ${msg}`);
@@ -154,6 +194,8 @@ if (!Number.isInteger(NONCE_HOLD_SECONDS) || NONCE_HOLD_SECONDS < 1)
 // 120_000 is what the SDK accepts; above it the setting is silently not the one in force.
 if (!Number.isInteger(PROVIDER_TIMEOUT_MS) || PROVIDER_TIMEOUT_MS < 1 || PROVIDER_TIMEOUT_MS > 120_000)
   fail(`PROVIDER_TIMEOUT_MS must be a whole number of milliseconds from 1 to 120000, got "${process.env.PROVIDER_TIMEOUT_MS}"`);
+if (!Number.isInteger(BATCH_DEPOSIT_REQUESTS) || BATCH_DEPOSIT_REQUESTS < 10)
+  fail(`BATCH_DEPOSIT_REQUESTS must be a whole number of at least 10 (the client's own floor), got "${process.env.BATCH_DEPOSIT_REQUESTS}"`);
 // Resolved once, so "is this mainnet" is a fact about a known chain and not a suffix match that
 // would read `cardano:preview` as mainnet's opposite and point it at mainnet's providers.
 const IS_MAINNET = (() => {
@@ -312,7 +354,7 @@ function writeCheckpoint() {
     seq: auditSeq,
     hash: auditPrevHash,
     updatedAt: Date.now(),
-    spends: ledger.map(r => ({ ts: r.ts, agentId: r.agentId, asset: r.asset, amount: r.amount.toString() })),
+    spends: ledger.map(r => ({ ts: r.ts, agentId: r.agentId, asset: r.asset, amount: r.amount.toString(), ...(r.voucher ? { voucher: true } : {}) })),
   };
   const tmp = `${LEDGER_FILE}.tmp`;
   writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
@@ -453,6 +495,55 @@ function providerConfig() {
 const address = signer.getAddress();
 
 /**
+ * batch-settlement: x402 over Subbit payment channels (DESIGN-batch-settlement.md). subbit-x402's
+ * client runs here, with this wallet, because a voucher is money to whoever holds it and costs
+ * nothing to sign: whatever signs vouchers has to be where the policy is. The agent's process gets
+ * a proxy that forwards the 402 here and the payload back.
+ *
+ * Preprod only, and only on Blockfrost: the client's one chain reader is Blockfrost's, written for
+ * preprod, and Subbit's validator is alpha.
+ */
+const BATCH_UNAVAILABLE =
+  networkName(NETWORK) !== "preprod"
+    ? `batch-settlement runs on preprod only, and this wallet is on ${NETWORK}`
+    : !process.env.BLOCKFROST_PROJECT_ID
+      ? "batch-settlement needs BLOCKFROST_PROJECT_ID: the channel client reads the chain through Blockfrost"
+      : undefined;
+const channels = BATCH_UNAVAILABLE ? undefined : await openChannels();
+
+async function openChannels() {
+  const baseUrl = blockfrostBaseUrl(NETWORK);
+  const projectId = process.env.BLOCKFROST_PROJECT_ID!;
+  // The `exact` signer's key: the same mnemonic, normalised as @x402/cardano does, and account 0.
+  // Two builders that disagreed on the address would each see half a wallet.
+  const wallet = Client.make(preprod)
+    .withBlockfrost({ baseUrl, projectId })
+    .withSeed({ mnemonic: mnemonic.trim().replace(/\s+/g, " ").toLowerCase(), accountIndex: 0 });
+  const own = await wallet.address();
+  if (Address.toBech32(own) !== address) fail(`batch-settlement: the channel wallet is ${Address.toBech32(own)}, the exact signer's ${address}`);
+  mkdirSync(CHANNELS_DIR, { recursive: true, mode: 0o700 });
+  const index = join(CHANNELS_DIR, "index.json");
+  checkFileMode("channel index", index);
+  let store: ChannelStore;
+  try {
+    store = new ChannelStore(index);
+  } catch (e) {
+    fail(`channel index ${resolvePath(index)} is unreadable: ${e instanceof Error ? e.message : e}`);
+  }
+  return {
+    chain: new BlockfrostChain("cardano:preprod", baseUrl, projectId),
+    wallet,
+    store,
+    /** This wallet's payment key hash: every channel's consumer. */
+    consumer: KeyHash.toHex(own.paymentCredential as KeyHash.KeyHash),
+    /** Every channel's IOU key derives from this, so an opening's key is checked against signerd's own derivation. */
+    iouRoot: await iouRootOf(wallet),
+    /** One client per agent: its own records, so its channels, deposits and counts are its own. */
+    clients: new Map<string, { client: BatchSettlementCardanoClient; storage: FileClientStorage }>(),
+  };
+}
+
+/**
  * What the wallet holds. The daily cap bounds an agent, not someone holding the key — only the
  * balance does that. Cached so a metrics scrape never waits on a rate-limited provider.
  */
@@ -519,11 +610,29 @@ function claimNonce(nonce: string, ttlSeconds: number): boolean {
 }
 
 /**
+ * Every input of every transaction handed out, `exact` or channel, and when. The two builders are
+ * blind to each other: the `exact` one spends the wallet's first UTXO and lets the SDK add any
+ * others, and a channel opening picks its own. subbit-x402's client leaves these out of its coin
+ * selection (it is this map, as `spentInputs`), and an `exact` transaction that spends one is
+ * refused as utxo_busy — otherwise two transactions could go out spending one UTXO, and one of
+ * them would never land. The client drops an entry once the wallet stops listing it, or after
+ * PENDING_MS.
+ */
+const inFlight = new Map<string, number>();
+function inputBusy(inputs: readonly string[]): string | undefined {
+  const now = Date.now();
+  return inputs.find(i => {
+    const at = inFlight.get(i);
+    return at !== undefined && now - at < PENDING_MS;
+  });
+}
+
+/**
  * `maxTimeoutSeconds` comes from the seller's 402: unclamped, zero times out every approval, and
  * a non-number would make the timer NaN — which fires at once — and the nonce hold NaN, which
  * never expires.
  */
-const approvalWindow = (input: ClientCardanoSignInput) => {
+const approvalWindow = (input: { maxTimeoutSeconds?: unknown }) => {
   const asked = typeof input.maxTimeoutSeconds === "number" && Number.isFinite(input.maxTimeoutSeconds) ? input.maxTimeoutSeconds : 300;
   return Math.max(30, Math.min(asked, MAX_APPROVAL_SECONDS));
 };
@@ -565,8 +674,11 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
     // party who checks is the facilitator, which is the seller's and has no reason to care whether
     // this wallet also paid someone else.
     let wrong: string | undefined;
+    let inputs: string[] = [];
     try {
-      wrong = mismatch(decodeCardanoTransaction(res.transaction), {
+      const decoded = decodeCardanoTransaction(res.transaction);
+      inputs = decoded.inputs;
+      wrong = mismatch(decoded, {
         payTo: input.payTo,
         asset: input.asset,
         amount: input.amount,
@@ -582,10 +694,17 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
       throw new AuditedError(`refusing to hand over a transaction that does not match what was authorised: ${wrong}`);
     }
 
-    if (!claimNonce(res.nonce, Math.min(approvalWindow(input), NONCE_HOLD_SECONDS))) {
-      audit("nonce_collision", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce });
-      throw new UtxoBusy(`utxo ${res.nonce} is already committed to an unsettled payment; retry once it settles`);
+    const hold = Math.min(approvalWindow(input), NONCE_HOLD_SECONDS);
+    // Checked before the nonce is claimed: a refusal must not leave it claimed.
+    const held = inputBusy(inputs);
+    if (held !== undefined || !claimNonce(res.nonce, hold)) {
+      const other = held !== undefined && held !== res.nonce;
+      audit(other ? "input_in_flight" : "nonce_collision", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce, ...(other ? { input: held } : {}) });
+      throw new UtxoBusy(`utxo ${held ?? res.nonce} is already committed to an unsettled payment; retry once it settles`);
     }
+    // Held no longer than the nonce: the ledger is what bounds spending, and a settlement that
+    // failed must not keep the channel client off these UTXOs for the client's full PENDING_MS.
+    for (const i of inputs) inFlight.set(i, Date.now() - PENDING_MS + hold * 1000);
     ledger.push({ ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
     pruneLedger();
     audit("signed", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce, network: input.network });
@@ -594,6 +713,11 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
   });
 }
 
+/** What an approval signs: an `exact` payment, or a batch-settlement voucher and the step it rides on. */
+type PendingWork =
+  | { scheme: "exact"; input: ClientCardanoSignInput }
+  | { scheme: typeof BATCH; x402Version: number; requirements: PaymentRequirements; increment: bigint };
+
 interface Pending {
   id: string;
   createdAt: number;
@@ -601,10 +725,14 @@ interface Pending {
   reason: string;
   /** Kept so the policy can be re-applied at approval time, `allowedResources` included. */
   resource?: string;
-  input: ClientCardanoSignInput;
+  /** What the queue shows and holds budget for: a voucher's is its increment. */
+  payTo: string;
+  asset: string;
+  amount: string;
+  work: PendingWork;
   /** Cleared when the request resolves, so a settled approval stops holding the event loop open. */
   timer: NodeJS.Timeout;
-  resolve: (v: { transaction: string; nonce: string } | { denied: string }) => void;
+  resolve: (v: Settled) => void;
 }
 const pending = new Map<string, Pending>();
 
@@ -621,12 +749,381 @@ function closePending(p: Pending, event: string, verdict: string, extra: Record<
   return true;
 }
 
-type Settled = { transaction: string; nonce: string } | { denied: string };
-type SignOutcome =
+type Settled = { transaction: string; nonce: string } | { payload: PaymentPayloadResult } | { denied: string };
+type Outcome<T> =
   | { kind: "deny"; rule: string; detail: string }
-  | { kind: "signed"; out: { transaction: string; nonce: string } }
+  | { kind: "signed"; out: T }
   | { kind: "error"; error: unknown }
   | { kind: "queued"; id: string; settled: Promise<Settled> };
+type SignOutcome = Outcome<{ transaction: string; nonce: string }>;
+
+/**
+ * Puts a request in the approval queue and holds its budget; the caller releases its locks and
+ * waits on `settled` outside them. Budget held by a queued request counts as spent until it
+ * resolves, so queuing two requests is not a way to promise the same budget twice.
+ */
+function enqueue(
+  res: ServerResponse,
+  q: { agentId: string; reason: string; resource?: string; payTo: string; asset: string; amount: string; detail: string; work: PendingWork; windowSeconds: number },
+): { id: string; settled: Promise<Settled> } {
+  const id = randomUUID().slice(0, 8);
+  const voucher = q.work.scheme === BATCH;
+  reserved.set(id, { ts: Date.now(), agentId: q.agentId, asset: q.asset, amount: BigInt(q.amount), ...(voucher ? { voucher: true } : {}) });
+  audit("pending", { id, agentId: q.agentId, reason: q.reason, resource: q.resource, payTo: q.payTo, asset: q.asset, amount: q.amount, detail: q.detail, ...(voucher ? { scheme: BATCH } : {}) });
+  const settled = new Promise<Settled>(resolve => {
+    const entry: Pending = {
+      id,
+      createdAt: Date.now(),
+      agentId: q.agentId,
+      reason: q.reason,
+      resource: q.resource,
+      payTo: q.payTo,
+      asset: q.asset,
+      amount: q.amount,
+      work: q.work,
+      timer: setTimeout(() => closePending(entry, "approval_timeout", "approval timed out", { asset: q.asset, amount: q.amount }), q.windowSeconds * 1000),
+      resolve,
+    };
+    pending.set(id, entry);
+    // The answer has one recipient: the request that is still open. Node's fetch stops waiting
+    // for headers after 300s, and an approval signed after the caller has gone records a spend
+    // for a transaction nobody will ever broadcast — so a caller that leaves takes its request
+    // with it, and its budget comes back.
+    const withdraw = () => {
+      if (!res.writableFinished) closePending(entry, "pending_abandoned", "the caller stopped waiting", { detail: "connection closed while queued" });
+    };
+    res.on("close", withdraw);
+    // The wait for the agent lock above is as long as a payment ahead of this one takes to
+    // sign, and a caller can leave during it. A listener attached after `close` has fired is
+    // a listener that never runs, which left the request in the queue with its budget held,
+    // for a human to approve into the void — the one thing the listener is here to prevent.
+    if (res.destroyed || res.socket?.destroyed) withdraw();
+  });
+  return { id, settled };
+}
+
+/**
+ * Which agent a paying request is for: the token's, when tokens mean something, else the body's.
+ * Once tokens mean something, the operator's does not mean "any agent": operating and paying are
+ * different authorities, and the operator already has the policy and the approval queue.
+ */
+function payingAgent(caller: Caller, body: Record<string, unknown>): { agentId: string } | { status: number; body: Record<string, unknown> } {
+  const claimed = body.agentId;
+  if (agentTokens.size > 0 && caller.kind === "operator")
+    return { status: 403, body: { error: "operator_cannot_sign", detail: "signing needs an agent token; the operator token operates" } };
+  if (caller.kind === "agent" && claimed !== undefined && claimed !== caller.agentId)
+    return { status: 403, body: { error: "agent_mismatch", detail: `this token signs for ${caller.agentId}, not ${String(claimed)}` } };
+  const agentId = caller.kind === "agent" ? caller.agentId : claimed;
+  if (typeof agentId !== "string" || !agentId) return { status: 400, body: { error: "agentId required" } };
+  if (agentId.length > MAX_AGENT_ID) return { status: 400, body: { error: "too_long", detail: `agentId (${agentId.length} > ${MAX_AGENT_ID})` } };
+  return { agentId };
+}
+
+// ---- batch-settlement: what the channel client may hand out ---------------------------------
+
+/** Per request: why the agent is paying, and whether a human has approved this voucher already. */
+interface BatchCall {
+  reason: string;
+  resource?: string;
+  /** Set on the second run of a queued voucher: what the human approving it was shown. */
+  approved?: { id: string; increment: bigint; payTo: string; asset: string };
+  /** A refund or an exit the operator asked for: no agent's budget moves. */
+  operator?: boolean;
+}
+const batchCall = new AsyncLocalStorage<BatchCall>();
+
+/** A policy verdict against a channel step, audited where it was made. */
+class BatchDenied extends AuditedError {
+  constructor(public readonly rule: string, public readonly detail: string) {
+    super(`${rule}: ${detail}`);
+  }
+}
+
+/** A voucher over approvalAbove: it is queued, and made again once a human has approved it. */
+class NeedsApproval extends Error {
+  constructor(public readonly increment: bigint, public readonly payTo: string, public readonly asset: string, public readonly detail: string) {
+    super(detail);
+  }
+}
+
+const short = (id: string) => `${id.slice(0, 16)}…`;
+
+function batchClient(agentId: string): { client: BatchSettlementCardanoClient; storage: FileClientStorage } {
+  const c = channels!;
+  const have = c.clients.get(agentId);
+  if (have) return have;
+  // Named for the agent's id, hashed: an id is free text, and a directory name is a path.
+  const storage = new FileClientStorage(join(CHANNELS_DIR, `agent-${sha256(agentId).slice(0, 16)}`));
+  const client = new BatchSettlementCardanoClient({
+    wallet: c.wallet,
+    storage,
+    chain: c.chain,
+    capacity: req => BigInt(req.amount) * BigInt(BATCH_DEPOSIT_REQUESTS),
+    // A clamp, so that a deposit is cut to fit rather than refused; `authorize` is the check.
+    maxDeposit: req => {
+      const cap = policy.agents[agentId]?.channelDepositMax?.[req.asset];
+      return cap === undefined ? undefined : BigInt(cap);
+    },
+    spentInputs: inFlight,
+    iouKeys: "derived",
+    authorize: a => authorizeChannel(agentId, a),
+  });
+  const made = { client, storage };
+  c.clients.set(agentId, made);
+  return made;
+}
+
+/** The client's run for a 402, under the wallet lock: it builds and signs with this wallet's UTXOs. */
+function batchPayload(agentId: string, call: BatchCall, x402Version: number, requirements: PaymentRequirements): Promise<PaymentPayloadResult> {
+  return withWalletLock(() => batchCall.run(call, () => batchClient(agentId).client.createPaymentPayload(x402Version, requirements)));
+}
+
+function refuse(call: BatchCall, agentId: string, rule: string, detail: string, what: Record<string, unknown> = {}): BatchDenied {
+  // On an approval's second run the queue records the outcome, as approval_stale.
+  if (!call.approved) audit("denied", { agentId, reason: call.reason, resource: call.resource, scheme: BATCH, ...what, rule, detail });
+  return new BatchDenied(rule, detail);
+}
+
+/**
+ * Everything the channel client hands out comes here first: the policy for a voucher's increment
+ * and for any deposit, and the checks for any transaction. Throwing refuses it, and the client
+ * records nothing.
+ */
+async function authorizeChannel(agentId: string, a: Authorization): Promise<void> {
+  const call = batchCall.getStore();
+  if (!call) throw new Error("a channel step outside a signerd request");
+  const c = channels!;
+  const ch = a.channel;
+  const entry = c.store.get(ch.channelId);
+  if (entry && entry.agentId !== agentId) throw refuse(call, agentId, "channel_owner", `channel ${short(ch.channelId)} is another agent's`);
+  const unknown = () => refuse(call, agentId, "channel_unknown", `signerd has no record of channel ${short(ch.channelId)}; the operator can run: walletctl recover ${agentId}`);
+
+  switch (a.kind) {
+    case "voucher":
+      if (!entry) throw unknown();
+      return commitVoucher(agentId, call, ch, a.amount, a.requirements, entry);
+
+    case "open": {
+      const req = a.requirements;
+      const extra = parseExtra(req);
+      const k = ch.channelConfig;
+      // A new channel's terms: this wallet, the seller the 402 names, and an IOU key signerd derives itself.
+      const iouKey = derivedIouSigner(c.iouRoot, req.network, ch.channelId).publicKey;
+      if (
+        k.payer !== c.consumer ||
+        k.payerAuthorizer !== iouKey ||
+        k.receiver !== req.payTo ||
+        k.receiverAuthorizer !== extra.receiverAuthorizer ||
+        k.token !== req.asset ||
+        k.withdrawDelay !== extra.withdrawDelay
+      )
+        throw refuse(call, agentId, "channel_terms", "the opening does not name this wallet, its own IOU key, and the 402's seller and terms");
+      checkChannelTx(agentId, "open", a.transaction, { channel: ch, amount: a.deposit }, await c.chain.coinsPerUtxoByte());
+      const token = currencyOf(req.asset).kind !== "ada";
+      await depositAllowed(call, agentId, req.asset, a.deposit, token ? a.reserve : 0n, extra.withdrawDelay);
+      const opened: ChannelEntry = {
+        agentId,
+        network: req.network,
+        scriptHash: extra.scriptHash,
+        asset: req.asset,
+        payTo: req.payTo,
+        providerKey: extra.receiverAuthorizer,
+        signedMax: "0",
+        anchor: `${txHashOf(a.transaction)}#${channelOutputIndex(decodeTx(a.transaction, "open"), extra.scriptHash)}`,
+        deposit: a.deposit.toString(),
+        reserve: token ? a.reserve.toString() : "0",
+        status: "open",
+        openedAt: Date.now(),
+      };
+      return commitVoucher(agentId, call, ch, a.amount, req, opened, { event: "channel_opened", deposit: a.deposit, transaction: a.transaction });
+    }
+
+    case "topUp": {
+      if (!entry) throw unknown();
+      checkChannelTx(agentId, "topUp", a.transaction, { channel: ch, view: a.view, amount: a.deposit }, await c.chain.coinsPerUtxoByte());
+      await depositAllowed(call, agentId, a.requirements.asset, a.deposit, 0n, parseExtra(a.requirements).withdrawDelay);
+      return commitVoucher(agentId, call, ch, a.amount, a.requirements, entry, { event: "channel_topped_up", deposit: a.deposit, transaction: a.transaction });
+    }
+
+    case "refund": {
+      if (!call.operator) throw new Error("a refund is the operator's to ask for");
+      if (!entry) throw unknown();
+      // The refund's voucher is the seller's count, which a forged receipt could have pushed past
+      // what was ever signed; a refund buys nothing, so it signs nothing new.
+      const signed = BigInt(entry.signedMax);
+      if (a.amount > signed) throw refuse(call, agentId, "refund_above_signed", `the refund would sign for ${a.amount}, above the ${signed} signed so far`);
+      const redeemed = subbedOf(a.view.datum.stage);
+      checkChannelTx(agentId, "refund", a.transaction, { channel: ch, view: a.view }, 0n, { payTo: a.requirements.payTo, maxPayout: signed > redeemed ? signed - redeemed : 0n });
+      audit("refund_signed", { agentId, channelId: ch.channelId, payout: a.payout.toString(), transaction: txHashOf(a.transaction) });
+      return;
+    }
+
+    default: {
+      if (!call.operator) throw new Error(`a ${a.kind} is the operator's to ask for`);
+      checkChannelTx(agentId, a.kind, a.transaction, { channel: ch, view: a.view }, 0n);
+      audit(`${a.kind}_signed`, { agentId, channelId: ch.channelId, transaction: txHashOf(a.transaction) });
+      return;
+    }
+  }
+}
+
+function checkChannelTx(agentId: string, step: ChannelStep, hex: string, on: { channel: ClientChannel; view?: ChannelView; amount?: bigint }, coinsPerUtxoByte: bigint, refund?: { payTo: string; maxPayout: bigint }) {
+  const c = channels!;
+  let wrong: string | undefined;
+  try {
+    wrong =
+      stepProblem(step, hex, { network: on.channel.network ?? "cardano:preprod", scriptHash: SUBBIT_HASH, consumer: c.consumer, coinsPerUtxoByte }, on) ??
+      summaryProblem(step, summarize(decodeTx(hex, step), SUBBIT_HASH), { wallet: address, ...(refund ?? {}) });
+  } catch (e) {
+    wrong = `it could not be read: ${e instanceof Error ? e.message : e}`;
+  }
+  if (wrong) {
+    audit("transaction_mismatch", { agentId, step, channelId: on.channel.channelId, detail: wrong });
+    throw new AuditedError(`refusing to hand over a channel ${step} that does not match what was authorised: ${wrong}`);
+  }
+}
+
+async function depositAllowed(call: BatchCall, agentId: string, asset: string, amount: bigint, reserveLovelace: bigint, withdrawDelay: number) {
+  const d = decideDeposit(policy, { agentId, asset, amount, reserveLovelace, locked: await lockedBy(agentId), withdrawDelay });
+  if (d.verdict !== "allow") throw refuse(call, agentId, d.rule, d.detail, { asset, deposit: amount.toString() });
+}
+
+/** Lovelace the channels held when last read, per agent, for the hot-balance check. */
+const lockedLovelace = new Map<string, { lovelace: bigint; at: number }>();
+
+/**
+ * What an agent's open channels hold now, read from the chain from signerd's own anchors — never
+ * from a position a seller's answer named. An opening not on chain yet counts what it will lock;
+ * a channel the chain shows closed out is marked closed and counts nothing.
+ */
+async function lockedBy(agentId: string): Promise<Record<string, bigint>> {
+  const c = channels!;
+  const out: Record<string, bigint> = {};
+  const add = (asset: string, n: bigint) => {
+    out[asset] = (out[asset] ?? 0n) + n;
+  };
+  for (const [id, e] of c.store.entries()) {
+    if (e.agentId !== agentId || e.status !== "open") continue;
+    const view = await c.chain.followChannel(e.anchor, e.scriptHash, id);
+    if (view) {
+      add(e.asset, view.amount);
+      if (view.datum.constants.currency.kind !== "ada") add("lovelace", view.lovelace);
+      if (view.ref !== e.anchor) c.store.set(id, { ...e, anchor: view.ref });
+    } else if ((await c.chain.spentBy(e.anchor)) === undefined) {
+      // Not on chain yet, or never to be: the client gives an opening up only once one of its
+      // inputs has gone to another transaction.
+      if ((await batchClient(agentId).storage.get(id))?.status === "failed") c.store.set(id, { ...e, status: "closed" });
+      else {
+        add(e.asset, BigInt(e.deposit));
+        if (BigInt(e.reserve) > 0n) add("lovelace", BigInt(e.reserve));
+      }
+    } else {
+      c.store.set(id, { ...e, status: "closed" });
+    }
+  }
+  lockedLovelace.set(agentId, { lovelace: out.lovelace ?? 0n, at: Date.now() });
+  return out;
+}
+
+/**
+ * A voucher spends what it adds to the most already signed on its channel; at or below that it
+ * spends nothing (a retry, or the re-sign after a corrective 402). The increment goes through
+ * `decide` like an `exact` payment, and is recorded — the channel index first — before the voucher
+ * can leave: a crash in between counts a spend that did not happen, never the reverse.
+ */
+function commitVoucher(
+  agentId: string,
+  call: BatchCall,
+  ch: ClientChannel,
+  cumulative: bigint,
+  req: PaymentRequirements,
+  entry: ChannelEntry,
+  step?: { event: string; deposit: bigint; transaction: string },
+) {
+  if (call.operator) throw new Error("the operator does not pay");
+  const signed = BigInt(entry.signedMax);
+  const increment = cumulative > signed ? cumulative - signed : 0n;
+  const providerKey = parseExtra(req).receiverAuthorizer;
+  if (increment === 0n) {
+    audit("voucher_resigned", { agentId, channelId: ch.channelId, cumulative: cumulative.toString() });
+    return;
+  }
+  const d = decide(policy, call.approved ? ledgerExcluding(call.approved.id) : effectiveLedger(), {
+    agentId,
+    payTo: req.payTo,
+    asset: req.asset,
+    amount: increment,
+    reason: call.reason,
+    resource: call.resource,
+    scheme: BATCH,
+    providerKey,
+  });
+  if (d.verdict === "deny") throw refuse(call, agentId, d.rule, d.detail, { payTo: req.payTo, asset: req.asset, amount: increment.toString() });
+  if (d.verdict === "needs_approval") {
+    const a = call.approved;
+    if (!a || a.increment !== increment || a.payTo !== req.payTo || a.asset !== req.asset) throw new NeedsApproval(increment, req.payTo, req.asset, d.detail);
+  }
+  channels!.store.set(ch.channelId, { ...entry, signedMax: cumulative.toString(), payTo: entry.payTo || req.payTo });
+  ledger.push({ ts: Date.now(), agentId, asset: req.asset, amount: increment, voucher: true });
+  pruneLedger();
+  if (step)
+    audit(step.event, { agentId, channelId: ch.channelId, payTo: req.payTo, providerKey, asset: req.asset, deposit: step.deposit.toString(), transaction: txHashOf(step.transaction) });
+  audit("voucher_signed", {
+    agentId,
+    reason: call.reason,
+    resource: call.resource,
+    payTo: req.payTo,
+    providerKey,
+    asset: req.asset,
+    amount: increment.toString(),
+    cumulative: cumulative.toString(),
+    channelId: ch.channelId,
+    network: req.network,
+  });
+  writeCheckpoint();
+}
+
+/**
+ * After the client adopted a count from a corrective 402 — which it does only when the seller
+ * shows a voucher this wallet's key signed for at least that much — the index learns it too, so a
+ * channel recovered from the chain can be refunded up to what it provably signed.
+ */
+async function liftSignedMax(agentId: string, pr: PaymentRequired | undefined) {
+  const id = (pr?.accepts.find(x => x.scheme === BATCH)?.extra?.channelState as { channelId?: unknown } | undefined)?.channelId;
+  if (typeof id !== "string") return;
+  const e = channels!.store.get(id);
+  const rec = await batchClient(agentId).storage.get(id);
+  if (!e || e.agentId !== agentId || !rec) return;
+  if (BigInt(rec.chargedCumulativeAmount) > BigInt(e.signedMax)) channels!.store.set(id, { ...e, signedMax: rec.chargedCumulativeAmount });
+}
+
+async function channelList(only?: string) {
+  const out: Array<Record<string, unknown>> = [];
+  for (const [id, e] of channels!.store.entries()) {
+    if (only !== undefined && e.agentId !== only) continue;
+    const rec = await batchClient(e.agentId).storage.get(id);
+    out.push({
+      channelId: id,
+      agentId: e.agentId,
+      payTo: e.payTo,
+      providerKey: e.providerKey,
+      asset: e.asset,
+      signed: e.signedMax,
+      status: e.status,
+      ...(rec
+        ? { client: { status: rec.status, charged: rec.chargedCumulativeAmount, capacity: rec.balance, deposited: rec.deposit, ...(rec.elapseAt ? { elapseAt: rec.elapseAt } : {}) } }
+        : {}),
+    });
+  }
+  return out;
+}
+
+/** What an agent's token may call: paying, and reading its own budget. Everything else is the operator's. */
+const AGENT_PATHS = new Set(["/sign", "/status", "/batch/payload", "/batch/response"]);
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+/** The channel client's own refusals when the wallet cannot fund a step. */
+const isShortOfFunds = (e: unknown) => isCoinSelectionFailure(e) || (e instanceof Error && /the wallet holds \d+ of the currency|no UTxO to open/.test(e.message));
 
 let shuttingDown = false;
 
@@ -683,10 +1180,13 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const visible = operatorOnly ? Object.keys(current.agents) : [caller.agentId];
     const agents: Record<string, unknown> = {};
     for (const id of visible) agents[id] = remaining(current, effectiveLedger(), id);
-    return json(res, 200, { address, network: NETWORK, agents, pending: operatorOnly ? pending.size : undefined });
+    const batch = channels
+      ? { available: true, channels: await channelList(operatorOnly ? undefined : caller.agentId) }
+      : { available: false, detail: BATCH_UNAVAILABLE };
+    return json(res, 200, { address, network: NETWORK, agents, batch, pending: operatorOnly ? pending.size : undefined });
   }
 
-  if (!operatorOnly && url.pathname !== "/sign" && url.pathname !== "/status")
+  if (!operatorOnly && !AGENT_PATHS.has(url.pathname))
     return json(res, 403, { error: "operator_only", detail: `an agent token cannot call ${url.pathname}` });
 
   if (req.method === "GET" && url.pathname === "/preflight") return json(res, 200, preflight());
@@ -771,35 +1271,17 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       }
 
       if (d.verdict === "needs_approval") {
-        const id = randomUUID().slice(0, 8);
         // Hold the budget, release the lock: a human may take minutes.
-        reserved.set(id, { ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
-        audit("pending", { id, agentId, reason, resource, payTo: input.payTo, asset: input.asset, amount: input.amount, detail: d.detail });
-        const settled = new Promise<Settled>(resolve => {
-          const entry: Pending = {
-            id,
-            createdAt: Date.now(),
-            agentId,
-            reason,
-            resource: typeof resource === "string" ? resource : undefined,
-            input,
-            timer: setTimeout(() => closePending(entry, "approval_timeout", "approval timed out", { asset: input.asset, amount: input.amount }), approvalWindow(input) * 1000),
-            resolve,
-          };
-          pending.set(id, entry);
-          // The answer has one recipient: the request that is still open. Node's fetch stops waiting
-          // for headers after 300s, and an approval signed after the caller has gone records a spend
-          // for a transaction nobody will ever broadcast — so a caller that leaves takes its request
-          // with it, and its budget comes back.
-          const withdraw = () => {
-            if (!res.writableFinished) closePending(entry, "pending_abandoned", "the caller stopped waiting", { detail: "connection closed while queued" });
-          };
-          res.on("close", withdraw);
-          // The wait for the agent lock above is as long as a payment ahead of this one takes to
-          // sign, and a caller can leave during it. A listener attached after `close` has fired is
-          // a listener that never runs, which left the request in the queue with its budget held,
-          // for a human to approve into the void — the one thing the listener is here to prevent.
-          if (res.destroyed || res.socket?.destroyed) withdraw();
+        const { id, settled } = enqueue(res, {
+          agentId,
+          reason,
+          resource: typeof resource === "string" ? resource : undefined,
+          payTo: input.payTo,
+          asset: input.asset,
+          amount: input.amount,
+          detail: d.detail,
+          work: { scheme: "exact", input },
+          windowSeconds: approvalWindow(input),
         });
         return { kind: "queued", id, settled };
       }
@@ -832,15 +1314,141 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       // Usually the queue entry left with its caller and `pending_abandoned` already says so. The
       // exception is a signature that finished while this connection was closing: the spend is
       // recorded, and the signed transaction has exactly one recipient, which is gone.
-      if (!("denied" in verdict)) return undelivered(agentId, reason, verdict.nonce, outcome.id);
+      if (!("denied" in verdict)) return undelivered(agentId, reason, "nonce" in verdict ? verdict.nonce : "", outcome.id);
       return;
     }
     if ("denied" in verdict) return json(res, 403, { error: "approval_denied", detail: verdict.denied, id: outcome.id });
     return json(res, 200, verdict);
   }
 
+  if (req.method === "POST" && url.pathname === "/batch/payload") {
+    if (!channels) return json(res, 503, { error: "batch_unavailable", detail: BATCH_UNAVAILABLE });
+    const who = payingAgent(caller, body);
+    if ("status" in who) return json(res, who.status, who.body);
+    const { agentId } = who;
+    const { reason, resource, x402Version, requirements } = body as { reason?: unknown; resource?: unknown; x402Version?: unknown; requirements?: unknown };
+    // What reaches the client and the audit log is checked here, as for /sign: a malformed 402 is
+    // the caller's 400, not the daemon's 500.
+    if (typeof reason !== "string") return json(res, 400, { error: "reason must be a string" });
+    if (resource !== undefined && typeof resource !== "string") return json(res, 400, { error: "resource must be a string" });
+    if (!Number.isInteger(x402Version)) return json(res, 400, { error: "x402Version must be an integer" });
+    if (!isObject(requirements) || requirements.scheme !== BATCH) return json(res, 400, { error: `requirements for ${BATCH} required` });
+    const r = requirements as unknown as PaymentRequirements;
+    if (typeof r.network !== "string" || !sameNetwork(r.network, NETWORK))
+      return json(res, 400, { error: "network_mismatch", detail: `this wallet signs for ${NETWORK}, not "${String(r.network)}"` });
+    if (typeof r.amount !== "string" || !/^[1-9][0-9]*$/.test(r.amount)) return json(res, 400, { error: "requirements.amount must be a positive decimal integer string" });
+    if (typeof r.payTo !== "string" || typeof r.asset !== "string") return json(res, 400, { error: "requirements.payTo and requirements.asset must be strings" });
+    if (typeof r.maxTimeoutSeconds !== "number" || !Number.isFinite(r.maxTimeoutSeconds)) return json(res, 400, { error: "requirements.maxTimeoutSeconds must be a number" });
+    try {
+      parseExtra(r);
+    } catch (e) {
+      return json(res, 400, { error: "bad_requirements", detail: e instanceof Error ? e.message : String(e) });
+    }
+    const tooLong =
+      (reason.length > MAX_REASON && `reason (${reason.length} > ${MAX_REASON})`) ||
+      (typeof resource === "string" && resource.length > MAX_RESOURCE && `resource (${resource.length} > ${MAX_RESOURCE})`) ||
+      (r.payTo.length > MAX_PAY_TO && `requirements.payTo (${r.payTo.length} > ${MAX_PAY_TO})`) ||
+      (r.asset.length > MAX_ASSET && `requirements.asset (${r.asset.length} > ${MAX_ASSET})`);
+    if (tooLong) {
+      badRequests++;
+      return json(res, 400, { error: "too_long", detail: `${tooLong} — it goes verbatim into an append-only log` });
+    }
+
+    const outcome = await withAgentLock(agentId, async (): Promise<Outcome<PaymentPayloadResult>> => {
+      try {
+        refreshPolicy();
+      } catch (e) {
+        const detail = String(e instanceof Error ? e.message : e);
+        audit("policy_error", { agentId, reason, detail });
+        return { kind: "deny", rule: "policy_unreadable", detail };
+      }
+      const call: BatchCall = { reason, ...(typeof resource === "string" ? { resource } : {}) };
+      try {
+        return { kind: "signed", out: await batchPayload(agentId, call, x402Version as number, r) };
+      } catch (e) {
+        if (e instanceof BatchDenied) return { kind: "deny", rule: e.rule, detail: e.detail };
+        if (e instanceof NeedsApproval) {
+          // Nothing was handed out or recorded: the voucher is made again once a human approves it.
+          const { id, settled } = enqueue(res, {
+            agentId,
+            reason,
+            ...(call.resource ? { resource: call.resource } : {}),
+            payTo: e.payTo,
+            asset: e.asset,
+            amount: e.increment.toString(),
+            detail: e.detail,
+            work: { scheme: BATCH, x402Version: x402Version as number, requirements: r, increment: e.increment },
+            windowSeconds: approvalWindow(r),
+          });
+          return { kind: "queued", id, settled };
+        }
+        if (isShortOfFunds(e)) {
+          audit("insufficient_funds", { agentId, reason, payTo: r.payTo, asset: r.asset, amount: r.amount, scheme: BATCH });
+          return { kind: "error", error: new InsufficientFunds(`the wallet cannot fund a channel for ${r.amount} of ${r.asset}: ${e instanceof Error ? e.message : e}`) };
+        }
+        if (!(e instanceof AuditedError)) audit("batch_error", { agentId, reason, error: String(e) });
+        return { kind: "error", error: e };
+      }
+    });
+
+    if (outcome.kind === "deny") return json(res, 403, { error: "policy_denied", rule: outcome.rule, detail: outcome.detail });
+    if (outcome.kind === "error") {
+      const e = outcome.error;
+      const detail = String(e instanceof Error ? e.message : e);
+      if (e instanceof InsufficientFunds) return json(res, 409, { error: "insufficient_funds", detail, retryable: false, asset: r.asset });
+      return json(res, 500, { error: "batch_failed", detail });
+    }
+    if (outcome.kind === "signed") {
+      // Recorded, and handed to nobody: the same record as an undelivered transaction.
+      if (gone(res)) return void audit("signed_undelivered", { agentId, reason, scheme: BATCH });
+      return json(res, 200, outcome.out);
+    }
+    const verdict = await outcome.settled; // waited for outside the lock
+    if (gone(res)) {
+      if (!("denied" in verdict)) audit("signed_undelivered", { id: outcome.id, agentId, reason, scheme: BATCH });
+      return;
+    }
+    if ("denied" in verdict) return json(res, 403, { error: "approval_denied", detail: verdict.denied, id: outcome.id });
+    return json(res, 200, "payload" in verdict ? verdict.payload : verdict);
+  }
+
+  if (req.method === "POST" && url.pathname === "/batch/response") {
+    if (!channels) return json(res, 503, { error: "batch_unavailable", detail: BATCH_UNAVAILABLE });
+    const who = payingAgent(caller, body);
+    if ("status" in who) return json(res, who.status, who.body);
+    const { agentId } = who;
+    const { paymentPayload, requirements, settleResponse, paymentRequired } = body;
+    if (!isObject(paymentPayload) || !isObject(requirements)) return json(res, 400, { error: "paymentPayload and requirements required" });
+    if ((settleResponse !== undefined && !isObject(settleResponse)) || (paymentRequired !== undefined && !isObject(paymentRequired)))
+      return json(res, 400, { error: "settleResponse and paymentRequired must be objects when given" });
+    // It moves the client's count, which sets the next voucher's amount — but never signerd's
+    // record of what was signed, which is what the policy counts from.
+    const out = await withAgentLock(agentId, async () => {
+      try {
+        const r = await batchClient(agentId).client.schemeHooks.onPaymentResponse!({
+          paymentPayload: paymentPayload as unknown as PaymentPayload,
+          requirements: requirements as unknown as PaymentRequirements,
+          ...(settleResponse ? { settleResponse: settleResponse as unknown as SettleResponse } : {}),
+          ...(paymentRequired ? { paymentRequired: paymentRequired as unknown as PaymentRequired } : {}),
+        });
+        if (r?.recovered) await liftSignedMax(agentId, paymentRequired as unknown as PaymentRequired);
+        return { recovered: Boolean(r?.recovered) };
+      } catch (e) {
+        const detail = String(e instanceof Error ? e.message : e);
+        audit("response_refused", { agentId, detail });
+        return { refused: detail };
+      }
+    });
+    return "refused" in out ? json(res, 422, { error: "response_refused", detail: out.refused }) : json(res, 200, out);
+  }
+
+  if (url.pathname === "/channels" || url.pathname.startsWith("/channels/")) {
+    if (!channels) return json(res, 503, { error: "batch_unavailable", detail: BATCH_UNAVAILABLE });
+    return channelRequest(req.method ?? "GET", url.pathname, body, res);
+  }
+
   if (req.method === "GET" && url.pathname === "/pending") {
-    return json(res, 200, [...pending.values()].map(p => ({ id: p.id, createdAt: p.createdAt, agentId: p.agentId, reason: p.reason, payTo: p.input.payTo, asset: p.input.asset, amount: p.input.amount })));
+    return json(res, 200, [...pending.values()].map(p => ({ id: p.id, createdAt: p.createdAt, agentId: p.agentId, reason: p.reason, payTo: p.payTo, asset: p.asset, amount: p.amount, ...(p.work.scheme === BATCH ? { scheme: BATCH } : {}) })));
   }
   if (req.method === "POST" && (url.pathname === "/approve" || url.pathname === "/deny")) {
     const p = typeof body.id === "string" ? pending.get(body.id) : undefined;
@@ -851,9 +1459,13 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     }
     // Under the agent's lock, like any other decision: the re-check and the signature it admits
     // must see one ledger, or a payment for the same agent could land between them.
-    const outcome = await withAgentLock(p.agentId, async () => {
+    const outcome = await withAgentLock(p.agentId, async (): Promise<
+      { kind: "gone" } | { kind: "stale"; verdict: Decision } | { kind: "signed"; out: { transaction: string; nonce: string } | { payload: PaymentPayloadResult } } | { kind: "error"; error: unknown }
+    > => {
       // A caller that left while this was on its way to the lock has already been closed out.
       if (!pending.has(p.id)) return { kind: "gone" as const };
+      if (p.work.scheme === BATCH) return approveVoucher(p, p.work);
+      const input = p.work.input;
       // The policy that governs is the one in force now, not the one in force when the request was
       // queued. Without this, tightening a limit while something waits in the queue leaves a way to
       // sign past it: approval is a gate inside the policy, not a way around it. An operator who
@@ -862,11 +1474,11 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       try {
         verdict = decide(refreshPolicy(), ledgerExcluding(p.id), {
           agentId: p.agentId,
-          payTo: p.input.payTo,
-          asset: p.input.asset,
-          amount: BigInt(p.input.amount),
+          payTo: input.payTo,
+          asset: input.asset,
+          amount: BigInt(input.amount),
           reason: p.reason,
-          assetTransferMethod: typeof p.input.extra?.assetTransferMethod === "string" ? p.input.extra.assetTransferMethod : undefined,
+          assetTransferMethod: typeof input.extra?.assetTransferMethod === "string" ? input.extra.assetTransferMethod : undefined,
           resource: p.resource,
         });
       } catch (e) {
@@ -881,7 +1493,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       pending.delete(p.id);
       clearTimeout(p.timer);
       try {
-        const out = await sign(p.agentId, p.reason, p.input);
+        const out = await sign(p.agentId, p.reason, input);
         reserved.delete(p.id);
         audit("approved", { id: p.id, agentId: p.agentId });
         p.resolve(out);
@@ -901,9 +1513,152 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         detail: `${outcome.verdict.detail}. The policy changed while this was queued; raise the limit if you mean to allow it.`,
       });
     if (outcome.kind === "error") return json(res, 500, { error: String(outcome.error) });
-    return json(res, 200, { ok: true, nonce: outcome.out.nonce });
+    return json(res, 200, { ok: true, ...("nonce" in outcome.out ? { nonce: outcome.out.nonce } : { scheme: BATCH }) });
   }
   json(res, 404, { error: "not found" });
+}
+
+/**
+ * An approved voucher, made again: the client runs for the same 402 with the approval in hand, and
+ * `commitVoucher` takes it only for the increment, payee and asset the human was shown, judged
+ * against the policy in force now. Anything else — a different amount, a tightened limit — is
+ * stale, as a changed policy is for an `exact` payment.
+ */
+async function approveVoucher(p: Pending, work: Extract<PendingWork, { scheme: typeof BATCH }>) {
+  // Off the queue first, so a second approve finds nothing; the reservation stays until the
+  // voucher's own spend is recorded, and is left out of the decision on it meanwhile.
+  pending.delete(p.id);
+  clearTimeout(p.timer);
+  try {
+    // An unreadable policy is not a permissive one: the same verdict an `exact` approval gets.
+    try {
+      refreshPolicy();
+    } catch (e) {
+      throw new BatchDenied("policy_unreadable", String(e instanceof Error ? e.message : e));
+    }
+    const approved = { id: p.id, increment: work.increment, payTo: p.payTo, asset: p.asset };
+    const payload = await batchPayload(p.agentId, { reason: p.reason, ...(p.resource ? { resource: p.resource } : {}), approved }, work.x402Version, work.requirements);
+    reserved.delete(p.id);
+    audit("approved", { id: p.id, agentId: p.agentId, scheme: BATCH });
+    p.resolve({ payload });
+    return { kind: "signed" as const, out: { payload } };
+  } catch (e) {
+    reserved.delete(p.id);
+    if (e instanceof BatchDenied || e instanceof NeedsApproval) {
+      const rule = e instanceof BatchDenied ? e.rule : "approval_changed";
+      const detail = e instanceof BatchDenied ? e.detail : `the voucher would now be for ${e.increment}, not the ${work.increment} approved`;
+      audit("approval_stale", { id: p.id, agentId: p.agentId, reason: p.reason, rule, detail });
+      p.resolve({ denied: `the policy no longer allows this: ${rule}` });
+      return { kind: "stale" as const, verdict: { verdict: "deny" as const, rule, detail } };
+    }
+    audit("approval_sign_error", { id: p.id, agentId: p.agentId, error: String(e) });
+    p.resolve({ denied: `sign failed: ${String(e)}` });
+    return { kind: "error" as const, error: e };
+  }
+}
+
+/** The operator's channel endpoints: listing, and the steps that return a channel's money. */
+async function channelRequest(method: string, path: string, body: Record<string, unknown>, res: ServerResponse) {
+  const c = channels!;
+  if (method === "GET" && path === "/channels") return json(res, 200, { channels: await channelList() });
+  if (method !== "POST") return json(res, 404, { error: "not found" });
+
+  if (path === "/channels/recover") {
+    const agentId = body.agentId;
+    if (typeof agentId !== "string" || !(agentId in policy.agents)) return json(res, 400, { error: "agentId of an agent in the policy required" });
+    // Reads the chain and writes records, signs nothing: the agent's lock, not the wallet's.
+    const out = await withAgentLock(agentId, async () => {
+      const { client, storage } = batchClient(agentId);
+      const found = await client.recover("cardano:preprod", SUBBIT_HASH);
+      let indexed = 0;
+      for (const r of await storage.list()) {
+        const owner = c.store.get(r.channelId)?.agentId;
+        if (owner === agentId) continue;
+        // Every agent's channels share this wallet's key, so the chain shows them all to each; a
+        // channel the index gives to another agent is closed in this agent's records for good.
+        if (owner !== undefined) {
+          await storage.set({ ...r, status: "closed" });
+          continue;
+        }
+        if (!r.channelRef || (r.status !== "open" && r.status !== "closing")) continue;
+        const view = await c.chain.followChannel(r.channelRef, r.scriptHash ?? SUBBIT_HASH, r.channelId);
+        if (!view) continue;
+        c.store.set(r.channelId, {
+          agentId,
+          network: r.network ?? "cardano:preprod",
+          scriptHash: r.scriptHash ?? SUBBIT_HASH,
+          asset: r.channelConfig.token,
+          payTo: r.channelConfig.receiver,
+          providerKey: r.channelConfig.receiverAuthorizer,
+          // The chain's lower bound; a corrective 402 lifts it to what the seller shows was signed.
+          signedMax: subbedOf(view.datum.stage).toString(),
+          anchor: view.ref,
+          deposit: "0",
+          reserve: "0",
+          status: "open",
+          openedAt: r.openedAt || Date.now(),
+        });
+        indexed++;
+      }
+      audit("channels_recovered", { agentId, found: found.length, indexed });
+      return { found: found.map(f => ({ channelId: f.channelId, status: f.status, exitOnly: Boolean(f.exitOnly) })), indexed };
+    });
+    return json(res, 200, out);
+  }
+
+  const channelId = body.channelId;
+  const entry = typeof channelId === "string" ? c.store.get(channelId) : undefined;
+  if (!entry || typeof channelId !== "string") return json(res, 404, { error: "no such channel" });
+  const { client } = batchClient(entry.agentId);
+  // The steps that move a channel's money run under the wallet lock like any signature, and an exit
+  // waits for its block inside it: payments pause for as long as that takes.
+  const run = <T>(what: string, f: () => Promise<T>) =>
+    withAgentLock(entry.agentId, () => withWalletLock(() => batchCall.run({ reason: `operator: ${what}`, operator: true }, f)));
+  try {
+    switch (path) {
+      case "/channels/refund": {
+        const pr = body.paymentRequired;
+        if (!isObject(pr) || !Array.isArray(pr.accepts)) return json(res, 400, { error: "paymentRequired (the seller's 402) required" });
+        const paymentPayload = await run("refund", () => client.refundPayload(pr as unknown as PaymentRequired, channelId));
+        return json(res, 200, { paymentPayload });
+      }
+      case "/channels/refund/result": {
+        const { paymentPayload, settleResponse } = body;
+        if (!isObject(paymentPayload) || !isObject(settleResponse) || !isObject(paymentPayload.accepted)) return json(res, 400, { error: "paymentPayload and settleResponse required" });
+        await withAgentLock(entry.agentId, () =>
+          client.schemeHooks.onPaymentResponse!({
+            paymentPayload: paymentPayload as unknown as PaymentPayload,
+            requirements: paymentPayload.accepted as unknown as PaymentRequirements,
+            settleResponse: settleResponse as unknown as SettleResponse,
+          }),
+        );
+        const s = settleResponse as unknown as SettleResponse;
+        audit(s.success ? "refund_settled" : "refund_failed", { agentId: entry.agentId, channelId, transaction: s.transaction, reason: s.errorReason });
+        return json(res, 200, { settled: s.success, transaction: s.transaction });
+      }
+      case "/channels/close": {
+        const out = await run("close", () => client.close(channelId));
+        return json(res, 200, { transaction: out.transaction, elapseAt: out.elapseAt.toString() });
+      }
+      case "/channels/end":
+        return json(res, 200, { transaction: await run("end", () => client.end(channelId)) });
+      case "/channels/elapse": {
+        // The client waits for the chain to reach elapse_at, inside the wallet lock; that is a
+        // wait worth refusing rather than making every payment share. Read from the chain, not the
+        // record: a close whose confirmation was missed leaves the record saying open.
+        const stage = (await client.openView(channelId)).view.datum.stage;
+        if (stage.kind === "closed" && stage.elapseAt > BigInt(Date.now()))
+          return json(res, 409, { error: "not_yet", detail: `elapse_at is ${new Date(Number(stage.elapseAt)).toISOString()}` });
+        return json(res, 200, { transaction: await run("elapse", () => client.elapse(channelId)) });
+      }
+    }
+  } catch (e) {
+    const detail = String(e instanceof Error ? e.message : e);
+    if (e instanceof BatchDenied) return json(res, 403, { error: "policy_denied", rule: e.rule, detail: e.detail });
+    if (!(e instanceof AuditedError)) audit("channel_error", { agentId: entry.agentId, channelId, step: path, error: detail });
+    return json(res, e instanceof AuditedError ? 409 : 500, { error: "channel_step_failed", detail });
+  }
+  return json(res, 404, { error: "not found" });
 }
 
 type Sample = [labels: string, value: string | number];
@@ -928,6 +1683,8 @@ function metrics(): string {
   one("ada_wallet_audit_seq", "Sequence number of the last audit record.", "gauge", auditSeq);
   one("ada_wallet_pending_approvals", "Payments waiting on a human right now.", "gauge", pending.size);
   one("ada_wallet_inflight_utxos", "UTXOs committed to a handed-out payment that has not settled.", "gauge", inflightNonces.size);
+  if (channels)
+    one("ada_wallet_channels_open", "batch-settlement channels signerd counts as open.", "gauge", channels.store.entries().filter(([, e]) => e.status === "open").length);
   if (hotBalance !== undefined) {
     one("ada_wallet_balance_lovelace", "Lovelace held by the wallet, as of the last refresh.", "gauge", hotBalance.toString());
     one("ada_wallet_balance_age_seconds", "Seconds since the balance was last refreshed.", "gauge", Math.round((Date.now() - hotBalanceAt) / 1000));
@@ -1003,15 +1760,23 @@ function preflight() {
   else if (KEYSTORE_FILE)
     add("ok", "keystore passphrase", PASSPHRASE_FILE ? resolvePath(PASSPHRASE_FILE) : "prompted on the terminal at startup");
 
+  // Channels hold this wallet's money too, and a stolen key takes it back as surely, only later.
+  const locked = [...lockedLovelace.values()].reduce((s, v) => s + v.lovelace, 0n);
+  const lockedNote = channels
+    ? lockedLovelace.size
+      ? `, and ${locked} locked in channels when last read (${Math.round((Date.now() - Math.min(...[...lockedLovelace.values()].map(v => v.at))) / 1000)}s ago)`
+      : ", and whatever channels hold: not read since start (the first deposit reads them)"
+    : "";
   if (MAX_HOT_BALANCE === undefined) {
     add(IS_MAINNET ? "fail" : "warn", "hot wallet ceiling",
       "MAX_HOT_BALANCE_LOVELACE is unset. The daily cap bounds an agent; nothing here bounds what someone with the key can take, except how much is in the wallet");
   } else if (hotBalance === undefined) {
     add("warn", "hot wallet ceiling", `ceiling ${MAX_HOT_BALANCE} lovelace, but the balance could not be read${hotBalanceError ? ` (${hotBalanceError})` : ""}`);
   } else {
-    add(hotBalance > MAX_HOT_BALANCE ? (IS_MAINNET ? "fail" : "warn") : "ok", "hot wallet ceiling",
-      `holding ${hotBalance} of a ${MAX_HOT_BALANCE} lovelace ceiling`);
+    add(hotBalance + locked > MAX_HOT_BALANCE ? (IS_MAINNET ? "fail" : "warn") : "ok", "hot wallet ceiling",
+      `holding ${hotBalance}${lockedNote}, of a ${MAX_HOT_BALANCE} lovelace ceiling`);
   }
+  add("ok", "batch-settlement", channels ? `available: channel records in ${resolvePath(CHANNELS_DIR)}` : `unavailable: ${BATCH_UNAVAILABLE}`);
 
   const agentCount = Object.keys(current?.agents ?? {}).length;
   add(
@@ -1074,6 +1839,21 @@ function preflight() {
       methods.includes("masumi")
         ? `masumi enabled; its collateral sits outside these caps, bounded only by MASUMI_MAX_COLLATERAL_LOVELACE (${process.env.MASUMI_MAX_COLLATERAL_LOVELACE ?? "unset, so the SDK default"})`
         : methods.join(", "));
+    if ((ap.allowedSchemes ?? ["exact"]).includes(BATCH)) {
+      const keys = ap.allowedProviderKeys ?? [];
+      add(keys.includes("*") ? "warn" : keys.length ? "ok" : "warn", `${where}: channel provider keys`,
+        keys.includes("*")
+          ? '["*"]: a channel may name any key as provider, so allowedPayees binds nothing for batch-settlement'
+          : keys.length
+            ? `${keys.length} key(s)`
+            : "none listed, so every batch-settlement payment is denied");
+      const deposits = Object.entries(ap.channelDepositMax ?? {});
+      add(deposits.length && ap.channelLockedMax ? "ok" : "warn", `${where}: channel deposits`,
+        deposits.length && ap.channelLockedMax
+          ? `${deposits.map(([a, v]) => `${a} ≤ ${v} a deposit`).join(", ")}; locked at most ${Object.entries(ap.channelLockedMax).map(([a, v]) => `${a} ${v}`).join(", ")}`
+          : "channelDepositMax or channelLockedMax missing, so no channel is opened");
+      if (!channels) add("warn", `${where}: batch-settlement`, `allowed by the policy, unavailable here: ${BATCH_UNAVAILABLE}`);
+    }
   }
 
   return {
@@ -1211,7 +1991,8 @@ server.listen(PORT, "127.0.0.1", () => {
   console.error(`ledger: ${resolvePath(LEDGER_FILE)}  (${ledger.length} spends inside the 24h window)`);
   console.error(`agents: ${Object.keys(policy.agents).join(", ")}`);
   console.error(`key:    ${KEYSTORE_FILE ? "encrypted keystore" : "plaintext mnemonic"}`);
+  console.error(`batch:  ${channels ? `batch-settlement available, channels in ${resolvePath(CHANNELS_DIR)}` : `batch-settlement unavailable (${BATCH_UNAVAILABLE})`}`);
   for (const note of permissionNotes) console.error(`  ${note.level === "warn" ? "WARNING " : ""}${note.detail}`);
-  console.error(`none of the policy, audit or ledger files may be writable by the agent's user`);
+  console.error(`none of the policy, audit or ledger files, nor the channels directory, may be writable by the agent's user`);
   console.error(`run "walletctl preflight" before pointing this at real money`);
 });

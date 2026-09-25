@@ -7,6 +7,8 @@
  *   x402_mcp_tools(server)                — what a remote MCP server offers (not what it charges)
  *   x402_mcp_call(server, tool, args, reason) — a paid MCP tool, through the same policy gate
  * The agent never sees a key. It never sees the signed tx either — @x402/core handles the 402 round-trip.
+ * `x402_fetch` pays with `exact` or, where the seller offers it and the policy allows it, with
+ * `batch-settlement` vouchers on a channel; signerd holds the channel keys and signs those too.
  *
  * Env: SIGNERD_URL (default http://127.0.0.1:7402), SIGNERD_TOKEN, AGENT_ID (default "default")
  */
@@ -17,6 +19,7 @@ import { z } from "zod";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
 import { ExactCardanoScheme } from "@x402/cardano";
 import { createGatedSigner, PolicyDenied } from "./gatedSigner.js";
+import { BATCH, createBatchProxy, preferBatch } from "./batchProxy.js";
 import { decodePaymentResponseHeader } from "@x402/core/http";
 import { receiptOf, describePayment, type Receipt } from "./receipt.js";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
@@ -41,10 +44,27 @@ interface CallContext {
   denial?: PolicyDenied;
   /** signerd signed during this call, so a spend is on the ledger whatever the seller does next. */
   signed?: boolean;
+  /** signerd offers batch-settlement and this agent's policy allows it, as of this call. */
+  batchAllowed?: boolean;
 }
 const callContext = new AsyncLocalStorage<CallContext>();
 
 const signer = await createGatedSigner({
+  signerdUrl: SIGNERD_URL,
+  token: TOKEN,
+  agentId: AGENT_ID,
+  reason: () => callContext.getStore()?.reason ?? "",
+  resource: () => callContext.getStore()?.resource,
+  onDenied: d => {
+    const store = callContext.getStore();
+    if (store) store.denial = d;
+  },
+  onSigned: () => {
+    const store = callContext.getStore();
+    if (store) store.signed = true;
+  },
+});
+const batch = createBatchProxy({
   signerdUrl: SIGNERD_URL,
   token: TOKEN,
   agentId: AGENT_ID,
@@ -65,7 +85,30 @@ const client = x402Client.fromConfig({
   schemes: [{ network: "cardano:*", client: new ExactCardanoScheme(signer) }],
   spendControls: false,
 });
-const payingFetch = wrapFetchWithPayment(fetch, client);
+// batch-settlement for web resources only: over paid MCP tools it has not been tried.
+const payingFetch = wrapFetchWithPayment(
+  fetch,
+  x402Client.fromConfig({
+    schemes: [
+      { network: "cardano:*", client: new ExactCardanoScheme(signer) },
+      { network: "cardano:*", client: batch },
+    ],
+    spendControls: false,
+    policies: [preferBatch(() => callContext.getStore()?.batchAllowed === true)],
+  }),
+);
+
+/** Whether to prefer batch-settlement on this call: signerd offers it, and this agent may use it. */
+async function batchAllowed(): Promise<boolean> {
+  try {
+    const r = await fetch(`${SIGNERD_URL}/status`, { headers });
+    if (!r.ok) return false;
+    const s = (await r.json()) as { batch?: { available?: boolean }; agents?: Record<string, { allowedSchemes?: string[] }> };
+    return s.batch?.available === true && (s.agents?.[AGENT_ID]?.allowedSchemes ?? []).includes(BATCH);
+  } catch {
+    return false;
+  }
+}
 
 const server = new McpServer({ name: "ada-agent-wallet", version: "0.1.0" });
 
@@ -103,7 +146,7 @@ server.tool(
   // It spends, it cannot be undone, and the URL is whatever the agent names.
   { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   async ({ url, reason, method, body }) =>
-    callContext.run({ reason, resource: url }, async () => {
+    callContext.run({ reason, resource: url, batchAllowed: await batchAllowed() }, async () => {
       try {
         const r = await payingFetch(url, { method, body, headers: body ? { "content-type": "application/json" } : undefined });
         const text = await r.text();

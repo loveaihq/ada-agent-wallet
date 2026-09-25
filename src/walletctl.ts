@@ -1,11 +1,20 @@
 #!/usr/bin/env node
-/** Operator CLI: walletctl status | preflight | pending | approve <id> | deny <id> | audit [n] */
+/**
+ * Operator CLI: walletctl status | preflight | pending | approve <id> | deny <id> | audit [n]
+ *   batch-settlement: channels | refund <channelId> <url> | close <channelId> | end <channelId>
+ *                     | elapse <channelId> | recover <agentId>
+ */
 import { readFileSync, existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
+import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 
 const URL_ = process.env.SIGNERD_URL ?? "http://127.0.0.1:7402";
 const headers = { authorization: `Bearer ${process.env.SIGNERD_TOKEN ?? ""}`, "content-type": "application/json" };
-const [cmd, arg] = process.argv.slice(2);
+const [cmd, arg, arg2] = process.argv.slice(2);
+const USAGE = [
+  "walletctl status | preflight | pending | approve <id> | deny <id> | audit [n]",
+  "          channels | refund <channelId> <url> | close <channelId> | end <channelId> | elapse <channelId> | recover <agentId>",
+].join("\n");
 
 interface PendingEntry {
   id: string;
@@ -121,6 +130,44 @@ switch (cmd) {
     console.log(lines.slice(-n).join("\n"));
     break;
   }
+  case "channels":
+    console.log(JSON.stringify((await call("/channels")).data, null, 2));
+    break;
+  case "refund": {
+    // signerd builds and signs the refund but talks to no seller: the 402 and the answer travel
+    // through here, as a payment's travel through the agent's process.
+    if (!arg || !arg2) die("refund needs a channel id and the seller's URL — run: walletctl channels");
+    let probe: Response;
+    try {
+      probe = await fetch(arg2);
+    } catch (e) {
+      die(`cannot reach ${arg2}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const required = probe.headers.get("PAYMENT-REQUIRED");
+    if (probe.status !== 402 || !required) die(`${arg2} answered ${probe.status} without a 402 to refund against`);
+    const { data } = await call("/channels/refund", { channelId: arg, paymentRequired: decodePaymentRequiredHeader(required) });
+    const paymentPayload = (data as { paymentPayload: Parameters<typeof encodePaymentSignatureHeader>[0] }).paymentPayload;
+    const res = await fetch(arg2, { headers: { "PAYMENT-SIGNATURE": encodePaymentSignatureHeader(paymentPayload) } });
+    const header = res.headers.get("PAYMENT-RESPONSE");
+    if (!header) die(`the seller answered ${res.status} with no settlement: ${(await res.text()).slice(0, 300)}`);
+    const settleResponse = decodePaymentResponseHeader(header);
+    console.log(JSON.stringify((await call("/channels/refund/result", { channelId: arg, paymentPayload, settleResponse })).data));
+    if (!settleResponse.success) process.exitCode = 1;
+    break;
+  }
+  case "close":
+  case "end":
+  case "elapse": {
+    if (!arg) die(`${cmd} needs a channel id — run: walletctl channels`);
+    const { status, data } = await call(`/channels/${cmd}`, { channelId: arg }, true);
+    console.log(JSON.stringify(data));
+    if (status !== 200) process.exitCode = 1;
+    break;
+  }
+  case "recover":
+    if (!arg) die("recover needs the agent id whose channels to look for");
+    console.log(JSON.stringify((await call("/channels/recover", { agentId: arg })).data, null, 2));
+    break;
   default:
-    console.log("walletctl status | preflight | pending | approve <id> | deny <id> | audit [n]");
+    console.log(USAGE);
 }

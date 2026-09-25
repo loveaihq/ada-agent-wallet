@@ -15,7 +15,7 @@ export interface Checkpoint {
   seq: number;
   hash: string;
   updatedAt: number;
-  spends: Array<{ ts: number; agentId: string; asset: string; amount: string }>;
+  spends: Array<{ ts: number; agentId: string; asset: string; amount: string; voucher?: boolean }>;
 }
 
 export interface OpenApproval {
@@ -47,13 +47,20 @@ export interface Replay {
  * and `String(undefined)` is "undefined" — an amount that takes down startup with no line number,
  * and an agent id that matches no policy and so quietly costs nothing.
  */
-function readSpend(e: Record<string, unknown>): { agentId: string; asset: string; amount: bigint } | undefined {
+function readSpend(e: Record<string, unknown>): { agentId: string; asset: string; amount: bigint; voucher?: boolean } | undefined {
   const { agentId, asset, amount } = e;
   if (typeof agentId !== "string" || !agentId) return undefined;
   if (typeof asset !== "string" || !asset) return undefined;
   if (typeof amount !== "string" || !/^[0-9]+$/.test(amount)) return undefined;
-  return { agentId, asset, amount: BigInt(amount) };
+  return { agentId, asset, amount: BigInt(amount), ...(e.voucher === true ? { voucher: true } : {}) };
 }
+
+/**
+ * The records that spend: a signed transaction, and a voucher's increment — what it added to the
+ * most already signed on its channel. A voucher re-signed at or below that is `voucher_resigned`,
+ * which spends nothing and is not read here.
+ */
+const SPEND_EVENTS: Record<string, { voucher?: true }> = { signed: {}, voucher_signed: { voucher: true } };
 
 const TERMINAL_EVENTS = new Set([
   "approved",
@@ -115,13 +122,14 @@ export async function replayAudit(
       if (recent) pendingSeen.set(String(e.id), { id: String(e.id), agentId: String(e.agentId), reason: e.reason as string });
     } else if (typeof event === "string" && TERMINAL_EVENTS.has(event)) {
       if (recent) terminated.add(String(e.id));
-    } else if (event === "signed" && typeof e.ts === "number") {
+    } else if (typeof event === "string" && Object.hasOwn(SPEND_EVENTS, event) && typeof e.ts === "number") {
       if (e.ts < cutoff) out.skipped++;
       // Only what the checkpoint cannot already hold. No seq means it predates the chain, so it is
       // older than the checkpoint by construction; counting it again inflated spend on every
       // restart, without bound.
       else if (checkpoint === undefined || (seq !== undefined && seq > checkpoint.seq)) {
-        const spend = readSpend(e);
+        // The kind comes from the event, not from a field a record could carry either way.
+        const spend = readSpend({ ...e, voucher: SPEND_EVENTS[event]!.voucher === true });
         // A spend that cannot be read is reported, not skipped: skipping it would hand the agent
         // back its budget.
         if (spend === undefined) out.malformedAt ??= lineNo;

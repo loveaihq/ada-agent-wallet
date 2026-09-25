@@ -9,12 +9,18 @@
  * transaction. A facilitator that stops waiting before the block arrives reports failure for a
  * transaction that was broadcast and may well confirm: funds gone, no goods. That agent was not
  * served, but its money may have moved, and the hash is the one thing it can check that against.
+ *
+ * A batch-settlement voucher settles with no transaction at all: the seller redeems it later,
+ * with many others, in one. What it names instead is the voucher it accepted (`commitmentId`,
+ * the channel and the cumulative amount), and that is what such a receipt carries.
  */
 
 export interface Receipt {
-  /** Settled: the seller says so and names the transaction. Never true without one. */
+  /** Settled: the seller says so and names the transaction, or the voucher. Never true without one. */
   paid: boolean;
   transaction?: string;
+  /** batch-settlement: the voucher the seller accepted, `<channelId>:<cumulative amount>`. */
+  voucher?: string;
   network?: string;
   reason?: string;
 }
@@ -27,10 +33,14 @@ export function receiptOf(settlement: unknown): Receipt | undefined {
   const transaction = str(s.transaction);
   const network = str(s.network);
   const reason = str(s.errorReason);
+  const extra = typeof s.extra === "object" && s.extra !== null ? (s.extra as Record<string, unknown>) : {};
+  const voucher = str(extra.commitmentId);
   return {
-    // A success with no transaction names nothing that can be checked, so it is not treated as one.
-    paid: s.success === true && transaction !== undefined,
+    // A success that names neither a transaction nor a voucher names nothing that can be checked,
+    // so it is not treated as one.
+    paid: s.success === true && (transaction !== undefined || voucher !== undefined),
     ...(transaction ? { transaction } : {}),
+    ...(voucher ? { voucher } : {}),
     ...(network ? { network } : {}),
     ...(reason ? { reason } : {}),
   };
@@ -43,6 +53,7 @@ export function receiptOf(settlement: unknown): Receipt | undefined {
 export function describePayment(receipt: Receipt | undefined, signed: boolean): Record<string, unknown> {
   const out: Record<string, unknown> = { paid: receipt?.paid === true };
   if (receipt?.transaction) out.transaction = receipt.transaction;
+  if (receipt?.voucher) out.voucher = receipt.voucher;
   if (receipt?.network) out.network = receipt.network;
   if (signed && !out.paid) {
     out.unsettled = receipt?.transaction

@@ -177,3 +177,32 @@ test("an unreadable checkpoint spend is refused rather than silently dropped", a
   };
   await assert.rejects(() => replayAudit([], { ...WINDOW, checkpoint }), /unreadable spend/);
 });
+
+test("a voucher's increment is a spend, kept apart from transactions; a re-sign is not", async () => {
+  const channelId = "cc".repeat(32);
+  const lines = chain([
+    signed("1000000"),
+    { event: "voucher_signed", agentId: "a", asset: "lovelace", amount: "1000", cumulative: "1000", channelId },
+    { event: "voucher_resigned", agentId: "a", channelId, cumulative: "1000" },
+    // The event says which kind a spend is; a field on the record cannot say otherwise.
+    signed("5", { voucher: true }),
+    { event: "voucher_signed", agentId: "a", asset: "lovelace", amount: "2000", cumulative: "3000", channelId, voucher: false },
+  ]);
+  const r = await replayAudit(lines, WINDOW);
+  assert.deepEqual(r.spends.map(s => [s.amount, Boolean(s.voucher)]), [[1_000_000n, false], [1000n, true], [5n, false], [2000n, true]]);
+});
+
+test("the checkpoint keeps which of its spends were vouchers", async () => {
+  const checkpoint: Checkpoint = {
+    version: 1,
+    seq: 0,
+    hash: "",
+    updatedAt: NOW,
+    spends: [
+      { ts: NOW, agentId: "a", asset: "lovelace", amount: "7", voucher: true },
+      { ts: NOW, agentId: "a", asset: "lovelace", amount: "9" },
+    ],
+  };
+  const r = await replayAudit([], { ...WINDOW, checkpoint });
+  assert.deepEqual(r.spends.map(s => [s.amount, Boolean(s.voucher)]), [[7n, true], [9n, false]]);
+});

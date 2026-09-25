@@ -72,3 +72,13 @@ test("signed with no settlement response at all still warns", () => {
   // A verify failure returns no PAYMENT-RESPONSE, but signerd already recorded the spend.
   assert.match(String(describePayment(undefined, true).unsettled), /counts against this agent's budget/);
 });
+
+test("a batch-settlement voucher settles with no transaction, and names the voucher instead", () => {
+  // The seller redeems it later, with many others, in one transaction of its own.
+  const commitmentId = `${"cc".repeat(32)}:5000`;
+  const r = receiptOf({ success: true, transaction: "", network: "cardano:preprod", extra: { chargedAmount: "1000", commitmentId } });
+  assert.deepEqual(r, { paid: true, voucher: commitmentId, network: "cardano:preprod" });
+  assert.deepEqual(describePayment(r, true), { paid: true, network: "cardano:preprod", voucher: commitmentId });
+  // A failure that names a voucher is still a failure.
+  assert.equal(receiptOf({ success: false, transaction: "", extra: { commitmentId } })?.paid, false);
+});
