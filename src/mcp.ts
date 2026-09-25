@@ -110,7 +110,7 @@ async function batchAllowed(): Promise<boolean> {
   }
 }
 
-const server = new McpServer({ name: "ada-agent-wallet", version: "0.1.0" });
+const server = new McpServer({ name: "ada-agent-wallet", version: "0.2.0" });
 
 server.tool("wallet_status", "Wallet address, per-agent remaining budget (rolling 24h), pending approvals.", {}, { readOnlyHint: true, openWorldHint: false }, async () => {
   try {
@@ -215,7 +215,7 @@ const httpUrl = z
   .refine(u => /^https?:$/.test(new URL(u).protocol), { message: "must be http or https" });
 
 async function withRemote<T>(serverUrl: string, kind: "http" | "sse", use: (paid: x402MCPClient) => Promise<T>): Promise<T> {
-  const paid = wrapMCPClientWithPayment(new McpClient({ name: "ada-agent-wallet", version: "0.1.0" }), client, {
+  const paid = wrapMCPClientWithPayment(new McpClient({ name: "ada-agent-wallet", version: "0.2.0" }), client, {
     autoPayment: true,
   });
   try {

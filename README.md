@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.1.0, preprod only.** It has never run on mainnet and has had no external security
+**Status: 0.2.0, preprod only.** It has never run on mainnet and has had no external security
 review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
