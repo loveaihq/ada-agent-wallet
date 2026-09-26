@@ -117,7 +117,9 @@ The `exact` signer spends the wallet's first UTxO as its nonce and lets the SDK 
 channel client leaves out the inputs it holds as in flight. signerd keeps one set of every input it
 has handed out, `exact` or channel, until the chain shows it spent or a hold expires. The channel
 client leaves those out, and an `exact` transaction that spends one is refused as `utxo_busy`, the
-same answer a reused nonce gets today.
+same answer a reused nonce gets today. signerd also shares one set of the outputs its channel
+transactions paid back to the wallet, so that no agent's client builds before Blockfrost lists
+them.
 
 ## Changes to subbit-x402
 
@@ -129,9 +131,13 @@ same answer a reused nonce gets today.
   refused: signerd sizes deposits at `BATCH_DEPOSIT_REQUESTS` (default 100) times the price, within
   `channelDepositMax`.
 - Installable: a build to `dist/` (TypeScript rewrites the `.ts` imports), type declarations, an
-  `exports` map and a `prepare` script. Published to npm as `subbit-x402@0.1.0`, which the wallet
-  depends on exactly, so an install never pulls from git and never floats onto a version nothing
-  here has run against.
+  `exports` map and a `prepare` script. Published to npm as `subbit-x402`, which the wallet depends
+  on at an exact version (0.1.3 now), so an install never pulls from git and never floats onto a
+  version nothing here has run against.
+- Top-ups that fall back to what the wallet can fund, and never to one that leaves nothing to put
+  up as the refund's collateral (0.1.2; 0.1.3 also counts the SDK's second way of saying the wallet
+  is short). A client that waits for Blockfrost to list what its own transactions paid back to the
+  wallet before it builds. On the seller's side, a paid MCP tool's result kept for a retry (0.1.2).
 
 ## Scope
 

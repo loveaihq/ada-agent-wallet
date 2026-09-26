@@ -5,25 +5,30 @@
  *
  *   1. the seller's tools, listed, and the free one called: nothing paid, nothing opened
  *   2. QUOTES calls of `quote` (0.01 tADA): the first opens the channel (a transaction), the rest are vouchers
- *   3. REPORTS calls of `report` (0.05 tADA), on the same channel
- *   4. one purchase of the seller's HTTP /data (0.1 tADA) through x402_fetch: the same channel again
- *   5. the seller claims every voucher in one transaction, into its own wallet. It has to go first:
+ *   3. REPORTS calls of `report` (0.05 tADA), on the same channel. The opening covers 100 quotes, so
+ *      a report tops it up, sized as 100 x the price that ran short: 5 tADA, more than the public
+ *      test wallet holds. The top-up falls back to what the wallet can fund, keeping back its fee
+ *      and an ADA-only UTxO the refund can put up as collateral
+ *   4. a `digest` (0.02 tADA) whose answer the seller drops after charging for it, and the retry:
+ *      the same voucher, answered with the lost call's answer, and no second charge
+ *   5. one purchase of the seller's HTTP /data (0.1 tADA) through x402_fetch: the same channel again
+ *   6. the seller claims every voucher in one transaction, into its own wallet. It has to go first:
  *      what it is owed is below what one Cardano output can hold, so a refund could not pay it
- *   6. the refund of the rest, through walletctl, owing the seller nothing
- *   7. the reconciliation, and what the calls cost on chain
+ *   7. the refund of the rest, through walletctl, owing the seller nothing
+ *   8. the reconciliation, and what the calls cost on chain
  *
- * Needs dev/batchseller.ts, and signerd started with a fresh CHANNELS_DIR and AGENT_TOKENS_FILE and
- * this agent's policy (amounts as decimal strings):
+ * Needs dev/batchseller.ts, and signerd started with a fresh CHANNELS_DIR and AGENT_TOKENS_FILE, the
+ * default BATCH_DEPOSIT_REQUESTS (100), and this agent's policy (amounts as decimal strings):
  *
  *   perTxMax { lovelace: 300000 }, dailyMax { lovelace: 5000000 }, approvalAbove { lovelace: 150000 },
  *   allowedPayees [<the seller's payTo>], allowedResources ["http://127.0.0.1:7411/*", "http://127.0.0.1:7414/*"],
  *   allowedSchemes ["exact", "batch-settlement"], allowedProviderKeys [<the seller's providerKey>],
  *   channelDepositMax { lovelace: 5000000 }, channelLockedMax { lovelace: 10000000 }
  *
- * and BATCH_DEPOSIT_REQUESTS=135, so that the opening covers the default run (1.35 tADA) and no
- * top-up is needed. A top-up is sized as requests x the price that ran short: the first report
- * would ask for 100 x 0.05 tADA at once, more than the public test wallet can put up beside its
- * collateral. dev/batch.ts is the run that exercises top-ups.
+ * The run does not wait for Blockfrost's index. Blockfrost lists a transaction's change some 20 s
+ * after its block, and the first report comes a few seconds after the opening's. The client
+ * (subbit-x402 0.1.2) waits for its own change before it builds: without that, the top-up would see
+ * the wallet poorer than it is.
  *
  * Env: SIGNERD_URL, SIGNERD_TOKEN (the operator's), AGENT_TOKEN (the agent's), AGENT_ID, AUDIT_FILE
  * (the ledger checkpoint is read beside it), BLOCKFROST_PROJECT_ID, QUOTES (100), REPORTS (5)
@@ -34,6 +39,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { TOP_UP_HEADROOM } from "subbit-x402/x402/client";
 import { blockfrostBaseUrl } from "../src/network.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -51,7 +57,12 @@ const CLAIMS = "http://127.0.0.1:7415/claim";
 const BF = blockfrostBaseUrl("cardano:preprod");
 const QUOTE = 10_000n;
 const REPORT = 50_000n;
+const DIGEST = 20_000n;
 const DATA = 100_000n;
+/** signerd's default BATCH_DEPOSIT_REQUESTS: a deposit covers 100 requests at the price that ran short. */
+const DEPOSIT_REQUESTS = 100n;
+/** The policy's channelDepositMax: no one deposit goes above it. */
+const DEPOSIT_MAX = 5_000_000n;
 
 const operator = { authorization: `Bearer ${OPERATOR}`, "content-type": "application/json" };
 const signerd = async (path: string, body?: unknown) => {
@@ -98,10 +109,12 @@ const answer = (r: Called) => JSON.parse((r.content as Array<{ text?: string }>)
 step("1. the seller's tools, and the free one");
 const listed = (await tool("x402_mcp_tools", { server: TOOLS })) as unknown as { tools?: Array<{ name: string }> };
 const names = (listed.tools ?? []).map(t => t.name);
-expect("the seller offers ping, quote and report", ["ping", "quote", "report"].every(n => names.includes(n)), listed);
+expect("the seller offers ping, quote, report and digest", ["ping", "quote", "report", "digest"].every(n => names.includes(n)), listed);
 const ping = await call("ping", "mcp batch run: is the seller up");
 expect("ping is free: nothing paid", ping.paid === false && !ping.isError && answer(ping).pong === true, ping);
 expect("and no channel opened", (await channels()).length === 0, await channels());
+const buyer = ((await signerd("/status")).data as { address: string }).address;
+const startListing = await utxosOf(buyer);
 
 // ---- 2 ------------------------------------------------------------------------------------------
 step(`2. ${QUOTES} quotes at 0.01 tADA: the first opens a channel`);
@@ -118,29 +131,81 @@ expect(`one channel, signed for ${ada(BigInt(QUOTES) * QUOTE)} tADA`, channel?.s
 const channelId = channel.channelId as string;
 
 // ---- 3 ------------------------------------------------------------------------------------------
-step(`3. ${REPORTS} reports at 0.05 tADA, on the same channel`);
+step(`3. ${REPORTS} reports at 0.05 tADA, on the same channel: past the opening's capacity, a top-up`);
+// What the wallet holds with the opening in: the ADA-only UTxOs listed before it, less those it
+// spent, plus the change it paid back. Read from the transaction, which Blockfrost has as soon as
+// the block, not from the wallet's listing, which shows the change some 20 s later.
+const openingTx = lastTransaction();
+const opening = (await blockfrost(`/txs/${openingTx}/utxos`)) as unknown as { inputs: Io[]; outputs: Io[] };
+const adaOnlyOf = (xs: Io[]) => xs.filter(x => x.address === buyer && !x.collateral && !x.reference && x.amount.length === 1).reduce((s, x) => s + BigInt(x.amount[0].quantity), 0n);
+const visible = adaOnlyTotal(startListing) - adaOnlyOf(opening.inputs) + adaOnlyOf(opening.outputs);
+const listedYet = (await utxosOf(buyer)).some(u => u.tx_hash === openingTx);
+log(`  the index ${listedYet ? "already lists" : "does not list yet"} the opening's change${listedYet ? "" : ": the client has to wait for it"}`);
+// The opening covers DEPOSIT_REQUESTS quotes; the first report past that is short by what it overshoots.
+const capacity = QUOTE * DEPOSIT_REQUESTS;
+let used = BigInt(QUOTES) * QUOTE;
+let short = 0n;
+for (let i = 1; i <= REPORTS && short === 0n; i++) if ((used += REPORT) > capacity) short = used - capacity;
+const want = REPORT * DEPOSIT_REQUESTS < DEPOSIT_MAX ? REPORT * DEPOSIT_REQUESTS : DEPOSIT_MAX;
+const fundable = visible - TOP_UP_HEADROOM;
+log(`  the wallet holds ${ada(visible)} tADA in ADA-only UTxOs; a top-up asks for ${ada(want)}`);
+let lastN = 0;
 for (let i = 1; i <= REPORTS; i++) {
+  const t = Date.now();
   const r = await call("report", `mcp batch run: report ${i}`);
+  if (i === 1) log(`  report 1 took ${Math.round((Date.now() - t) / 1000)} s`);
   expect(`report ${i} paid by voucher on the channel`, r.paid === true && r.voucher?.startsWith(`${channelId}:`) === true && !r.isError, r);
+  lastN = answer(r).n as number;
 }
+const topUps = auditRecords().filter(e => e.seq > firstSeq && e.event === "channel_topped_up");
+if (short > 0n) {
+  expect("one top-up, of the same channel", topUps.length === 1 && topUps[0].channelId === channelId, topUps);
+  const deposit = BigInt(topUps[0].deposit as string);
+  // Largest first: the whole top-up, then what the wallet can fund beside the fee and the refund's
+  // collateral, then only the shortfall.
+  const fallback = fundable > short ? fundable : short;
+  // The whole top-up needs its fee and a change output of at least min-UTxO besides (over 1.15
+  // tADA together); short of that the SDK finds no valid change for it.
+  if (visible < want + 1_150_000n) expect(`the wallet cannot put up ${ada(want)} tADA with its fee and change, so it tops up ${ada(fallback)}: what it can`, deposit === fallback, { deposit, want, visible, fundable, short });
+  else if (visible >= want + TOP_UP_HEADROOM) expect(`a top-up of the whole ${ada(want)} tADA`, deposit === want, { deposit, want, visible });
+  else expect(`a top-up of ${ada(want)} tADA, or ${ada(fallback)} if that left too little for collateral`, deposit === want || deposit === fallback, { deposit, want, visible, fallback });
+  log(`  topped up ${ada(deposit)} tADA in ${topUps[0].transaction}`);
+} else expect("no top-up: the opening covers every report", topUps.length === 0, topUps);
 
 // ---- 4 ------------------------------------------------------------------------------------------
-step("4. the same seller's HTTP /data, through x402_fetch");
+step("4. a digest whose answer is lost after the seller charged for it, and the retry");
+const signedNow = async () => BigInt((await channels()).find(c => c.channelId === channelId)!.signed as string);
+const beforeLost = await signedNow();
+const lost = await tool("x402_mcp_call", { server: TOOLS, tool: "digest", args: {}, reason: "mcp batch run: a digest whose answer is lost" });
+expect("the first digest fails in transit", lost.isError === true && !lost.denied, lost);
+const lostAt = await signedNow();
+expect("after its voucher went out", lostAt === beforeLost + DIGEST, { beforeLost, lostAt });
+const asked = Date.now();
+const retried = await call("digest", "mcp batch run: the same digest, asked again");
+expect("the retry is served, on the lost call's voucher", retried.paid === true && !retried.isError && retried.voucher === `${channelId}:${lostAt}`, retried);
+const digest = answer(retried);
+expect("with the answer the seller gave the lost call: the tool did not run again", digest.kind === "digest" && digest.n === lastN + 1 && Date.parse(digest.at as string) < asked, digest);
+expect("the retry signed nothing new", (await signedNow()) === lostAt, { lostAt });
+expect("and was audited as a re-sign", auditRecords().some(e => e.seq > firstSeq && e.event === "voucher_resigned"), {});
+
+// ---- 5 ------------------------------------------------------------------------------------------
+step("5. the same seller's HTTP /data, through x402_fetch");
 const web = await tool("x402_fetch", { url: `${SELLER}/data`, reason: "mcp batch run: one datum over HTTP" });
 expect("paid by voucher on the same channel", web.status === 200 && web.paid === true && web.voucher?.startsWith(`${channelId}:`) === true, web);
-const expected = BigInt(QUOTES) * QUOTE + BigInt(REPORTS) * REPORT + DATA;
+const expected = BigInt(QUOTES) * QUOTE + BigInt(REPORTS) * REPORT + DIGEST + DATA;
 channel = (await channels()).find(c => c.channelId === channelId)!;
 expect("still one channel", (await channels()).length === 1, await channels());
 expect(`signed for ${ada(expected)} tADA in all`, channel.signed === expected.toString(), channel);
 
-// ---- 5 ------------------------------------------------------------------------------------------
-step("5. the seller claims every voucher, in one transaction");
+// ---- 6 ------------------------------------------------------------------------------------------
+step("6. the seller claims every voucher, in one transaction");
 const claimed = (await (await fetch(CLAIMS, { method: "POST" })).json()) as Array<{ transaction: string; channels: Array<{ channelId: string; totalClaimed: string }> }>;
 expect("one claim transaction, redeeming this channel in full", claimed.length === 1 && claimed[0].channels.some(c => c.channelId === channelId && c.totalClaimed === expected.toString()), claimed);
 const claimTx = claimed[0].transaction;
 
-// ---- 6 ------------------------------------------------------------------------------------------
-step("6. the refund of the rest, through walletctl");
+// ---- 7 ------------------------------------------------------------------------------------------
+step("7. the refund of the rest, through walletctl");
+// Its collateral is the ADA-only UTxO the top-up left, which the client waits to see listed.
 let refund = await walletctl(["refund", channelId, `${SELLER}/data`]);
 // Blockfrost's index trails the claim's block by ~20 s; until it catches up, signerd still sees the
 // vouchers as owed and refuses a refund that would have to pay them.
@@ -152,20 +217,20 @@ for (let i = 0; i < 3 && /must claim it first/.test(refund.err); i++) {
 expect("the refund settled", refund.code === 0 && /"settled":true/.test(refund.out), refund);
 const refundTx = JSON.parse(refund.out.trim().split("\n").at(-1)!).transaction as string;
 
-// ---- 7 ------------------------------------------------------------------------------------------
-step("7. reconciliation");
+// ---- 8 ------------------------------------------------------------------------------------------
+step("8. reconciliation");
 const all = auditRecords().filter(e => e.seq > firstSeq);
 const vouchers = all.filter(e => e.event === "voucher_signed");
 const spent = vouchers.reduce((s, e) => s + BigInt(e.amount as string), 0n);
 const final = (await channels()).find(c => c.channelId === channelId)!;
 expect("the audit's voucher increments add up to what signerd signed", spent.toString() === final.signed, { spent, signed: final.signed });
-expect("one voucher per paid call", vouchers.length === QUOTES + REPORTS + 1, { vouchers: vouchers.length });
+// The digest's retry re-signed the lost call's voucher, so it is one of them, not two.
+expect("one voucher per paid call", vouchers.length === QUOTES + REPORTS + 2, { vouchers: vouchers.length });
 const ledger = JSON.parse(readFileSync(resolve(dirname(AUDIT_FILE), "ledger.json"), "utf8")) as { spends: Array<{ amount: string; voucher?: boolean; agentId: string }> };
 const onLedger = ledger.spends.filter(s => s.voucher && s.agentId === AGENT_ID).reduce((s, x) => s + BigInt(x.amount), 0n);
 expect("and so does the ledger the caps are computed from", onLedger === spent, { onLedger, spent });
 
 // The buyer pays for the opening, any top-up and the refund; the seller for its claim.
-const status = (await signerd("/status")).data as { address: string };
 const buyerTxs = [...all.filter(e => e.event === "channel_opened" || e.event === "channel_topped_up").map(e => e.transaction as string), refundTx];
 let walletNet = 0n;
 let sellerNet = 0n;
@@ -173,7 +238,7 @@ let buyerFees = 0n;
 let sellerFees = 0n;
 for (const hash of [...buyerTxs, claimTx]) {
   const utxos = await blockfrost(`/txs/${hash}/utxos`);
-  walletNet += netFor(utxos, status.address);
+  walletNet += netFor(utxos, buyer);
   sellerNet += netFor(utxos, final.payTo as string);
   const fee = BigInt((await blockfrost(`/txs/${hash}`)).fees as string);
   if (hash === claimTx) sellerFees += fee;
@@ -182,12 +247,12 @@ for (const hash of [...buyerTxs, claimTx]) {
 expect("the seller gained exactly what the vouchers signed, less its claim's fee", sellerNet === spent - sellerFees, { sellerNet, spent, sellerFees });
 expect("the wallet lost exactly that and its own fees", walletNet === -(spent + buyerFees), { walletNet, spent, buyerFees });
 
-const calls = QUOTES + REPORTS + 1;
+const calls = QUOTES + REPORTS + 2;
 const fees = buyerFees + sellerFees;
 const later = [...times.slice(1)].sort((a, b) => a - b);
-log(`  ${calls} paid calls (${QUOTES} quote and ${REPORTS} report over MCP, 1 /data over HTTP), ${ada(spent)} tADA to the seller`);
+log(`  ${calls} paid calls (${QUOTES} quote, ${REPORTS} report and 1 digest, answered twice, over MCP; 1 /data over HTTP), ${ada(spent)} tADA to the seller`);
 log(`  ${buyerTxs.length + 1} transactions on chain, ${ada(fees)} tADA in fees (buyer ${ada(buyerFees)}, seller ${ada(sellerFees)}), ${ada(fees / BigInt(calls))} per call`);
-log(`  opened ${buyerTxs[0]}, claimed ${claimTx}, refunded ${refundTx}`);
+log(`  opened ${buyerTxs[0]}, ${buyerTxs.length > 2 ? `topped up ${buyerTxs.slice(1, -1).join(", ")}, ` : ""}claimed ${claimTx}, refunded ${refundTx}`);
 log(`  the first quote, which opened the channel, took ${times[0]} ms; the others ${later[0]}-${later.at(-1)} ms, median ${later[Math.floor(later.length / 2)]} ms`);
 
 await mcp.close();
@@ -215,6 +280,34 @@ function walletctl(args: string[]): Promise<{ code: number; out: string; err: st
     child.stderr.on("data", d => (err += d));
     child.on("close", code => ok({ code: code ?? 1, out, err }));
   });
+}
+
+type Utxo = { tx_hash: string; output_index: number; amount: Array<{ unit: string; quantity: string }> };
+/** A transaction's input or output, as Blockfrost's `/txs/{hash}/utxos` gives it. */
+type Io = Utxo & { address: string; collateral?: boolean; reference?: boolean };
+
+/** An address's UTxOs as Blockfrost lists them, which is what the client builds from. */
+async function utxosOf(address: string): Promise<Utxo[]> {
+  const out: Utxo[] = [];
+  for (let page = 1; ; page++) {
+    const r = await fetch(`${BF}/addresses/${address}/utxos?page=${page}`, { headers: { project_id: PROJECT_ID } });
+    if (r.status === 404) return out;
+    if (!r.ok) throw new Error(`Blockfrost /addresses/…/utxos: ${r.status}`);
+    const xs = (await r.json()) as Utxo[];
+    out.push(...xs);
+    if (xs.length < 100) return out;
+  }
+}
+
+function adaOnlyTotal(xs: Utxo[]): bigint {
+  return xs.filter(u => u.amount.length === 1).reduce((s, u) => s + BigInt(u.amount[0].quantity), 0n);
+}
+
+/** The run's latest transaction of the wallet's own: its opening, or a top-up. */
+function lastTransaction(): string {
+  return auditRecords()
+    .filter(e => e.seq > firstSeq && (e.event === "channel_opened" || e.event === "channel_topped_up"))
+    .at(-1)!.transaction as string;
 }
 
 async function blockfrost(path: string): Promise<Record<string, unknown>> {

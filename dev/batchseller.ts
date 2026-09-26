@@ -10,9 +10,11 @@
  *   :7412  GET /other  0.1 tADA  a seller whose channels would name a provider key the policy does not allow
  *   :7413  the facilitator: verifies, broadcasts, and waits for each deposit's block
  *   :7414  POST /mcp   the same seller's paid MCP tools, for dev/mcpbatch.ts:
- *          ping free, quote 0.01 tADA, report 0.05 tADA. Below what one Cardano output can hold,
- *          so batch-settlement is the only way to pay them. They are served by the same scheme
- *          instance as :7411, so a buyer's channel keeps one count across both.
+ *          ping free, quote 0.01 tADA, report 0.05 tADA, and digest 0.02 tADA, which answers in
+ *          structured content and loses its first settled answer on the way back, as /lossy does.
+ *          Below what one Cardano output can hold, so batch-settlement is the only way to pay them.
+ *          They are served by the same scheme instance as :7411, so a buyer's channel keeps one
+ *          count across both.
  *   :7415  POST /claim the seller redeems every channel's vouchers, in as few transactions as it can.
  *          It must claim before a buyer can refund a channel whose owed amount is below what one
  *          Cardano output can hold: the claim pays into the seller's own wallet, a refund cannot.
@@ -138,15 +140,18 @@ await listen(7412, serve(other, 7412));
 
 // :7414, the MCP tools. `@x402/mcp`'s own wrapper, as dev/mcpresource.ts uses for `exact`, around the
 // resource server :7411 uses (initialized with it above).
-const toolPrice = async (tool: string, description: string, amount: string) =>
+const toolPrice = async (tool: string, description: string, amount: string, onSettled?: () => void) =>
   createPaymentWrapper(mainResources, {
     accepts: await mainResources.buildPaymentRequirements({ scheme: "batch-settlement", network: NETWORK, payTo, price: { asset: "lovelace", amount }, maxTimeoutSeconds: 300, extra: {} }),
     // Without `resource` every 402 would name itself `mcp://tool/paid_tool`.
     resource: { url: createToolResourceUrl(tool), description, mimeType: "application/json" },
+    ...(onSettled ? { hooks: { onAfterSettlement: async () => onSettled() } } : {}),
   });
+let digestSettlements = 0;
 const paidTools = {
   quote: await toolPrice("quote", "An ADA/USD quote for 0.01 tADA", "10000"),
   report: await toolPrice("report", "A short report for 0.05 tADA", "50000"),
+  digest: await toolPrice("digest", "A structured digest for 0.02 tADA", "20000", () => void digestSettlements++),
 };
 let toolCalls = 0;
 const reply = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }] });
@@ -155,15 +160,45 @@ function tools(): McpServer {
   mcp.tool("ping", "Free. Says the server is up.", {}, async () => reply({ pong: true }));
   mcp.tool("quote", "An ADA/USD quote. Costs 0.01 tADA, by batch-settlement.", {}, paidTools.quote(async () => reply({ symbol: "ADA/USD", price: "0.2380", n: ++toolCalls, at: new Date().toISOString() })));
   mcp.tool("report", "A short report. Costs 0.05 tADA, by batch-settlement.", {}, paidTools.report(async () => reply({ title: "preprod channel report", n: ++toolCalls, at: new Date().toISOString() })));
+  // Structured content with its JSON as the one text block: a shape the seller keeps for a retry.
+  mcp.tool(
+    "digest",
+    "A structured digest. Costs 0.02 tADA, by batch-settlement.",
+    {},
+    paidTools.digest(async () => {
+      const digest = { kind: "digest", n: ++toolCalls, at: new Date().toISOString() };
+      return { content: [{ type: "text" as const, text: JSON.stringify(digest) }], structuredContent: digest };
+    }),
+  );
   return mcp;
 }
 // Stateless, as in dev/mcpresource.ts: a fresh MCP server per request, the payment in its `_meta`.
+let digestLost = false;
 await listen(7414, async (req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1:7414");
   if (url.pathname !== "/mcp") return send(res, 404, {}, { error: "not found" });
   const raw = await readBody(req);
+  const message = raw ? JSON.parse(raw) : undefined;
+  // The first paid `digest` call to settle loses its answer, as a dropped connection would. The
+  // transport answers it as one JSON body, which it writes only once the call and its settlement
+  // are done, and the connection closes instead. The retry carries the same voucher: it must get
+  // that answer back without the tool running or a second charge.
+  const lossy = !digestLost && message?.method === "tools/call" && message.params?.name === "digest" && message.params?._meta?.["x402/payment"] !== undefined;
+  if (lossy) {
+    const settled = digestSettlements;
+    const writeHead = res.writeHead;
+    res.writeHead = ((...args: Parameters<typeof res.writeHead>) => {
+      if (digestSettlements === settled) return writeHead.apply(res, args);
+      digestLost = true;
+      log("digest: a paid call settled, and its answer is dropped");
+      res.write = (() => true) as typeof res.write;
+      res.end = (() => res) as typeof res.end;
+      res.destroy();
+      return res;
+    }) as typeof res.writeHead;
+  }
   const mcp = tools();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: lossy });
   res.on("close", () => {
     void transport.close();
     void mcp.close();

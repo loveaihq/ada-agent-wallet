@@ -99,6 +99,7 @@ import {
   iouRootOf,
   type Authorization,
   type ClientChannel,
+  type OwnOutput,
 } from "subbit-x402/x402/client";
 import { BATCH, decide, decideDeposit, parsePolicy, remaining, type Decision, type Policy, type SpendRecord } from "./policy.js";
 import { ChannelStore, type ChannelEntry } from "./channelStore.js";
@@ -619,6 +620,13 @@ function claimNonce(nonce: string, ttlSeconds: number): boolean {
  * PENDING_MS.
  */
 const inFlight = new Map<string, number>();
+/**
+ * What channel transactions paid back to this wallet, until the wallet lists it. Blockfrost lists
+ * a transaction's change some 20 s after its block, and a client builds only once it does. The
+ * map is shared by every agent's client, as `inFlight` is, so each also waits for another's
+ * change.
+ */
+const ownOutputs = new Map<string, OwnOutput>();
 function inputBusy(inputs: readonly string[]): string | undefined {
   const now = Date.now();
   return inputs.find(i => {
@@ -652,12 +660,14 @@ class UtxoBusy extends AuditedError {}
  * daemon: an x402 endpoint priced in an asset this wallet has never held reaches here, and
  * "something broke" is the wrong thing to tell an agent that needs to stop asking.
  *
- * Matched on the builder's message because the SDK gives it no code of its own. If that message
- * ever changes the condition falls back to a plain 500, which is what it was before.
+ * Matched on the builder's messages because the SDK gives them no code of its own. There are two:
+ * a failed coin selection when the wallet holds less than the payment, and no valid change when it
+ * holds the payment but not the fee and a change output besides. If those messages ever change,
+ * the condition falls back to a plain 500, which is what it was before.
  */
 class InsufficientFunds extends AuditedError {}
 const isCoinSelectionFailure = (e: unknown) =>
-  e instanceof Error && /coin selection failed/i.test(`${e.message} ${String((e as { cause?: unknown }).cause ?? "")}`);
+  e instanceof Error && /coin selection failed|cannot create valid change/i.test(`${e.message} ${String((e as { cause?: unknown }).cause ?? "")}`);
 
 async function sign(agentId: string, reason: string, input: ClientCardanoSignInput) {
   return withWalletLock(async () => {
@@ -872,6 +882,7 @@ function batchClient(agentId: string): { client: BatchSettlementCardanoClient; s
       return cap === undefined ? undefined : BigInt(cap);
     },
     spentInputs: inFlight,
+    ownOutputs,
     iouKeys: "derived",
     authorize: a => authorizeChannel(agentId, a),
   });
@@ -1129,8 +1140,12 @@ async function channelList(only?: string) {
 const AGENT_PATHS = new Set(["/sign", "/status", "/batch/payload", "/batch/response"]);
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-/** The channel client's own refusals when the wallet cannot fund a step. */
-const isShortOfFunds = (e: unknown) => isCoinSelectionFailure(e) || (e instanceof Error && /the wallet holds \d+ of the currency|no UTxO to open/.test(e.message));
+/**
+ * The channel client's own refusals when the wallet cannot fund a step, or could fund it only by
+ * leaving nothing to put up as the refund's collateral.
+ */
+const isShortOfFunds = (e: unknown) =>
+  isCoinSelectionFailure(e) || (e instanceof Error && /the wallet holds \d+ of the currency|no UTxO to open|would leave no ADA-only UTxOs/.test(e.message));
 
 let shuttingDown = false;
 

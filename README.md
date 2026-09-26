@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.2, preprod only.** It has never run on mainnet and has had no external security
+**Status: 0.2.3, preprod only.** It has never run on mainnet and has had no external security
 review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
@@ -214,16 +214,25 @@ Every channel transaction but the opening puts up collateral from an ADA-only UT
 1 ADA of it back as change. So the wallet needs one ADA-only UTxO of at least about 2 ADA, and ADA
 sitting in a UTxO with tokens does not count.
 
+A top-up is sized for `BATCH_DEPOSIT_REQUESTS` requests at the price that ran short. When the
+wallet cannot fund that much, it tops up what it can, keeping back the fee and such a UTxO for the
+refund. Failing that, it tops up at least what this request is short of. A top-up that would leave
+nothing to put up as the refund's collateral is refused as `insufficient_funds`. Right after a
+channel transaction of its own, the client waits, for up to a minute, for Blockfrost to list that
+transaction's change before it builds again.
+
 Limits: preprod only, and only with `BLOCKFROST_PROJECT_ID` — the channel client reads the chain
 through Blockfrost, and Subbit's validator is alpha software.
 
 `x402_mcp_call` pays paid MCP tools the same way, through the same proxy and on the same channels.
 A seller's HTTP routes and MCP tools share one channel when they name the same provider.
 
-One difference remains: a paid response lost in transit is replayed to its retry only over HTTP.
-subbit-x402 keeps a paid request's answer when the transport hands it the response body, and
-`@x402/mcp` hands over the tool result instead. So an MCP retry after a lost answer is charged
-again, one voucher's worth.
+A paid answer lost in transit is given again to its retry, over MCP as over HTTP, when the seller
+runs subbit-x402 0.1.2 or later. The retry carries the same voucher, signerd re-signs it without
+spending anything (`voucher_resigned`), and the seller hands back the answer it kept. Over MCP it
+keeps a tool's result only when `@x402/mcp` can give it back unchanged: one text block, or
+structured content with its JSON as that block. A retry after any other result is charged again,
+one voucher's worth.
 
 `npm run batchseller` is the preprod seller, with its MCP tools on :7414. `npm run batch`,
 `batchexit`, `batchend` and `mcpbatch` are the round trips against it; the results are under
@@ -246,21 +255,30 @@ again, one voucher's worth.
   received exactly 2.500000 and the wallet lost exactly that plus the four transactions' fees,
   0.923814 (opening `1ea7adcb…` 0.178173, top-ups `4b373326…` and `38170b84…` 0.253535 and
   0.253533, refund `13808a96…` 0.238573).
-- `npm run mcpbatch` on preprod (2026-09-26): paid MCP tools, bought through `x402_mcp_call`, at
-  prices no Cardano output could carry.
-  - **The calls.** One channel paid 106 calls: 100 `quote` at 0.01 tADA and 5 `report` at 0.05
-    tADA over MCP, plus one `/data` at 0.1 tADA over HTTP from the same seller.
-  - **Speed.** The first call opened the channel in 25 s. The other 105 were vouchers at 36–64 ms
-    each, median 42 ms.
-  - **Settlement.** The seller claimed all 1.350000 tADA in one transaction into its own wallet.
+- `npm run mcpbatch` on preprod (2026-09-26, subbit-x402 0.1.3): paid MCP tools, bought through
+  `x402_mcp_call`, at prices no Cardano output could carry.
+  - **The calls.** One channel paid 107 calls. Over MCP there were 100 `quote` at 0.01 tADA,
+    5 `report` at 0.05 tADA and one `digest` at 0.02 tADA; over HTTP, one `/data` at 0.1 tADA from
+    the same seller.
+  - **Speed.** The first call opened the channel in 23.5 s. The other calls were vouchers at
+    37–65 ms each, median 46 ms, except the report that topped the channel up (53 s).
+  - **A top-up the wallet could not fund in full.** With the opening in, the wallet held 5.758573
+    tADA in ADA-only UTxOs. That is more than the 5 tADA the top-up asked for, but not enough for
+    its fee and a change output as well. The index did not list the opening's change yet, so the
+    client waited for it. It then topped up 3.258573 tADA, all it could, keeping back an ADA-only
+    UTxO of 2.244289 for the refund's collateral.
+  - **A lost answer.** The seller charged the `digest` and dropped its answer. The retry carried
+    the same voucher, which signerd re-signed without spending anything (`voucher_resigned`), and
+    got the lost call's answer back: the tool did not run again.
+  - **Settlement.** The seller claimed all 1.370000 tADA in one transaction into its own wallet.
     It had to claim before the refund, since a refund cannot pay an amount below an output's
-    minimum. `walletctl refund` then returned the rest, owing it nothing.
-  - **Reconciliation.** 106 vouchers for 1.350000 tADA in the audit log, the ledger and signerd's
-    channel index alike. On chain, the seller gained exactly 1.350000 less its claim's fee, and the
-    wallet lost exactly that plus its own fees. That is three transactions and 0.667032 tADA, or
-    0.006292 per call:
-    - opening `5aaeed1c…` and refund `0df62e18…`, 0.410718 between them;
-    - claim `ea71f9f7…`, 0.256314.
+    minimum. `walletctl refund` then returned the rest, 4.388648 tADA, owing it nothing.
+  - **Reconciliation.** 107 vouchers for 1.370000 tADA in the audit log, the ledger and signerd's
+    channel index alike. On chain, the seller gained exactly 1.370000 less its claim's fee, and the
+    wallet lost exactly that plus its own fees. That is four transactions and 0.922743 tADA, or
+    0.008623 per call:
+    - opening `1d0cb8cc…` 0.176589, top-up `d417da2a…` 0.255711, refund `a1010bac…` 0.232545;
+    - claim `b834de67…`, 0.257898.
 - `npm run batchexit` on preprod (2026-09-25), the way out without the seller: three purchases,
   `walletctl close` (`95f5f833…`), then signerd restarted with its channel directory deleted;
   `walletctl recover` found the closed channel on chain with its IOU key derived again, and
