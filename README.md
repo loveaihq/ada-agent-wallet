@@ -203,16 +203,31 @@ no keys that forwards the 402 to signerd and the payload back. `x402_fetch` pref
   was signed and not yet redeemed, a fee under 2 ADA and collateral under 5 ADA.
 
 The operator's side: `walletctl channels`, `walletctl refund <channelId> <url>` (the seller
-co-signs; signerd builds and signs it but talks to no seller, walletctl carries the messages),
+co-signs; signerd builds and signs it but talks to no seller, walletctl carries the messages; a
+refund pays the seller what it is still owed in an output of its own, so when that is below an
+output's minimum, about 1 ADA, the seller has to claim first and the refund then owes it nothing),
 `close`, `end` and `elapse` to leave without the seller, and `recover <agentId>` to find an agent's
 channels on chain again after losing the records. An exit waits for its block inside the wallet
 lock, so payments pause while one lands.
 
+Every channel transaction but the opening puts up collateral from an ADA-only UTxO and keeps about
+1 ADA of it back as change. So the wallet needs one ADA-only UTxO of at least about 2 ADA, and ADA
+sitting in a UTxO with tokens does not count.
+
 Limits: preprod only, and only with `BLOCKFROST_PROJECT_ID` — the channel client reads the chain
-through Blockfrost, and Subbit's validator is alpha software. `x402_mcp_call` stays on `exact`:
-`batch-settlement` over paid MCP tools has not been tried. `npm run batchseller` is the preprod
-seller, and `npm run batch`, `batchexit` and `batchend` are the round trips against it; the results
-are under "Verified".
+through Blockfrost, and Subbit's validator is alpha software.
+
+`x402_mcp_call` pays paid MCP tools the same way, through the same proxy and on the same channels.
+A seller's HTTP routes and MCP tools share one channel when they name the same provider.
+
+One difference remains: a paid response lost in transit is replayed to its retry only over HTTP.
+subbit-x402 keeps a paid request's answer when the transport hands it the response body, and
+`@x402/mcp` hands over the tool result instead. So an MCP retry after a lost answer is charged
+again, one voucher's worth.
+
+`npm run batchseller` is the preprod seller, with its MCP tools on :7414. `npm run batch`,
+`batchexit`, `batchend` and `mcpbatch` are the round trips against it; the results are under
+"Verified".
 
 ## Verified
 - `npm test`: 101 unit tests over the policy engine, the startup replay, the locks, the keystore,
@@ -231,6 +246,21 @@ are under "Verified".
   received exactly 2.500000 and the wallet lost exactly that plus the four transactions' fees,
   0.923814 (opening `1ea7adcb…` 0.178173, top-ups `4b373326…` and `38170b84…` 0.253535 and
   0.253533, refund `13808a96…` 0.238573).
+- `npm run mcpbatch` on preprod (2026-09-26): paid MCP tools, bought through `x402_mcp_call`, at
+  prices no Cardano output could carry.
+  - **The calls.** One channel paid 106 calls: 100 `quote` at 0.01 tADA and 5 `report` at 0.05
+    tADA over MCP, plus one `/data` at 0.1 tADA over HTTP from the same seller.
+  - **Speed.** The first call opened the channel in 25 s. The other 105 were vouchers at 36–64 ms
+    each, median 42 ms.
+  - **Settlement.** The seller claimed all 1.350000 tADA in one transaction into its own wallet.
+    It had to claim before the refund, since a refund cannot pay an amount below an output's
+    minimum. `walletctl refund` then returned the rest, owing it nothing.
+  - **Reconciliation.** 106 vouchers for 1.350000 tADA in the audit log, the ledger and signerd's
+    channel index alike. On chain, the seller gained exactly 1.350000 less its claim's fee, and the
+    wallet lost exactly that plus its own fees. That is three transactions and 0.667032 tADA, or
+    0.006292 per call:
+    - opening `5aaeed1c…` and refund `0df62e18…`, 0.410718 between them;
+    - claim `ea71f9f7…`, 0.256314.
 - `npm run batchexit` on preprod (2026-09-25), the way out without the seller: three purchases,
   `walletctl close` (`95f5f833…`), then signerd restarted with its channel directory deleted;
   `walletctl recover` found the closed channel on chain with its IOU key derived again, and

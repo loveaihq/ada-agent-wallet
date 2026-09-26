@@ -138,10 +138,13 @@ same answer a reused nonce gets today.
 - **Preprod only.** The channel client's only chain reader is Blockfrost's, written for preprod,
   and Subbit's validator is alpha. signerd refuses `batch-settlement` on any other network and
   without `BLOCKFROST_PROJECT_ID`; `exact` keeps Koios as its default.
-- **`x402_fetch` first.** @x402/mcp runs the same hooks, but `batch-settlement` over paid MCP tools
-  has not been tried.
-- **What the agent sees:** `x402_fetch` pays either way, and `wallet_status` lists each channel with
-  what it locks and what has been signed.
+- **Paid MCP tools too.** `x402_mcp_call` hands `@x402/mcp` the same x402Client as `x402_fetch`.
+  @x402/mcp runs the same scheme hooks: the seller's answer goes back to signerd, and a corrective
+  402 is retried once. A seller's HTTP routes and MCP tools therefore share one channel and one
+  count. Only the replay of a lost answer is HTTP-only: subbit-x402 keeps the response body, which
+  `@x402/mcp` does not pass on.
+- **What the agent sees:** `x402_fetch` and `x402_mcp_call` pay either way, and `wallet_status`
+  lists each channel with what it locks and what has been signed.
 
 ## Tests
 

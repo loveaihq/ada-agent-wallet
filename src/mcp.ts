@@ -7,8 +7,9 @@
  *   x402_mcp_tools(server)                — what a remote MCP server offers (not what it charges)
  *   x402_mcp_call(server, tool, args, reason) — a paid MCP tool, through the same policy gate
  * The agent never sees a key. It never sees the signed tx either — @x402/core handles the 402 round-trip.
- * `x402_fetch` pays with `exact` or, where the seller offers it and the policy allows it, with
- * `batch-settlement` vouchers on a channel; signerd holds the channel keys and signs those too.
+ * `x402_fetch` and `x402_mcp_call` pay with `exact` or, where the seller offers it and the policy
+ * allows it, with `batch-settlement` vouchers on a channel; signerd holds the channel keys and signs
+ * those too.
  *
  * Env: SIGNERD_URL (default http://127.0.0.1:7402), SIGNERD_TOKEN, AGENT_ID (default "default")
  */
@@ -81,22 +82,18 @@ const batch = createBatchProxy({
 });
 // spendControls: false — the per-payment USD cap in @x402/core is replaced by signerd's policy
 // (per-tx, rolling daily, hourly rate, payee allowlist, human approval), enforced where the key lives.
+// One client for web resources and MCP tools alike: `@x402/mcp` runs the same scheme hooks as
+// `@x402/fetch` (the seller's answer handed back, a corrective 402 retried once), so a channel's
+// count stays in step whichever way it is paid.
 const client = x402Client.fromConfig({
-  schemes: [{ network: "cardano:*", client: new ExactCardanoScheme(signer) }],
+  schemes: [
+    { network: "cardano:*", client: new ExactCardanoScheme(signer) },
+    { network: "cardano:*", client: batch },
+  ],
   spendControls: false,
+  policies: [preferBatch(() => callContext.getStore()?.batchAllowed === true)],
 });
-// batch-settlement for web resources only: over paid MCP tools it has not been tried.
-const payingFetch = wrapFetchWithPayment(
-  fetch,
-  x402Client.fromConfig({
-    schemes: [
-      { network: "cardano:*", client: new ExactCardanoScheme(signer) },
-      { network: "cardano:*", client: batch },
-    ],
-    spendControls: false,
-    policies: [preferBatch(() => callContext.getStore()?.batchAllowed === true)],
-  }),
-);
+const payingFetch = wrapFetchWithPayment(fetch, client);
 
 /** Whether to prefer batch-settlement on this call: signerd offers it, and this agent may use it. */
 async function batchAllowed(): Promise<boolean> {
@@ -198,8 +195,9 @@ server.tool(
  *
  * `x402_fetch` above pays for a web resource. A paid MCP *tool* is a different thing — the charge
  * comes back inside the tool call — and `@x402/mcp` is the official client for it. It takes an
- * `x402Client`, and the one built above already has the gated signer inside, so the same policy,
- * the same audit log and the same approval queue cover both without a second code path.
+ * `x402Client`, and the one built above already has the gated signer and the batch proxy inside, so
+ * the same policy, the same audit log, the same approval queue and the same channels cover both
+ * without a second code path.
  *
  * Worth naming: `@x402/mcp`'s own `onPaymentRequested` hook is documented as the place to put
  * human-in-the-loop approval, and it runs in *this* process — which is the thing signerd exists in
@@ -266,7 +264,7 @@ server.tool(
     // The resource is the server, not the tool: it is the URL the agent reports it is paying for,
     // which is what `allowedResources` is written against. Per-tool allowlisting would need a
     // resource shape the policy file does not have; the tool name is in the audit record instead.
-    callContext.run({ reason: `${reason} [mcp tool ${tool}]`, resource: serverUrl }, async () => {
+    callContext.run({ reason: `${reason} [mcp tool ${tool}]`, resource: serverUrl, batchAllowed: await batchAllowed() }, async () => {
       try {
         const result = await withRemote(serverUrl, transport, paid => paid.callTool(tool, args));
         // `paymentMade` means a payment went out with the retry, not that it settled, and a seller

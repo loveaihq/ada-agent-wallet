@@ -9,6 +9,13 @@
  *          GET /token  0.001 tUSDM  the same in Moneta's preprod tUSDM, for a token channel
  *   :7412  GET /other  0.1 tADA  a seller whose channels would name a provider key the policy does not allow
  *   :7413  the facilitator: verifies, broadcasts, and waits for each deposit's block
+ *   :7414  POST /mcp   the same seller's paid MCP tools, for dev/mcpbatch.ts:
+ *          ping free, quote 0.01 tADA, report 0.05 tADA. Below what one Cardano output can hold,
+ *          so batch-settlement is the only way to pay them. They are served by the same scheme
+ *          instance as :7411, so a buyer's channel keeps one count across both.
+ *   :7415  POST /claim the seller redeems every channel's vouchers, in as few transactions as it can.
+ *          It must claim before a buyer can refund a channel whose owed amount is below what one
+ *          Cardano output can hold: the claim pays into the seller's own wallet, a refund cannot.
  *
  * Prints one JSON line once listening: {"payTo", "providerKey", "otherKey"}, for the policy.
  *
@@ -22,6 +29,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomBytes } from "node:crypto";
 import { x402Facilitator } from "@x402/core/facilitator";
 import { HTTPFacilitatorClient, x402HTTPResourceServer, x402ResourceServer, type HTTPAdapter, type RoutesConfig } from "@x402/core/server";
+import { createPaymentWrapper, createToolResourceUrl } from "@x402/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Address, Client, KeyHash, preprod } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH } from "subbit-x402/subbit";
 import { BlockfrostChain } from "subbit-x402/x402/chain";
@@ -85,7 +95,10 @@ const shop = (receiverAuthorizer: string, storage: FileChannelStorage, signs: bo
   });
 
 const mainStorage = new FileChannelStorage(`${OUT}/main`);
-const main = new x402HTTPResourceServer(new x402ResourceServer(facilitatorClient).register(NETWORK, shop(providerKey, mainStorage, true)), {
+// One scheme instance for the HTTP routes and the MCP tools: they share the buyer's channel, so they
+// must share its count, or each would refuse the other's vouchers as out of step.
+const mainResources = new x402ResourceServer(facilitatorClient).register(NETWORK, shop(providerKey, mainStorage, true));
+const main = new x402HTTPResourceServer(mainResources, {
   "GET /data": { accepts: accept("100000"), description: "one datum for 0.1 tADA" },
   "GET /big": { accepts: accept("200000"), description: "a bigger datum, over the run's approval threshold" },
   "GET /lossy": { accepts: accept("100000"), description: "one datum whose first response never arrives" },
@@ -122,9 +135,53 @@ const serve = (http: x402HTTPResourceServer, port: number) => async (req: Incomi
 };
 await listen(7411, serve(main, 7411));
 await listen(7412, serve(other, 7412));
+
+// :7414, the MCP tools. `@x402/mcp`'s own wrapper, as dev/mcpresource.ts uses for `exact`, around the
+// resource server :7411 uses (initialized with it above).
+const toolPrice = async (tool: string, description: string, amount: string) =>
+  createPaymentWrapper(mainResources, {
+    accepts: await mainResources.buildPaymentRequirements({ scheme: "batch-settlement", network: NETWORK, payTo, price: { asset: "lovelace", amount }, maxTimeoutSeconds: 300, extra: {} }),
+    // Without `resource` every 402 would name itself `mcp://tool/paid_tool`.
+    resource: { url: createToolResourceUrl(tool), description, mimeType: "application/json" },
+  });
+const paidTools = {
+  quote: await toolPrice("quote", "An ADA/USD quote for 0.01 tADA", "10000"),
+  report: await toolPrice("report", "A short report for 0.05 tADA", "50000"),
+};
+let toolCalls = 0;
+const reply = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }] });
+function tools(): McpServer {
+  const mcp = new McpServer({ name: "batch-dev-seller", version: "0.1.0" });
+  mcp.tool("ping", "Free. Says the server is up.", {}, async () => reply({ pong: true }));
+  mcp.tool("quote", "An ADA/USD quote. Costs 0.01 tADA, by batch-settlement.", {}, paidTools.quote(async () => reply({ symbol: "ADA/USD", price: "0.2380", n: ++toolCalls, at: new Date().toISOString() })));
+  mcp.tool("report", "A short report. Costs 0.05 tADA, by batch-settlement.", {}, paidTools.report(async () => reply({ title: "preprod channel report", n: ++toolCalls, at: new Date().toISOString() })));
+  return mcp;
+}
+// Stateless, as in dev/mcpresource.ts: a fresh MCP server per request, the payment in its `_meta`.
+await listen(7414, async (req, res) => {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1:7414");
+  if (url.pathname !== "/mcp") return send(res, 404, {}, { error: "not found" });
+  const raw = await readBody(req);
+  const mcp = tools();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  res.on("close", () => {
+    void transport.close();
+    void mcp.close();
+  });
+  await mcp.connect(transport);
+  await transport.handleRequest(req, res, raw ? JSON.parse(raw) : undefined);
+});
+const manager = new ChannelManager({ storage: mainStorage, wallet: provider, providerKeyHash: providerKey, chain, facilitator: facilitatorClient, network: NETWORK, payTo, scriptHash: SUBBIT_HASH, ...(REFERENCE_SCRIPT ? { referenceScript: REFERENCE_SCRIPT } : {}) });
+await listen(7415, async (req, res) => {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1:7415");
+  await readBody(req);
+  if (req.method !== "POST" || url.pathname !== "/claim") return send(res, 404, {}, { error: "not found" });
+  const results = await manager.claim();
+  for (const r of results) log(`claimed ${r.channels.length} channel(s) in ${r.transaction}`);
+  send(res, 200, {}, results.map(r => ({ transaction: r.transaction, channels: r.channels.map(c => ({ channelId: c.channelId, taken: c.taken.toString(), totalClaimed: c.totalClaimed.toString() })) })));
+});
 if (process.env.BATCH_SELLER_SETTLES === "1") {
   // A seller that looks after its channels: when a buyer closes one, it settles the latest voucher.
-  const manager = new ChannelManager({ storage: mainStorage, wallet: provider, providerKeyHash: providerKey, chain, facilitator: facilitatorClient, network: NETWORK, payTo, scriptHash: SUBBIT_HASH, ...(REFERENCE_SCRIPT ? { referenceScript: REFERENCE_SCRIPT } : {}) });
   manager.watch({
     intervalMs: 15_000,
     onEvent: e => {
@@ -136,7 +193,7 @@ if (process.env.BATCH_SELLER_SETTLES === "1") {
   log("watcher on: channels their buyers close are settled");
 }
 console.log(JSON.stringify({ payTo, providerKey, otherKey }));
-log(`selling on 7411 and 7412, facilitator on 7413; provider ${payTo}`);
+log(`selling on 7411 and 7412, MCP tools on 7414, facilitator on 7413, claims on 7415; provider ${payTo}`);
 
 function listen(port: number, handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>): Promise<Server> {
   const srv = createServer((req, res) =>

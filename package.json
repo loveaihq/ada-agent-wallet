@@ -64,6 +64,7 @@
     "batch": "tsx dev/batch.ts",
     "batchexit": "tsx dev/batchexit.ts",
     "batchend": "tsx dev/batchend.ts",
+    "mcpbatch": "tsx dev/mcpbatch.ts",
     "prepare": "npm run build"
   },
   "dependencies": {
