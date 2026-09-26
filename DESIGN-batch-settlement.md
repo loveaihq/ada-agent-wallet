@@ -119,7 +119,9 @@ has handed out, `exact` or channel, until the chain shows it spent or a hold exp
 client leaves those out, and an `exact` transaction that spends one is refused as `utxo_busy`, the
 same answer a reused nonce gets today. signerd also shares one set of the outputs its channel
 transactions paid back to the wallet, so that no agent's client builds before Blockfrost lists
-them.
+them. Both directions ran on preprod in `npm run contention` (README, "Verified"). A channel asked to
+open while an `exact` purchase held the wallet's largest ADA-only UTxO was refused as
+`insufficient_funds`. An `exact` purchase that needed a top-up's input was refused as `utxo_busy`.
 
 ## Changes to subbit-x402
 

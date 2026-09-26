@@ -279,6 +279,24 @@ one voucher's worth.
     0.008623 per call:
     - opening `1d0cb8cc…` 0.176589, top-up `d417da2a…` 0.255711, refund `a1010bac…` 0.232545;
     - claim `b834de67…`, 0.257898.
+- `npm run contention` on preprod (2026-09-26): an `exact` payment and a channel transaction never
+  go out spending the same UTxO while the first is unsettled.
+  - **`exact` first.** A 1.5 tADA purchase was built on the wallet's first-listed UTxO, its
+    largest ADA-only one. A channel asked to open meanwhile could not use that UTxO, and the
+    wallet could not fund the opening without it, so it was refused as `insufficient_funds`. It
+    opened from other UTxOs once the purchase was on chain.
+  - **Channel first.** While a top-up was in flight, a purchase was built on the wallet's token
+    UTxO, which holds only its min-UTxO of ADA, so the SDK added the largest ADA-only UTxO: the
+    top-up's. signerd refused it as `utxo_busy` and audited `input_in_flight`, naming that input.
+    Asked again once the top-up was on chain, it went through.
+  - **On chain.** All four transactions handed out landed, and no two share an input: purchases
+    `708aa478…` and `4b6c31bd…`, opening `60f4363b…`, top-up `a408c7a2…`. Buyer and seller
+    reconciled to the lovelace across the run's eight transactions. Those count the layout before
+    it, the seller's claim, the refund, and 3 tADA sent to the buyer for the refund's collateral.
+  - **What it cost the wallet's ADA.** An `exact` payment's change keeps the wallet's tokens and
+    its leftover ADA in one output. ADA held with tokens counts neither for channels nor as
+    collateral, so after the two purchases the wallet held no ADA-only UTxO, and its refund had to
+    wait for more.
 - `npm run batchexit` on preprod (2026-09-25), the way out without the seller: three purchases,
   `walletctl close` (`95f5f833…`), then signerd restarted with its channel directory deleted;
   `walletctl recover` found the closed channel on chain with its IOU key derived again, and
