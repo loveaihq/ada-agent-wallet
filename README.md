@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.3, preprod only.** It has never run on mainnet and has had no external security
+**Status: 0.2.4, preprod only.** It has never run on mainnet and has had no external security
 review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
@@ -221,8 +221,10 @@ nothing to put up as the refund's collateral is refused as `insufficient_funds`.
 channel transaction of its own, the client waits, for up to a minute, for Blockfrost to list that
 transaction's change before it builds again.
 
-Limits: preprod only, and only with `BLOCKFROST_PROJECT_ID` — the channel client reads the chain
-through Blockfrost, and Subbit's validator is alpha software.
+Limits: preprod only, and Subbit's validator is alpha software. The channel client reads the chain
+as the `exact` signer does: through Blockfrost with `BLOCKFROST_PROJECT_ID`, and through Koios,
+which needs no key, without it. Koios' preprod index has trailed the chain by over two minutes, so
+there an opening or top-up can take a minute or more to confirm.
 
 `x402_mcp_call` pays paid MCP tools the same way, through the same proxy and on the same channels.
 A seller's HTTP routes and MCP tools share one channel when they name the same provider.
@@ -279,6 +281,18 @@ one voucher's worth.
     0.008623 per call:
     - opening `1d0cb8cc…` 0.176589, top-up `d417da2a…` 0.255711, refund `a1010bac…` 0.232545;
     - claim `b834de67…`, 0.257898.
+- `npm run mcpbatch` again, on Koios alone (2026-09-26): signerd and the seller had no Blockfrost
+  key. Only the demo's own checks used one, so they do not rest on what they check.
+  - **Every step passed**, on the same 107 calls as the run above: the opening, the fallback
+    top-up (0.674183 tADA, with the validator evaluated through Koios' Ogmios endpoint), the lost
+    answer's retry, the seller's claim, and the refund.
+  - **Reconciled to the lovelace.** Fees were 0.915222 tADA over four transactions: opening
+    `8c8e4807…`, top-up `f6302be7…`, claim `40248f9e…`, refund `afddfdf7…`.
+  - **Slower.** The opening took 52.6 s, against 17–33 s on Blockfrost. Koios' preprod index has
+    trailed the chain by over two minutes.
+  - **A fault, found by an earlier attempt, and fixed in subbit-x402.** That attempt found that the
+    seller's facilitator checked a `settlement_pending` retry again, and refused it when its
+    transaction had landed in between.
 - `npm run contention` on preprod (2026-09-26): an `exact` payment and a channel transaction never
   go out spending the same UTxO while the first is unsettled.
   - **`exact` first.** A 1.5 tADA purchase was built on the wallet's first-listed UTxO, its

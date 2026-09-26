@@ -22,7 +22,8 @@
  * Prints one JSON line once listening: {"payTo", "providerKey", "otherKey"}, for the policy.
  *
  * Env: WALLET_MNEMONIC (the public test mnemonic: this key sells, it never holds anything of the
- *      user's), BLOCKFROST_PROJECT_ID, SUBBIT_REFERENCE_SCRIPT (optional txHash#index of the
+ *      user's), BLOCKFROST_PROJECT_ID (optional: without it the seller reads the chain through
+ *      Koios, with KOIOS_TOKEN if one is set), SUBBIT_REFERENCE_SCRIPT (optional txHash#index of the
  *      deployed validator), BATCH_SELLER_OUT (where the server keeps its channel records),
  *      BATCH_SELLER_SETTLES=1 (run the watcher that settles a channel its buyer closes; off, the
  *      seller never settles, which is what dev/batchexit.ts needs)
@@ -37,10 +38,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { Address, Client, KeyHash, preprod } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH } from "subbit-x402/subbit";
 import { BlockfrostChain } from "subbit-x402/x402/chain";
+import { KoiosChain } from "subbit-x402/x402/koios";
 import { BatchSettlementCardanoFacilitator } from "subbit-x402/x402/facilitator";
 import { ChannelManager } from "subbit-x402/x402/manager";
 import { BatchSettlementCardanoServer, FileChannelStorage, walletProviderSigner } from "subbit-x402/x402/server";
-import { blockfrostBaseUrl } from "../src/network.js";
+import { blockfrostBaseUrl, koiosBaseUrl } from "../src/network.js";
 import { readBody } from "./provider.js";
 
 const NETWORK = "cardano:preprod" as const;
@@ -50,14 +52,17 @@ const OUT = process.env.BATCH_SELLER_OUT ?? "./.batch-seller";
 const REFERENCE_SCRIPT = process.env.SUBBIT_REFERENCE_SCRIPT;
 /** Moneta's preprod tUSDM, 6 decimals. */
 const TUSDM = "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d";
-if (!MNEMONIC || !PROJECT_ID) {
-  console.error("batchseller: WALLET_MNEMONIC and BLOCKFROST_PROJECT_ID are required");
+if (!MNEMONIC) {
+  console.error("batchseller: WALLET_MNEMONIC is required");
   process.exit(1);
 }
 
-const baseUrl = blockfrostBaseUrl(NETWORK);
-const chain = new BlockfrostChain(NETWORK, baseUrl, PROJECT_ID);
-const provider = Client.make(preprod).withBlockfrost({ baseUrl, projectId: PROJECT_ID }).withSeed({ mnemonic: MNEMONIC, accountIndex: 1 });
+const koios = { baseUrl: koiosBaseUrl(NETWORK), ...(process.env.KOIOS_TOKEN ? { token: process.env.KOIOS_TOKEN } : {}) };
+const chain = PROJECT_ID ? new BlockfrostChain(NETWORK, blockfrostBaseUrl(NETWORK), PROJECT_ID) : new KoiosChain(NETWORK, koios.baseUrl, koios.token);
+const provider = (PROJECT_ID ? Client.make(preprod).withBlockfrost({ baseUrl: blockfrostBaseUrl(NETWORK), projectId: PROJECT_ID }) : Client.make(preprod).withKoios(koios)).withSeed({
+  mnemonic: MNEMONIC,
+  accountIndex: 1,
+});
 const providerAddress = await provider.address();
 const payTo = Address.toBech32(providerAddress);
 const providerKey = KeyHash.toHex(providerAddress.paymentCredential as KeyHash.KeyHash);

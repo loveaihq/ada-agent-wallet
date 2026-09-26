@@ -143,9 +143,10 @@ open while an `exact` purchase held the wallet's largest ADA-only UTxO was refus
 
 ## Scope
 
-- **Preprod only.** The channel client's only chain reader is Blockfrost's, written for preprod,
-  and Subbit's validator is alpha. signerd refuses `batch-settlement` on any other network and
-  without `BLOCKFROST_PROJECT_ID`; `exact` keeps Koios as its default.
+- **Preprod only.** The channel client's chain readers, Blockfrost's and Koios', are written for
+  preprod, and Subbit's validator is alpha. signerd refuses `batch-settlement` on any other
+  network. Like `exact`, it reads through Blockfrost when `BLOCKFROST_PROJECT_ID` is set and
+  through Koios, which needs no key, when it is not.
 - **Paid MCP tools too.** `x402_mcp_call` hands `@x402/mcp` the same x402Client as `x402_fetch`.
   @x402/mcp runs the same scheme hooks: the seller's answer goes back to signerd, and a corrective
   402 is retried once. A seller's HTTP routes and MCP tools therefore share one channel and one

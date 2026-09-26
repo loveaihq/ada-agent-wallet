@@ -18,7 +18,7 @@
  *   POST /approve  {id}                -> signs the queued request, if the policy still allows it
  *   POST /deny     {id}
  *
- * batch-settlement (preprod, with BLOCKFROST_PROJECT_ID; see DESIGN-batch-settlement.md):
+ * batch-settlement (preprod, through Blockfrost or Koios; see DESIGN-batch-settlement.md):
  *   POST /batch/payload   {agentId, reason, resource?, x402Version, requirements} -> {x402Version, payload}
  *                         a voucher, or a channel opening or top-up with one; 403, 409 and the
  *                         approval queue as for /sign
@@ -88,6 +88,7 @@ import type { PaymentPayload, PaymentPayloadResult, PaymentRequired, PaymentRequ
 import { Address, Client, KeyHash, preprod } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH } from "subbit-x402/subbit";
 import { BlockfrostChain } from "subbit-x402/x402/chain";
+import { KoiosChain } from "subbit-x402/x402/koios";
 import { currencyOf, subbedOf, txHashOf, type ChannelView } from "subbit-x402/x402/cardano";
 import { channelOutputIndex, decodeTx } from "subbit-x402/x402/txcheck";
 import { parseExtra } from "subbit-x402/x402/types";
@@ -501,25 +502,22 @@ const address = signer.getAddress();
  * nothing to sign: whatever signs vouchers has to be where the policy is. The agent's process gets
  * a proxy that forwards the 402 here and the payload back.
  *
- * Preprod only, and only on Blockfrost: the client's one chain reader is Blockfrost's, written for
- * preprod, and Subbit's validator is alpha.
+ * Preprod only: the client's chain readers are written for preprod, and Subbit's validator is alpha.
+ * It reads the chain as the `exact` signer does: through Blockfrost with BLOCKFROST_PROJECT_ID, and
+ * through Koios without it.
  */
-const BATCH_UNAVAILABLE =
-  networkName(NETWORK) !== "preprod"
-    ? `batch-settlement runs on preprod only, and this wallet is on ${NETWORK}`
-    : !process.env.BLOCKFROST_PROJECT_ID
-      ? "batch-settlement needs BLOCKFROST_PROJECT_ID: the channel client reads the chain through Blockfrost"
-      : undefined;
+const BATCH_UNAVAILABLE = networkName(NETWORK) !== "preprod" ? `batch-settlement runs on preprod only, and this wallet is on ${NETWORK}` : undefined;
 const channels = BATCH_UNAVAILABLE ? undefined : await openChannels();
 
 async function openChannels() {
-  const baseUrl = blockfrostBaseUrl(NETWORK);
-  const projectId = process.env.BLOCKFROST_PROJECT_ID!;
+  const projectId = process.env.BLOCKFROST_PROJECT_ID;
+  const koios = { baseUrl: koiosBaseUrl(NETWORK), ...(process.env.KOIOS_TOKEN ? { token: process.env.KOIOS_TOKEN } : {}) };
   // The `exact` signer's key: the same mnemonic, normalised as @x402/cardano does, and account 0.
   // Two builders that disagreed on the address would each see half a wallet.
-  const wallet = Client.make(preprod)
-    .withBlockfrost({ baseUrl, projectId })
-    .withSeed({ mnemonic: mnemonic.trim().replace(/\s+/g, " ").toLowerCase(), accountIndex: 0 });
+  const wallet = (projectId ? Client.make(preprod).withBlockfrost({ baseUrl: blockfrostBaseUrl(NETWORK), projectId }) : Client.make(preprod).withKoios(koios)).withSeed({
+    mnemonic: mnemonic.trim().replace(/\s+/g, " ").toLowerCase(),
+    accountIndex: 0,
+  });
   const own = await wallet.address();
   if (Address.toBech32(own) !== address) fail(`batch-settlement: the channel wallet is ${Address.toBech32(own)}, the exact signer's ${address}`);
   mkdirSync(CHANNELS_DIR, { recursive: true, mode: 0o700 });
@@ -532,7 +530,7 @@ async function openChannels() {
     fail(`channel index ${resolvePath(index)} is unreadable: ${e instanceof Error ? e.message : e}`);
   }
   return {
-    chain: new BlockfrostChain("cardano:preprod", baseUrl, projectId),
+    chain: projectId ? new BlockfrostChain("cardano:preprod", blockfrostBaseUrl(NETWORK), projectId) : new KoiosChain("cardano:preprod", koios.baseUrl, koios.token),
     wallet,
     store,
     /** This wallet's payment key hash: every channel's consumer. */
