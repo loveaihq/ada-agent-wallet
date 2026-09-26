@@ -47,6 +47,6 @@ behaviour worth expecting**. They are accepted limitations, not findings:
 
 ## Status
 
-`0.2.1`. Verified on preprod, including real on-chain round-trips. It has never run on mainnet, and
+`0.2.2`. Verified on preprod, including real on-chain round-trips. It has never run on mainnet, and
 no part of it has had an external security review. If you are about to point it at real ADA, read
 **Before mainnet** in the README and run `npm run walletctl -- preflight` first.

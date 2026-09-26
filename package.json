@@ -1,6 +1,6 @@
 {
   "name": "ada-agent-wallet",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Out-of-process spend control for AI agents paying with x402: per-tx and rolling caps, payee allowlist, human approval, and a hash-chained audit log — enforced in a separate daemon that holds the key, not in the agent. Settles on Cardano.",
   "type": "module",
   "bin": {
