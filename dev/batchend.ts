@@ -66,8 +66,9 @@ const { transaction: closeTx, elapseAt } = JSON.parse(closed.out.trim().split("\
 log(`  closed in ${closeTx}; elapse_at ${new Date(Number(elapseAt)).toISOString()}`);
 let early = await walletctl(["elapse", channelId]);
 // The index may not show the close for a few seconds; until it does the channel reads as open.
-for (let i = 0; i < 3 && !/not_yet/.test(early.out); i++) {
-  await sleep(10_000);
+// Soon after, the seller settles it, and then it reads as settled: ask in between.
+for (let i = 0; i < 8 && /is opened, not closed/.test(early.out); i++) {
+  await sleep(3_000);
   early = await walletctl(["elapse", channelId]);
 }
 expect("elapse before elapse_at is refused as not_yet", early.code !== 0 && /not_yet/.test(early.out), early);

@@ -839,6 +839,13 @@ class BatchDenied extends AuditedError {
   }
 }
 
+/**
+ * Not a failure: the channel is between two states the chain has not finished showing — an
+ * opening or a top-up of this wallet's own, landed or landing — and the same request works once
+ * it has. Like utxo_busy, the caller is told to retry.
+ */
+class ChannelBusy extends AuditedError {}
+
 /** A voucher over approvalAbove: it is queued, and made again once a human has approved it. */
 class NeedsApproval extends Error {
   constructor(public readonly increment: bigint, public readonly payTo: string, public readonly asset: string, public readonly detail: string) {
@@ -1382,6 +1389,10 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
           });
           return { kind: "queued", id, settled };
         }
+        if (e instanceof Error && /retry shortly/.test(e.message)) {
+          audit("channel_busy", { agentId, reason, detail: e.message });
+          return { kind: "error", error: new ChannelBusy(e.message) };
+        }
         if (isShortOfFunds(e)) {
           audit("insufficient_funds", { agentId, reason, payTo: r.payTo, asset: r.asset, amount: r.amount, scheme: BATCH });
           return { kind: "error", error: new InsufficientFunds(`the wallet cannot fund a channel for ${r.amount} of ${r.asset}: ${e instanceof Error ? e.message : e}`) };
@@ -1395,6 +1406,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     if (outcome.kind === "error") {
       const e = outcome.error;
       const detail = String(e instanceof Error ? e.message : e);
+      if (e instanceof ChannelBusy) return json(res, 409, { error: "channel_busy", detail, retryable: true });
       if (e instanceof InsufficientFunds) return json(res, 409, { error: "insufficient_funds", detail, retryable: false, asset: r.asset });
       return json(res, 500, { error: "batch_failed", detail });
     }
@@ -1642,19 +1654,17 @@ async function channelRequest(method: string, path: string, body: Record<string,
       }
       case "/channels/end":
         return json(res, 200, { transaction: await run("end", () => client.end(channelId)) });
-      case "/channels/elapse": {
-        // The client waits for the chain to reach elapse_at, inside the wallet lock; that is a
-        // wait worth refusing rather than making every payment share. Read from the chain, not the
-        // record: a close whose confirmation was missed leaves the record saying open.
-        const stage = (await client.openView(channelId)).view.datum.stage;
-        if (stage.kind === "closed" && stage.elapseAt > BigInt(Date.now()))
-          return json(res, 409, { error: "not_yet", detail: `elapse_at is ${new Date(Number(stage.elapseAt)).toISOString()}` });
-        return json(res, 200, { transaction: await run("elapse", () => client.elapse(channelId)) });
-      }
+      case "/channels/elapse":
+        // Refused rather than waited out: the client would otherwise wait for the chain to reach
+        // elapse_at inside the wallet lock, and every payment with it. The client decides on the
+        // same read of the channel it builds from — a check made here, on a read of its own, raced
+        // the index right after a close and let the wait through.
+        return json(res, 200, { transaction: await run("elapse", () => client.elapse(channelId, { wait: false })) });
     }
   } catch (e) {
     const detail = String(e instanceof Error ? e.message : e);
     if (e instanceof BatchDenied) return json(res, 403, { error: "policy_denied", rule: e.rule, detail: e.detail });
+    if (/^not yet:/.test(detail)) return json(res, 409, { error: "not_yet", detail });
     if (!(e instanceof AuditedError)) audit("channel_error", { agentId: entry.agentId, channelId, step: path, error: detail });
     return json(res, e instanceof AuditedError ? 409 : 500, { error: "channel_step_failed", detail });
   }

@@ -86,7 +86,14 @@ step("2. a lost response, and the retry");
 const lost = await buy(`${SELLER}/lossy`, "batch run: a datum whose answer is lost");
 expect("the first /lossy fails in transit", Boolean(lost.error) || lost.status !== 200, lost);
 const afterLost = (await channels())[0].signed;
-const retried = await buy(`${SELLER}/lossy`, "batch run: the same datum, asked again");
+let retried = await buy(`${SELLER}/lossy`, "batch run: the same datum, asked again");
+// The lost request carried a top-up; if the chain has not finished showing it, signerd says to
+// retry (channel_busy), and an agent would.
+for (let i = 0; i < 3 && retried.rule === "channel_busy"; i++) {
+  log(`  retry answered channel_busy (${retried.error ?? ""}); asking again`);
+  await sleep(15_000);
+  retried = await buy(`${SELLER}/lossy`, "batch run: the same datum, asked again");
+}
 expect("the retry is served", retried.status === 200 && retried.paid === true, retried);
 const afterRetry = (await channels())[0].signed;
 expect("the retry signed nothing new", afterRetry === afterLost, { afterLost, afterRetry });

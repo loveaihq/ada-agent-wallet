@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.0, preprod only.** It has never run on mainnet and has had no external security
+**Status: 0.2.1, preprod only.** It has never run on mainnet and has had no external security
 review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
@@ -70,10 +70,10 @@ npm run signerd                                            # prints the address 
 The policy file declares the network it was written for, and signerd refuses to start on a mismatch.
 A plaintext mnemonic is fine for a faucet wallet; for anything else see "The key" below.
 
-Koios is enough to run signerd and every check in `dev/` except one. It is **not** enough to close a
-402 round-trip: the facilitator's verify step cannot read most UTXOs through it, for reasons that
-are not yours to fix and that the error does not explain. Set `BLOCKFROST_PROJECT_ID` before
-`npm run roundtrip` — see "Known behaviour worth expecting".
+Koios is enough for signerd, every check in `dev/` and, since `@evolution-sdk/evolution` 0.5.14, a
+whole `exact` 402 round-trip: before it, the facilitator's verify step could not read most UTXOs
+through Koios (see "Known behaviour worth expecting"). `batch-settlement` still needs
+`BLOCKFROST_PROJECT_ID`.
 
 **Where the policy, audit and ledger files live is part of the security model.** The daily cap is
 computed from `ledger.json`, rebuilt where needed by replaying `audit.jsonl`, and the limits
@@ -237,6 +237,15 @@ are under "Verified".
   `walletctl elapse` (`262b5b15…`) took everything back. The seller never settled, so it received
   nothing, and the wallet was down exactly the three fees, 0.751551 tADA; the three vouchers stay
   spent in the ledger, as any signed payment does.
+- the batch-settlement runs again on `@evolution-sdk/evolution` 0.5.14 (2026-09-25), with
+  subbit-x402 0.1.1: `npm run batch` passed with the same reconciliation to the lovelace, and
+  `npm run batchend` too. Each first found a race that 0.5.13's runs had missed by timing: a retry
+  16 s after a top-up's block built a second top-up of the output the first had spent (the client
+  now waits for the index, and the retry in the passing run came 13 s after its block); and an
+  `elapse` straight after a close was let through by a check that read the chain separately from
+  the elapse itself, which then waited out `elapse_at` inside the wallet lock (the client now
+  decides on the one read, and refuses). On Koios alone, `roundtrip deny` and `roundtrip auto`
+  passed (`3bb30455…`, 31.9 s).
 - `npm run batchend` on preprod (2026-09-25), a token channel and the seller's side of an exit:
   five purchases priced at 0.001 tUSDM opened a tUSDM channel through signerd (`6829d63d…`, 45 s,
   then 36–53 ms a voucher); `walletctl close` (`b7dbfbba…`); an `elapse` straight after was
@@ -304,8 +313,8 @@ are under "Verified".
   `signed` → `approved` in `audit.jsonl`, transaction
   `adb52eb1cdb6878fc72943894ee95477be992ccad49cd8b418bef0b4eb606285` in block 5202188, read back
   from Blockfrost: exactly 4 tADA to the seller and nothing to anyone else. The nonce it spent was
-  an output of `01b6275f8f…`, a Plutus transaction — the case Koios cannot look up until
-  evolution-sdk#544 ships, so this one is Blockfrost-only for now.
+  an output of `01b6275f8f…`, a Plutus transaction — the case Koios could not look up before
+  evolution-sdk#544, so this one ran on Blockfrost.
 - **the whole matrix on `@x402/*` 2.27.0, preprod, 2026-09-23** — 2.27.0 shipped on 2026-09-22 and
   a `^2.26.0` range floats onto it, so what someone installs today is not the build the round-trips
   had been run against. All six combinations of {`deny`, `auto`, `approve`} x {HTTP, MCP} pass on it.
@@ -464,18 +473,24 @@ Naming these is the point; none is fixed by more policy code.
   against 12.5 tADA actually delivered. The tools say so when it happens: `paid: false` with an
   `unsettled` note, and the transaction if one was broadcast, since a settlement reported failed can
   still confirm.
-- **A 402 round-trip cannot complete on Koios at all.** The facilitator's `verify` resolves each
-  input the buyer's transaction spends, and `@evolution-sdk`'s Koios provider fails that lookup for
-  almost all of them. Over one wallet's 19 UTXOs, asked three ways: the Koios provider resolved 3,
+- **Before `@evolution-sdk/evolution` 0.5.14, a 402 round-trip could not complete on Koios at
+  all.** Fixed upstream in evolution-sdk#544 (reported from here as #540), released in 0.5.14 on
+  2026-09-24, which this package now pins; the `exact` round trip passed on Koios alone the next
+  day. What it was: the facilitator's `verify` resolves each input the buyer's transaction spends,
+  and `@evolution-sdk`'s Koios provider failed that lookup for almost all of them. Over one wallet's 19 UTXOs, asked three ways: the Koios provider resolved 3,
   the Blockfrost provider resolved 19, and plain HTTP to the same Koios endpoint returned all 19.
   So the data is there and Koios is serving it; the provider cannot read it. The failures are
   deterministic, ~1.4s on an idle box, and grouped by the transaction that created the UTXO — not a
   timeout, not rate limiting, not native assets, not a UTXO that is missing or spent. All you are
   told is `Koios getUtxosByOutRef failed`, with the cause discarded. There is no steering around it
   either, because the SDK always takes `utxos[0]` as the payment nonce: if the wallet's first UTXO
-  is one it cannot read, nothing that wallet does can pay. `BLOCKFROST_PROJECT_ID` is the answer and
-  the free tier covers it. Everything short of settlement — policy, signing, the approval queue, the
-  audit — works on Koios exactly as documented.
+  is one it cannot read, nothing that wallet does can pay. The cause was the provider decoding the
+  creating transaction's whole `/tx_info` row, three fields of which Koios returns as `null`.
+- **Two batch-settlement answers mean "ask again", not "broken".** `channel_busy` (409, retryable):
+  the channel is between two states the chain has not finished showing — right after a top-up of
+  this wallet's own, Blockfrost's index can still show the channel where the top-up spent it, and
+  the client waits up to 30 s for it before saying so. `not_yet` (409): `walletctl elapse` before
+  the channel's `elapse_at`, refused rather than waited out inside the wallet lock.
 - **Koios can refuse a submit moments after confirming the transaction it chains from.** A payment
   spending the change of a just-confirmed transaction was rejected with `Koios submitTx failed`,
   and the identical payment succeeded on retry: its query view had the new UTXO before its submit
