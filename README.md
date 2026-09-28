@@ -70,9 +70,11 @@ npm run signerd                                            # prints the address 
 The policy file declares the network it was written for, and signerd refuses to start on a mismatch.
 A plaintext mnemonic is fine for a faucet wallet; for anything else see "The key" below.
 
-Koios is enough for signerd, every check in `dev/` and, since `@evolution-sdk/evolution` 0.5.14, a
-whole `exact` 402 round-trip: before it, the facilitator's verify step could not read most UTXOs
-through Koios (see "Known behaviour worth expecting"). `batch-settlement` still needs
+Koios is enough for signerd and, since `@evolution-sdk/evolution` 0.5.14, a whole `exact` 402
+round-trip: before it, the facilitator's verify step could not read most UTXOs through Koios (see
+"Known behaviour worth expecting"). signerd's `batch-settlement` runs on Koios too, since 0.2.4 on
+subbit-x402 0.1.4. The `dev/` drivers that reconcile a run against the chain (`batch`, `batchend`,
+`batchexit`, `batchsponsored`, `contention` and `mcpbatch`) read it through Blockfrost, and need
 `BLOCKFROST_PROJECT_ID`.
 
 **Where the policy, audit and ledger files live is part of the security model.** The daily cap is
@@ -232,6 +234,9 @@ others, and more:
   (subbit-x402 0.2.2): the client walks a token channel back to its opening, and one whose opening
   took none of the wallet's ADA was opened on an offer.
 - Leaving without the seller (`close`, `end`, `elapse`) still needs ADA of the wallet's own.
+
+A walkthrough, from the seller to the refund, is in
+[`docs/usdm-only-agent.md`](docs/usdm-only-agent.md) (a draft).
 
 A top-up is sized for `BATCH_DEPOSIT_REQUESTS` requests at the price that ran short. When the
 wallet cannot fund that much, it tops up what it can, keeping back the fee and such a UTxO for the

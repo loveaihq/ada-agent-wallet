@@ -19,7 +19,8 @@
  *          It must claim before a buyer can refund a channel whose owed amount is below what one
  *          Cardano output can hold: the claim pays into the seller's own wallet, a refund cannot.
  *
- * Prints one JSON line once listening: {"payTo", "providerKey", "otherKey"}, for the policy.
+ * Prints one JSON line once listening: {"payTo", "providerKey", "otherKey"}, for the policy, and
+ * "sponsorAddress" when BATCH_SELLER_SPONSOR_ACCOUNT is set.
  *
  * Env: WALLET_MNEMONIC (the public test mnemonic: this key sells, it never holds anything of the
  *      user's), BLOCKFROST_PROJECT_ID (optional: without it the seller reads the chain through
