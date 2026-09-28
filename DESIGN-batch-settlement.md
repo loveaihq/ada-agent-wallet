@@ -119,8 +119,9 @@ its transaction out:
     the fee may not come to more than the offer and the channel bring, so none of it is this
     wallet's ADA.
   - A refund may also spend UTxOs the chain shows at this wallet's key: the refunded tokens come
-    home to one of them. It pays the channel's ADA to the seller only when signerd recorded, at the
-    opening, that the seller's offer paid the reserve.
+    home to one of them. It pays the channel's ADA to the seller only when signerd recorded that
+    the seller's offer paid the reserve: at the opening, or at `recover`, from the opening as the
+    chain shows it.
 
 ## One wallet, two builders
 

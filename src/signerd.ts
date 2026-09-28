@@ -87,7 +87,7 @@ import { toClientCardanoSigner, decodeCardanoTransaction, type ClientCardanoSign
 import type { PaymentPayload, PaymentPayloadResult, PaymentRequired, PaymentRequirements, SettleResponse } from "@x402/core/types";
 import { Address, Client, KeyHash, preprod } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH } from "subbit-x402/subbit";
-import { BlockfrostChain } from "subbit-x402/x402/chain";
+import { BlockfrostChain, causeChain } from "subbit-x402/x402/chain";
 import { KoiosChain } from "subbit-x402/x402/koios";
 import { currencyOf, subbedOf, txHashOf, type ChannelView } from "subbit-x402/x402/cardano";
 import { channelOutputIndex, decodeTx, sortedInputRefs } from "subbit-x402/x402/txcheck";
@@ -1477,7 +1477,8 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
           audit("insufficient_funds", { agentId, reason, payTo: r.payTo, asset: r.asset, amount: r.amount, scheme: BATCH });
           return { kind: "error", error: new InsufficientFunds(`the wallet cannot fund a channel for ${r.amount} of ${r.asset}: ${e instanceof Error ? e.message : e}`) };
         }
-        if (!(e instanceof AuditedError)) audit("batch_error", { agentId, reason, error: String(e) });
+        // The SDK's message leaves out what failed underneath it; the chain of causes says.
+        if (!(e instanceof AuditedError)) audit("batch_error", { agentId, reason, error: String(e), causes: causeChain(e).slice(0, 6) });
         return { kind: "error", error: e };
       }
     });
@@ -1687,6 +1688,8 @@ async function channelRequest(method: string, path: string, body: Record<string,
           anchor: view.ref,
           deposit: "0",
           reserve: "0",
+          // The client read the opening from the chain: a reserve the seller's offer paid is the seller's.
+          ...(r.reserveFrom === "seller" ? { reserveFrom: "seller" as const } : {}),
           status: "open",
           openedAt: r.openedAt || Date.now(),
         });

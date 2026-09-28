@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.5, preprod only.** It has never run on mainnet and has had no external security
+**Status: 0.2.6, preprod only.** It has never run on mainnet and has had no external security
 review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
@@ -228,8 +228,9 @@ others, and more:
 - The reserve is the seller's. The policy does not count it, so a sponsored token channel needs no
   lovelace entry in `channelDepositMax` or `channelLockedMax`, and the refund pays the reserve back
   to the seller. signerd records the channel as `reserveFrom: "seller"`, and pays a reserve to the
-  seller only on a channel it saw opened that way. A channel found again with `recover` does not
-  carry this, and is refunded as an unsponsored one.
+  seller only on a channel recorded that way. `recover` finds it out again from the chain
+  (subbit-x402 0.2.2): the client walks a token channel back to its opening, and one whose opening
+  took none of the wallet's ADA was opened on an offer.
 - Leaving without the seller (`close`, `end`, `elapse`) still needs ADA of the wallet's own.
 
 A top-up is sized for `BATCH_DEPOSIT_REQUESTS` requests at the price that ran short. When the
