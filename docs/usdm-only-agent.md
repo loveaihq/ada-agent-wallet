@@ -69,9 +69,9 @@ through a facilitator that says so.
 npm i -g ada-agent-wallet
 ```
 
-Give it a wallet that holds tUSDM and nothing else: one UTxO of tUSDM and the min-ada it came
-with, about 1.18 tADA, and no ADA-only UTxO. Any 24-word preprod mnemonic will do. Keep it in a
-file readable only by the user signerd runs as; for anything beyond a faucet wallet, use
+The wallet should hold tUSDM and nothing else: one UTxO of tUSDM and the min-ada it came with,
+about 1.18 tADA, and no ADA-only UTxO. A new 24-word mnemonic will do; it is funded below. Keep it
+in a file readable only by the user signerd runs as; for anything beyond a faucet wallet, use
 `ada-keystore` (see the README, "The key").
 
 The policy allows `batch-settlement` in tUSDM, names the seller's provider key, and caps what one
@@ -107,6 +107,11 @@ WALLET_MNEMONIC_FILE=~/.ada-agent-wallet/mnemonic POLICY_FILE=./policy.json \
 
 signerd stays in the foreground. Run `ada-walletctl` from another shell, with the same
 `SIGNERD_TOKEN` exported.
+
+signerd prints the wallet's address as it starts, and `ada-walletctl status` shows it too. To fund
+a new wallet, claim tUSDM on Moneta's testnet airdrop page, tusdm.moneta.global, to a wallet of
+your own; for subbit-x402's step 10 it sent 1,000 tUSDM and 5 tADA. Then send 1 tUSDM on to the
+agent's address. Most wallet apps attach just the min-ada to a token they send.
 
 ## 3. The agent
 
