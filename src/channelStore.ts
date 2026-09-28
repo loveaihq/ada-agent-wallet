@@ -30,6 +30,12 @@ export interface ChannelEntry {
   deposit: string;
   /** A token channel's ADA reserve, likewise. */
   reserve: string;
+  /**
+   * `seller`: the seller's fee-sponsor offer paid this token channel's reserve (subbit-x402's
+   * SPONSORSHIP.md). It is not this wallet's: the policy does not count it, and the refund pays it
+   * back to the seller.
+   */
+  reserveFrom?: "seller";
   status: "open" | "closed";
   openedAt: number;
 }
@@ -51,6 +57,7 @@ function readEntry(id: string, e: unknown): ChannelEntry {
     if (typeof r[k] !== "string") throw bad(`${k} is not a string`);
   for (const k of ["signedMax", "deposit", "reserve"] as const) if (typeof r[k] !== "string" || !DEC.test(r[k] as string)) throw bad(`${k} is not a decimal amount`);
   if (typeof r.anchor !== "string" || !REF.test(r.anchor)) throw bad("anchor is not an out-ref");
+  if (r.reserveFrom !== undefined && r.reserveFrom !== "seller") throw bad("reserveFrom is neither absent nor seller");
   if (r.status !== "open" && r.status !== "closed") throw bad("status is neither open nor closed");
   if (typeof r.openedAt !== "number") throw bad("openedAt is not a number");
   return r as unknown as ChannelEntry;

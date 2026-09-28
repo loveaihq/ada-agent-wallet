@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.4, preprod only.** It has never run on mainnet and has had no external security
+**Status: 0.2.5, preprod only.** It has never run on mainnet and has had no external security
 review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
@@ -212,7 +212,25 @@ lock, so payments pause while one lands.
 
 Every channel transaction but the opening puts up collateral from an ADA-only UTxO and keeps about
 1 ADA of it back as change. So the wallet needs one ADA-only UTxO of at least about 2 ADA, and ADA
-sitting in a UTxO with tokens does not count.
+sitting in a UTxO with tokens does not count. A sponsored channel is the exception (below).
+
+**Sponsored channels (subbit-x402 0.2.1).** A seller may pay for a token channel. Its 402 then
+carries a fee-sponsor offer, one of the seller's ADA-only UTxOs. The channel client opens, tops up
+and refunds on that offer, so a wallet that holds only a stablecoin can pay (subbit-x402's
+SPONSORSHIP.md). The seller's ADA pays the fees, the channel's reserve and the collateral. The
+wallet's own ADA only passes through. signerd checks a sponsored transaction as it checks the
+others, and more:
+- signerd reads the offer from the chain itself. A step whose offer is not, on chain, an ADA-only
+  UTxO at the offer's address with the offer's lovelace, and not this wallet's, is refused
+  (`sponsor_offer`).
+- What the channel keeps, what the seller gets and the fee must all come out of the offer and the
+  channel. So this wallet's ADA comes back to it in full, and the offer is the only collateral.
+- The reserve is the seller's. The policy does not count it, so a sponsored token channel needs no
+  lovelace entry in `channelDepositMax` or `channelLockedMax`, and the refund pays the reserve back
+  to the seller. signerd records the channel as `reserveFrom: "seller"`, and pays a reserve to the
+  seller only on a channel it saw opened that way. A channel found again with `recover` does not
+  carry this, and is refunded as an unsponsored one.
+- Leaving without the seller (`close`, `end`, `elapse`) still needs ADA of the wallet's own.
 
 A top-up is sized for `BATCH_DEPOSIT_REQUESTS` requests at the price that ran short. When the
 wallet cannot fund that much, it tops up what it can, keeping back the fee and such a UTxO for the
@@ -237,13 +255,13 @@ structured content with its JSON as that block. A retry after any other result i
 one voucher's worth.
 
 `npm run batchseller` is the preprod seller, with its MCP tools on :7414. `npm run batch`,
-`batchexit`, `batchend` and `mcpbatch` are the round trips against it; the results are under
-"Verified".
+`batchexit`, `batchend`, `mcpbatch` and `batchsponsored` are the round trips against it; the
+results are under "Verified".
 
 ## Verified
-- `npm test`: 101 unit tests over the policy engine, the startup replay, the locks, the keystore,
-  the network table, the signed-transaction and channel-transaction checks, the channel index, the
-  batch-settlement proxy and the settlement receipt. None needs a chain. `npm run typecheck` covers
+- `npm test`: 106 unit tests over the policy engine, the startup replay, the locks, the keystore,
+  the network table, the signed-transaction and channel-transaction checks (sponsored steps
+  included), the channel index, the batch-settlement proxy and the settlement receipt. None needs a chain. `npm run typecheck` covers
   `dev/` and `test/` too, which `tsx` runs without checking.
 - `npm run batch` on preprod (2026-09-25), a real MCP client paying `dev/batchseller.ts` through
   `x402_fetch`, 0.1 tADA a request: the first purchase opened a channel in 38 s (deposit 2.732620
@@ -311,6 +329,24 @@ one voucher's worth.
     its leftover ADA in one output. ADA held with tokens counts neither for channels nor as
     collateral, so after the two purchases the wallet held no ADA-only UTxO, and its refund had to
     wait for more.
+- `npm run batchsponsored` on preprod (2026-09-28, subbit-x402 0.2.1): a token channel the seller
+  paid for, through signerd, from a wallet holding only tUSDM and the 1.176630 tADA that came with
+  it. The seller ran `dev/batchseller.ts` with `BATCH_SELLER_SPONSOR_ACCOUNT=9`. The run made 25
+  purchases at 0.001 tUSDM, with `BATCH_DEPOSIT_REQUESTS=10` and a policy with no lovelace entry
+  at all.
+  - The opening `8c4f3373…` (fee 0.190097) and the top-ups `440e17e5…` and `951dc64d…` (0.266094
+    each) each used another of the seller's offers, named in the audit as `sponsoredBy`. signerd
+    recorded the channel as `reserveFrom: "seller"`.
+  - The seller claimed (`4dc5c0eb…`, 0.268721). Then `walletctl refund` (`6053f5a2…`, 0.244491) put
+    up the seller's offer as its collateral, and did not spend it.
+  - Reconciled on chain across the five: the wallet's ADA did not move, to the lovelace, and its
+    tUSDM went down exactly the 0.025 the vouchers signed. The seller, across `payTo` and its
+    sponsor key, got +0.025 tUSDM and paid −1.235497 tADA, the five fees exactly, so its reserve
+    came back.
+  - The first attempt stopped at the second top-up. Two seconds after the first top-up's block,
+    the SDK's script evaluation through Blockfrost failed ("Blockfrost evaluateTx failed"), and
+    the agent got `batch_failed`, with nothing signed or sent. Resumed 22 minutes later on the same
+    channel, that top-up passed. Why it failed is not established.
 - `npm run batchexit` on preprod (2026-09-25), the way out without the seller: three purchases,
   `walletctl close` (`95f5f833…`), then signerd restarted with its channel directory deleted;
   `walletctl recover` found the closed channel on chain with its IOU key derived again, and

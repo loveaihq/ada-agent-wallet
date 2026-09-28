@@ -67,7 +67,8 @@ export interface AgentPolicy {
   channelDepositMax?: AmountMap;
   /**
    * Per asset: the most this agent's open channels may hold together. A token channel's ADA
-   * reserve counts as lovelace, so token channels need a lovelace entry here too.
+   * reserve counts as lovelace, so token channels need a lovelace entry here too, unless the
+   * seller's fee-sponsor offer paid the reserve: it is then the seller's, and counts for nothing.
    */
   channelLockedMax?: AmountMap;
   /**

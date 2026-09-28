@@ -90,7 +90,8 @@ New per-agent fields, all optional; `batch-settlement` is off until listed:
 | `maxVouchersPerHour` | vouchers in any rolling hour; `maxPerHour` keeps counting transactions | 600 |
 
 - The seller sets the close period, anywhere from 900 s to 30 days under the binding.
-- A token channel's ADA reserve counts as locked ADA.
+- A token channel's ADA reserve counts as locked ADA, unless the seller's fee-sponsor offer paid
+  it: on a sponsored channel it is the seller's (subbit-x402 0.2.1, SPONSORSHIP.md).
 - `MAX_HOT_BALANCE_LOVELACE` counts what the channels hold too: a stolen key gets that back as
   well, only later.
 
@@ -110,6 +111,16 @@ its transaction out:
 - **Close:** the channel put back unchanged but for its stage. **End, elapse:** the channel's funds
   to this wallet.
 - In all of them, a fee of at most 2 ADA and collateral of at most 5 ADA.
+- **Sponsored opening, top-up, refund:**
+  - signerd reads the seller's offer from the chain itself, and refuses one that is not there as
+    offered, or is this wallet's own.
+  - An opening and a top-up spend the offer; a refund puts it up as its only collateral.
+  - The seller's `payTo` may be paid ADA, no tokens. What the channel keeps, what `payTo` gets and
+    the fee may not come to more than the offer and the channel bring, so none of it is this
+    wallet's ADA.
+  - A refund may also spend UTxOs the chain shows at this wallet's key: the refunded tokens come
+    home to one of them. It pays the channel's ADA to the seller only when signerd recorded, at the
+    opening, that the seller's offer paid the reserve.
 
 ## One wallet, two builders
 

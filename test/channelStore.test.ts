@@ -30,6 +30,13 @@ test("what was signed on a channel survives a restart", () => {
   if (process.platform !== "win32") assert.equal(statSync(file).mode & 0o777, 0o600);
 });
 
+test("a channel whose reserve the seller's offer paid says so after a restart", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "channels-")), "index.json");
+  const sponsored: ChannelEntry = { ...entry, asset: "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d", reserveFrom: "seller" };
+  new ChannelStore(file).set(ID, sponsored);
+  assert.equal(new ChannelStore(file).get(ID)!.reserveFrom, "seller");
+});
+
 test("a malformed entry is refused, and nothing is written", () => {
   const file = join(mkdtempSync(join(tmpdir(), "channels-")), "index.json");
   const store = new ChannelStore(file);
@@ -38,6 +45,7 @@ test("a malformed entry is refused, and nothing is written", () => {
   assert.throws(() => store.set(ID, { ...entry, signedMax: "5e3" }), /signedMax is not a decimal amount/);
   assert.throws(() => store.set(ID, { ...entry, anchor: "somewhere" }), /anchor is not an out-ref/);
   assert.throws(() => store.set("not-a-tag", entry), /32-byte tag/);
+  assert.throws(() => store.set(ID, { ...entry, reserveFrom: "buyer" as "seller" }), /reserveFrom is neither absent nor seller/);
   assert.equal(readFileSync(file, "utf8"), before);
   assert.equal(store.get(ID)!.signedMax, "5000");
 });

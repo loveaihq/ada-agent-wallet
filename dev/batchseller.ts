@@ -26,7 +26,9 @@
  *      Koios, with KOIOS_TOKEN if one is set), SUBBIT_REFERENCE_SCRIPT (optional txHash#index of the
  *      deployed validator), BATCH_SELLER_OUT (where the server keeps its channel records),
  *      BATCH_SELLER_SETTLES=1 (run the watcher that settles a channel its buyer closes; off, the
- *      seller never settles, which is what dev/batchexit.ts needs)
+ *      seller never settles, which is what dev/batchexit.ts needs), BATCH_SELLER_SPONSOR_ACCOUNT
+ *      (an account of the mnemonic, not 1, whose ADA-only UTxOs the seller offers to pay a token
+ *      channel's fees and reserve with: subbit-x402's SPONSORSHIP.md, for dev/batchsponsored.ts)
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -42,6 +44,7 @@ import { KoiosChain } from "subbit-x402/x402/koios";
 import { BatchSettlementCardanoFacilitator } from "subbit-x402/x402/facilitator";
 import { ChannelManager } from "subbit-x402/x402/manager";
 import { BatchSettlementCardanoServer, FileChannelStorage, walletProviderSigner } from "subbit-x402/x402/server";
+import { SponsorPool } from "subbit-x402/x402/sponsor";
 import { blockfrostBaseUrl, koiosBaseUrl } from "../src/network.js";
 import { readBody } from "./provider.js";
 
@@ -59,10 +62,16 @@ if (!MNEMONIC) {
 
 const koios = { baseUrl: koiosBaseUrl(NETWORK), ...(process.env.KOIOS_TOKEN ? { token: process.env.KOIOS_TOKEN } : {}) };
 const chain = PROJECT_ID ? new BlockfrostChain(NETWORK, blockfrostBaseUrl(NETWORK), PROJECT_ID) : new KoiosChain(NETWORK, koios.baseUrl, koios.token);
-const provider = (PROJECT_ID ? Client.make(preprod).withBlockfrost({ baseUrl: blockfrostBaseUrl(NETWORK), projectId: PROJECT_ID }) : Client.make(preprod).withKoios(koios)).withSeed({
-  mnemonic: MNEMONIC,
-  accountIndex: 1,
-});
+const seed = (accountIndex: number) =>
+  (PROJECT_ID ? Client.make(preprod).withBlockfrost({ baseUrl: blockfrostBaseUrl(NETWORK), projectId: PROJECT_ID }) : Client.make(preprod).withKoios(koios)).withSeed({ mnemonic: MNEMONIC!, accountIndex });
+const provider = seed(1);
+const SPONSOR_ACCOUNT = process.env.BATCH_SELLER_SPONSOR_ACCOUNT;
+if (SPONSOR_ACCOUNT !== undefined && !/^(0|[2-9]|[1-9][0-9]+)$/.test(SPONSOR_ACCOUNT)) {
+  console.error("batchseller: BATCH_SELLER_SPONSOR_ACCOUNT must be an account index other than 1, the provider's");
+  process.exit(1);
+}
+const sponsorWallet = SPONSOR_ACCOUNT !== undefined ? seed(Number(SPONSOR_ACCOUNT)) : undefined;
+const sponsor = sponsorWallet ? { pool: new SponsorPool({ wallet: sponsorWallet }), log: (l: string) => log(`sponsor: ${l}`) } : undefined;
 const providerAddress = await provider.address();
 const payTo = Address.toBech32(providerAddress);
 const providerKey = KeyHash.toHex(providerAddress.paymentCredential as KeyHash.KeyHash);
@@ -99,6 +108,8 @@ const shop = (receiverAuthorizer: string, storage: FileChannelStorage, signs: bo
         },
     chain,
     assetDecimals: { [TUSDM]: 6 },
+    // Only the seller that holds its provider key pays for its buyers' channels.
+    ...(sponsor && signs ? { sponsor } : {}),
   });
 
 const mainStorage = new FileChannelStorage(`${OUT}/main`);
@@ -232,8 +243,9 @@ if (process.env.BATCH_SELLER_SETTLES === "1") {
   });
   log("watcher on: channels their buyers close are settled");
 }
-console.log(JSON.stringify({ payTo, providerKey, otherKey }));
+console.log(JSON.stringify({ payTo, providerKey, otherKey, ...(sponsorWallet ? { sponsorAddress: Address.toBech32(await sponsorWallet.address()) } : {}) }));
 log(`selling on 7411 and 7412, MCP tools on 7414, facilitator on 7413, claims on 7415; provider ${payTo}`);
+if (sponsorWallet) log(`paying for token channels from account ${SPONSOR_ACCOUNT}'s ADA-only UTxOs`);
 
 function listen(port: number, handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>): Promise<Server> {
   const srv = createServer((req, res) =>

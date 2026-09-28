@@ -90,7 +90,8 @@ import { SUBBIT_HASH } from "subbit-x402/subbit";
 import { BlockfrostChain } from "subbit-x402/x402/chain";
 import { KoiosChain } from "subbit-x402/x402/koios";
 import { currencyOf, subbedOf, txHashOf, type ChannelView } from "subbit-x402/x402/cardano";
-import { channelOutputIndex, decodeTx } from "subbit-x402/x402/txcheck";
+import { channelOutputIndex, decodeTx, sortedInputRefs } from "subbit-x402/x402/txcheck";
+import { offerIn, offerOnChainProblem, offerProblem, type FeeSponsorOffer } from "subbit-x402/x402/sponsor";
 import { parseExtra } from "subbit-x402/x402/types";
 import {
   BatchSettlementCardanoClient,
@@ -104,7 +105,7 @@ import {
 } from "subbit-x402/x402/client";
 import { BATCH, decide, decideDeposit, parsePolicy, remaining, type Decision, type Policy, type SpendRecord } from "./policy.js";
 import { ChannelStore, type ChannelEntry } from "./channelStore.js";
-import { stepProblem, summarize, summaryProblem, type ChannelStep } from "./channelTx.js";
+import { stepProblem, summarize, summaryProblem, type ChannelStep, type Expected } from "./channelTx.js";
 import { createKeyedLock, createLock } from "./serialize.js";
 import { replayAudit, sha256, type Checkpoint } from "./replay.js";
 import { mismatch } from "./verifyTx.js";
@@ -934,9 +935,12 @@ async function authorizeChannel(agentId: string, a: Authorization): Promise<void
         k.withdrawDelay !== extra.withdrawDelay
       )
         throw refuse(call, agentId, "channel_terms", "the opening does not name this wallet, its own IOU key, and the 402's seller and terms");
-      checkChannelTx(agentId, "open", a.transaction, { channel: ch, amount: a.deposit }, await c.chain.coinsPerUtxoByte());
+      const sponsor = a.sponsored ? await sponsorOffer(call, agentId, req) : undefined;
+      checkChannelTx(agentId, "open", a.transaction, { channel: ch, amount: a.deposit }, await c.chain.coinsPerUtxoByte(), sponsor ? { payTo: req.payTo, sponsor } : undefined);
       const token = currencyOf(req.asset).kind !== "ada";
-      await depositAllowed(call, agentId, req.asset, a.deposit, token ? a.reserve : 0n, extra.withdrawDelay);
+      // A sponsored opening's reserve is the seller's: checkChannelTx saw the offer pay for it.
+      const reserve = token && !sponsor ? a.reserve : 0n;
+      await depositAllowed(call, agentId, req.asset, a.deposit, reserve, extra.withdrawDelay);
       const opened: ChannelEntry = {
         agentId,
         network: req.network,
@@ -947,18 +951,20 @@ async function authorizeChannel(agentId: string, a: Authorization): Promise<void
         signedMax: "0",
         anchor: `${txHashOf(a.transaction)}#${channelOutputIndex(decodeTx(a.transaction, "open"), extra.scriptHash)}`,
         deposit: a.deposit.toString(),
-        reserve: token ? a.reserve.toString() : "0",
+        reserve: reserve.toString(),
+        ...(sponsor ? { reserveFrom: "seller" as const } : {}),
         status: "open",
         openedAt: Date.now(),
       };
-      return commitVoucher(agentId, call, ch, a.amount, req, opened, { event: "channel_opened", deposit: a.deposit, transaction: a.transaction });
+      return commitVoucher(agentId, call, ch, a.amount, req, opened, { event: "channel_opened", deposit: a.deposit, transaction: a.transaction, ...(sponsor ? { sponsoredBy: sponsor.input } : {}) });
     }
 
     case "topUp": {
       if (!entry) throw unknown();
-      checkChannelTx(agentId, "topUp", a.transaction, { channel: ch, view: a.view, amount: a.deposit }, await c.chain.coinsPerUtxoByte());
+      const sponsor = a.sponsored ? await sponsorOffer(call, agentId, a.requirements) : undefined;
+      checkChannelTx(agentId, "topUp", a.transaction, { channel: ch, view: a.view, amount: a.deposit }, await c.chain.coinsPerUtxoByte(), sponsor ? { payTo: a.requirements.payTo, sponsor, channelLovelace: a.view.lovelace } : undefined);
       await depositAllowed(call, agentId, a.requirements.asset, a.deposit, 0n, parseExtra(a.requirements).withdrawDelay);
-      return commitVoucher(agentId, call, ch, a.amount, a.requirements, entry, { event: "channel_topped_up", deposit: a.deposit, transaction: a.transaction });
+      return commitVoucher(agentId, call, ch, a.amount, a.requirements, entry, { event: "channel_topped_up", deposit: a.deposit, transaction: a.transaction, ...(sponsor ? { sponsoredBy: sponsor.input } : {}) });
     }
 
     case "refund": {
@@ -969,8 +975,19 @@ async function authorizeChannel(agentId: string, a: Authorization): Promise<void
       const signed = BigInt(entry.signedMax);
       if (a.amount > signed) throw refuse(call, agentId, "refund_above_signed", `the refund would sign for ${a.amount}, above the ${signed} signed so far`);
       const redeemed = subbedOf(a.view.datum.stage);
-      checkChannelTx(agentId, "refund", a.transaction, { channel: ch, view: a.view }, 0n, { payTo: a.requirements.payTo, maxPayout: signed > redeemed ? signed - redeemed : 0n });
-      audit("refund_signed", { agentId, channelId: ch.channelId, payout: a.payout.toString(), transaction: txHashOf(a.transaction) });
+      // Sponsored: the seller's offer is the collateral, and the channel's ADA goes back to the
+      // seller. Only for a channel whose reserve signerd itself saw the seller's offer pay.
+      const sponsor = a.sponsored ? await sponsorOffer(call, agentId, a.requirements) : undefined;
+      if (sponsor && entry.reserveFrom !== "seller") {
+        throw refuse(call, agentId, "refund_reserve", `a sponsored refund pays the channel's ADA to the seller, and channel ${short(ch.channelId)}'s reserve is this wallet's`);
+      }
+      const ownInputs = sponsor ? await ownInputsOf(a.transaction, a.view.ref) : undefined;
+      checkChannelTx(agentId, "refund", a.transaction, { channel: ch, view: a.view, ...(ownInputs ? { ownInputs } : {}) }, 0n, {
+        payTo: a.requirements.payTo,
+        maxPayout: signed > redeemed ? signed - redeemed : 0n,
+        ...(sponsor ? { sponsor, channelLovelace: a.view.lovelace } : {}),
+      });
+      audit("refund_signed", { agentId, channelId: ch.channelId, payout: a.payout.toString(), transaction: txHashOf(a.transaction), ...(sponsor ? { sponsoredBy: sponsor.input } : {}) });
       return;
     }
 
@@ -983,13 +1000,20 @@ async function authorizeChannel(agentId: string, a: Authorization): Promise<void
   }
 }
 
-function checkChannelTx(agentId: string, step: ChannelStep, hex: string, on: { channel: ClientChannel; view?: ChannelView; amount?: bigint }, coinsPerUtxoByte: bigint, refund?: { payTo: string; maxPayout: bigint }) {
+function checkChannelTx(
+  agentId: string,
+  step: ChannelStep,
+  hex: string,
+  on: { channel: ClientChannel; view?: ChannelView; amount?: bigint; ownInputs?: ReadonlySet<string> },
+  coinsPerUtxoByte: bigint,
+  want?: Omit<Expected, "wallet">,
+) {
   const c = channels!;
   let wrong: string | undefined;
   try {
     wrong =
       stepProblem(step, hex, { network: on.channel.network ?? "cardano:preprod", scriptHash: SUBBIT_HASH, consumer: c.consumer, coinsPerUtxoByte }, on) ??
-      summaryProblem(step, summarize(decodeTx(hex, step), SUBBIT_HASH), { wallet: address, ...(refund ?? {}) });
+      summaryProblem(step, summarize(decodeTx(hex, step), SUBBIT_HASH), { wallet: address, ...(want ?? {}) });
   } catch (e) {
     wrong = `it could not be read: ${e instanceof Error ? e.message : e}`;
   }
@@ -1002,6 +1026,38 @@ function checkChannelTx(agentId: string, step: ChannelStep, hex: string, on: { c
 async function depositAllowed(call: BatchCall, agentId: string, asset: string, amount: bigint, reserveLovelace: bigint, withdrawDelay: number) {
   const d = decideDeposit(policy, { agentId, asset, amount, reserveLovelace, locked: await lockedBy(agentId), withdrawDelay });
   if (d.verdict !== "allow") throw refuse(call, agentId, d.rule, d.detail, { asset, deposit: amount.toString() });
+}
+
+/**
+ * The fee-sponsor offer a sponsored step spends or puts up, read from the chain here rather than
+ * taken from the client. The offer's address never enters the transaction, so an offer naming one
+ * of this wallet's own UTxOs would have this wallet's signature pay that UTxO's ADA to the seller.
+ */
+async function sponsorOffer(call: BatchCall, agentId: string, req: PaymentRequirements): Promise<{ input: string; lovelace: bigint }> {
+  const c = channels!;
+  let offer: FeeSponsorOffer | undefined;
+  try {
+    offer = offerIn(req.extra);
+  } catch (e) {
+    throw refuse(call, agentId, "sponsor_offer", `the 402's fee-sponsor offer: ${e instanceof Error ? e.message : e}`);
+  }
+  if (!offer) throw refuse(call, agentId, "sponsor_offer", "a sponsored step, and its 402 makes no fee-sponsor offer");
+  if (currencyOf(req.asset).kind === "ada") throw refuse(call, agentId, "sponsor_offer", "only token channels are sponsored");
+  const wrong = offerProblem(offer, req.network, Date.now(), 0) ?? offerOnChainProblem(offer, await c.chain.getUnspent(offer.input), c.consumer);
+  if (wrong) throw refuse(call, agentId, "sponsor_offer", wrong, { offer: offer.input });
+  return { input: offer.input, lovelace: BigInt(offer.lovelace) };
+}
+
+/** A transaction's inputs besides `channelRef` that the chain shows at this wallet's key. */
+async function ownInputsOf(hex: string, channelRef: string): Promise<Set<string>> {
+  const c = channels!;
+  const own = new Set<string>();
+  for (const ref of sortedInputRefs(decodeTx(hex, "refund"))) {
+    if (ref === channelRef) continue;
+    const pay = (await c.chain.getUnspent(ref))?.address.paymentCredential;
+    if (pay instanceof KeyHash.KeyHash && KeyHash.toHex(pay) === c.consumer) own.add(ref);
+  }
+  return own;
 }
 
 /** Lovelace the channels held when last read, per agent, for the hot-balance check. */
@@ -1023,7 +1079,8 @@ async function lockedBy(agentId: string): Promise<Record<string, bigint>> {
     const view = await c.chain.followChannel(e.anchor, e.scriptHash, id);
     if (view) {
       add(e.asset, view.amount);
-      if (view.datum.constants.currency.kind !== "ada") add("lovelace", view.lovelace);
+      // A token channel's ADA is its reserve, which on a sponsored channel is the seller's.
+      if (view.datum.constants.currency.kind !== "ada" && e.reserveFrom !== "seller") add("lovelace", view.lovelace);
       if (view.ref !== e.anchor) c.store.set(id, { ...e, anchor: view.ref });
     } else if ((await c.chain.spentBy(e.anchor)) === undefined) {
       // Not on chain yet, or never to be: the client gives an opening up only once one of its
@@ -1054,7 +1111,7 @@ function commitVoucher(
   cumulative: bigint,
   req: PaymentRequirements,
   entry: ChannelEntry,
-  step?: { event: string; deposit: bigint; transaction: string },
+  step?: { event: string; deposit: bigint; transaction: string; sponsoredBy?: string },
 ) {
   if (call.operator) throw new Error("the operator does not pay");
   const signed = BigInt(entry.signedMax);
@@ -1083,7 +1140,16 @@ function commitVoucher(
   ledger.push({ ts: Date.now(), agentId, asset: req.asset, amount: increment, voucher: true });
   pruneLedger();
   if (step)
-    audit(step.event, { agentId, channelId: ch.channelId, payTo: req.payTo, providerKey, asset: req.asset, deposit: step.deposit.toString(), transaction: txHashOf(step.transaction) });
+    audit(step.event, {
+      agentId,
+      channelId: ch.channelId,
+      payTo: req.payTo,
+      providerKey,
+      asset: req.asset,
+      deposit: step.deposit.toString(),
+      transaction: txHashOf(step.transaction),
+      ...(step.sponsoredBy ? { sponsoredBy: step.sponsoredBy } : {}),
+    });
   audit("voucher_signed", {
     agentId,
     reason: call.reason,
@@ -1126,6 +1192,7 @@ async function channelList(only?: string) {
       asset: e.asset,
       signed: e.signedMax,
       status: e.status,
+      ...(e.reserveFrom ? { reserveFrom: e.reserveFrom } : {}),
       ...(rec
         ? { client: { status: rec.status, charged: rec.chargedCumulativeAmount, capacity: rec.balance, deposited: rec.deposit, ...(rec.elapseAt ? { elapseAt: rec.elapseAt } : {}) } }
         : {}),
