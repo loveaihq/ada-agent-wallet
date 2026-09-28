@@ -482,17 +482,18 @@ results are under "Verified".
 - the spend cap holds under concurrency: four simultaneous requests against a cap that fits one
   produce one `signed` and three `daily_max` denials. Before the agent lock the same probe signed
   every one of them, on one shared nonce.
-- what the registry serves is what was built: `ada-agent-wallet@0.2.5` on npm is byte for byte the
-  tarball checked before publishing (20 files, shasum `43b7f48d…`, the one `npm publish` printed).
-  Installed from the registry into an empty directory, it brings `subbit-x402@0.2.1` and one copy
+- what the registry serves is what was built: `ada-agent-wallet@0.2.6` on npm is byte for byte the
+  tarball checked before publishing (20 files, shasum `44bfa586…`, the one `npm publish` printed).
+  Installed from the registry into an empty directory, it brings `subbit-x402@0.2.2` and one copy
   of the SDK (0.5.14), and no `typescript` or `tsx`, because both packages ship prebuilt.
   - `ada-walletctl` and `ada-keystore` print their usage.
   - `ada-wallet-mcp` gets as far as its own "signerd is not answering" check.
   - `ada-signerd` comes up on preprod with batch-settlement available, both with a Blockfrost key
     and without one, on Koios.
 
-  Earlier releases were checked the same way: 0.2.4 (`87f7ffb1…`), 0.2.3 (`dde3cc15…`), 0.2.2
-  (`b27996d7…`), 0.2.1 (`e11f0510…`), 0.2.0 (`6edfe7ba…`) and 0.1.0 (17 files, `a6c269ca…`).
+  Earlier releases were checked the same way: 0.2.5 (`43b7f48d…`), 0.2.4 (`87f7ffb1…`), 0.2.3
+  (`dde3cc15…`), 0.2.2 (`b27996d7…`), 0.2.1 (`e11f0510…`), 0.2.0 (`6edfe7ba…`) and 0.1.0 (17
+  files, `a6c269ca…`).
 
 ## Before mainnet
 ```
