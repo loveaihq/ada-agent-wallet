@@ -348,6 +348,15 @@ results are under "Verified".
     the SDK's script evaluation through Blockfrost failed ("Blockfrost evaluateTx failed"), and
     the agent got `batch_failed`, with nothing signed or sent. Resumed 22 minutes later on the same
     channel, that top-up passed. Why it failed is not established.
+- `npm run batchsponsored` again (2026-09-28, 0.2.6 on subbit-x402 0.2.2), in two phases with
+  the wallet's records lost in between (`BATCHSPONSORED_PHASE=pay`, then `recover`).
+  - On Blockfrost, signerd paid 25 purchases: the opening `1342b697…`, the top-ups `eb562bb1…` and
+    `1341473d…` (in blocks 5228801 and 5228804), and then the seller claimed (`f3d51a24…`).
+  - signerd was stopped, its channels directory deleted, and started again with no Blockfrost
+    key, so it read the chain through Koios. `walletctl recover` found the channel with its
+    reserve the seller's, and `walletctl refund` was sponsored (`470822ba…`).
+  - The wallet's ADA did not move, to the lovelace, and its tUSDM went down the 0.025 the vouchers
+    signed. The seller paid the five fees, 1.235908 tADA.
 - `npm run batchexit` on preprod (2026-09-25), the way out without the seller: three purchases,
   `walletctl close` (`95f5f833…`), then signerd restarted with its channel directory deleted;
   `walletctl recover` found the closed channel on chain with its IOU key derived again, and

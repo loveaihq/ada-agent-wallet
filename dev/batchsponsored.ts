@@ -14,6 +14,10 @@
  * A run that stops part way resumes: it keeps the wallet's starting holdings beside AUDIT_FILE and
  * carries on with the purchases the channel has not had yet.
  *
+ * BATCHSPONSORED_PHASE splits it for a signerd that loses its records between the claim and the
+ * refund: `pay` stops after the claim; `recover` starts with `walletctl recover`, expects the
+ * channel back with its reserve the seller's, and goes on to the refund. Without it, all at once.
+ *
  * Needs the seller (dev/batchseller.ts with BATCH_SELLER_SPONSOR_ACCOUNT) and signerd with
  * BATCH_DEPOSIT_REQUESTS=10 and a policy that allows batch-settlement in tUSDM and has no lovelace
  * entry at all: a sponsored channel locks none of the wallet's ADA. Env: SIGNERD_URL,
@@ -42,6 +46,11 @@ const BF = blockfrostBaseUrl("cardano:preprod");
 const TUSDM_UNIT = "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9" + "0014df10745553444d";
 const PURCHASES = 25;
 const STATE = resolve(dirname(AUDIT_FILE), "batchsponsored.json");
+const PHASE = process.env.BATCHSPONSORED_PHASE ?? "all";
+if (!["all", "pay", "recover"].includes(PHASE)) {
+  console.error("batchsponsored: BATCHSPONSORED_PHASE is all, pay or recover");
+  process.exit(1);
+}
 
 // ---- 1 ------------------------------------------------------------------------------------------
 log("1. a wallet that holds only tUSDM and the ADA that came with it");
@@ -50,9 +59,12 @@ const status = (await signerd("/status")).data as { address: string };
 const kept = existsSync(STATE) ? (JSON.parse(readFileSync(STATE, "utf8")) as Record<string, string | number>) : undefined;
 const before = kept ? { utxos: Number(kept.utxos), lovelace: BigInt(kept.lovelace!), tusdm: BigInt(kept.tusdm!), adaOnly: Number(kept.adaOnly) } : await holdings(status.address);
 if (!kept) writeFileSync(STATE, JSON.stringify({ ...before, lovelace: before.lovelace.toString(), tusdm: before.tusdm.toString() }));
+const keep = (k: string, v: string) => writeFileSync(STATE, JSON.stringify({ ...(JSON.parse(readFileSync(STATE, "utf8")) as object), [k]: v }));
 log(`  ${status.address}: ${before.utxos} UTxO(s), ${ada(before.lovelace)} tADA, ${units(before.tusdm)} tUSDM, ${before.adaOnly} ADA-only${kept ? " (kept from the first run)" : ""}`);
 expect("the wallet holds tUSDM and no ADA-only UTxO", before.tusdm > 0n && before.adaOnly === 0, before);
 
+let claimTx = (kept?.claimTx as string | undefined) ?? "";
+if (PHASE !== "recover") {
 // ---- 2 ------------------------------------------------------------------------------------------
 log(`2. ${PURCHASES} purchases of /token: an opening and two top-ups, each on an offer of the seller's`);
 const mcp = new Client({ name: "batchsponsored", version: "0.1.0" });
@@ -79,6 +91,7 @@ await mcp.close();
 const ch = (await channels()).find(c => c.status === "open");
 expect("one open tUSDM channel, signed for 0.025 tUSDM, its reserve the seller's", ch?.signed === "25000" && ch.reserveFrom === "seller", ch);
 const channelId = ch!.channelId as string;
+keep("payTo", ch!.payTo as string);
 const steps = audit().filter(e => e.channelId === channelId && (e.event === "channel_opened" || e.event === "channel_topped_up"));
 expect(
   "an opening and two top-ups, each on a different offer of the seller's",
@@ -93,10 +106,27 @@ if (failed.length) log(`  earlier failures, before this run resumed: ${failed.ma
 log("3. the seller claims");
 const claims = (await (await fetch("http://127.0.0.1:7415/claim", { method: "POST" })).json()) as Array<{ transaction: string; channels: Array<{ channelId: string; taken: string }> }>;
 expect("one claim, taking this channel's 0.025 tUSDM", claims.length === 1 && claims[0]!.channels.some(c => c.channelId === channelId && c.taken === "25000"), claims);
-const claimTx = claims[0]!.transaction;
+claimTx = claims[0]!.transaction;
+keep("claimTx", claimTx);
 await blockfrost(`/txs/${claimTx}`);
+if (PHASE === "pay") {
+  log("stopping after the claim, as BATCHSPONSORED_PHASE=pay asks");
+  process.exit(0);
+}
 // Blockfrost's index trails a block; a refund built on the channel's position before the claim fails.
 await sleep(25_000);
+}
+
+if (PHASE === "recover") {
+  log("3b. walletctl recover: the channel back from the chain, its reserve the seller's");
+  const found = await walletctl(["recover", AGENT_ID]);
+  expect("walletctl recover", found.code === 0, found);
+  expect("recover indexed the channel again", /"indexed":\s*1/.test(found.out), found.out);
+}
+const ch = (await channels()).find(c => c.status === "open");
+expect("the open channel's record says its reserve is the seller's", ch?.reserveFrom === "seller", ch);
+const channelId = ch!.channelId as string;
+const steps = audit().filter(e => e.channelId === channelId && (e.event === "channel_opened" || e.event === "channel_topped_up"));
 
 // ---- 4 ------------------------------------------------------------------------------------------
 log("4. walletctl refund: the seller's offer is its collateral, and the channel's ADA goes back to the seller");
@@ -114,7 +144,8 @@ expect("signerd signed it as a sponsored refund", audit().some(e => e.event === 
 log("5. reconciliation");
 await blockfrost(`/txs/${refundTx}`);
 await sleep(25_000);
-const payTo = ch!.payTo as string;
+// A record found again by recover has no payTo until a 402 binds it; the paying phase kept it.
+const payTo = (kept?.payTo as string | undefined) ?? (ch!.payTo as string);
 const spent = audit()
   .filter(e => e.event === "voucher_signed" && e.channelId === channelId)
   .reduce((s, e) => s + BigInt(e.amount as string), 0n);
