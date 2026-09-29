@@ -51,8 +51,9 @@ jobs:
         shell: bash
         run: |
           [ -f test-output.txt ] || exit 0
-          { grep -E "✖" test-output.txt | head -5; grep -iE "error|cannot|not found|expected|actual" test-output.txt | grep -v "✔" | head -5; } |
-            while IFS= read -r line; do echo "::error::${line}"; done
+          # One annotation holding the end of the output, newlines encoded the way annotations want.
+          body=$(tail -n 25 test-output.txt | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=npm test, last 25 lines::${body}"
       - run: npm run typecheck
       # Real mode bits and a signal signerd can drain on: the two things Windows cannot show.
       - if: runner.os != 'Windows'
