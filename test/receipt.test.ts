@@ -61,6 +61,16 @@ test("signed but never settled says the budget is spent anyway", () => {
   assert.equal(out.reason, "exact_cardano_facilitator_chain_lookup_failed");
 });
 
+test("the note says when the budget comes back, and that a voucher's does not", () => {
+  // It comes back only when signerd reads from the chain that the transaction cannot land, so the
+  // note must not read as something the agent or the seller can ask for.
+  for (const note of [describePayment({ paid: false }, true).unsettled, describePayment({ paid: false, transaction: TX }, true).unsettled]) {
+    assert.match(String(note), /never lands/);
+    assert.match(String(note), /validity window has passed, plus a safety margin/);
+  }
+  assert.match(String(describePayment({ paid: false }, true).unsettled), /not for a batch-settlement voucher/);
+});
+
 test("signed, reported failed, but broadcast: the warning names the transaction", () => {
   const out = describePayment({ paid: false, transaction: TX }, true);
   assert.equal(out.paid, false);

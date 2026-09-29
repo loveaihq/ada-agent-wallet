@@ -25,7 +25,9 @@ Anything that breaks one of these, because enforcing them is the whole reason th
 - a payment reaching a payee outside `allowedPayees`, or a resource outside `allowedResources`
 - the approval queue releasing a payment the policy would now refuse
 - the mnemonic, or a decrypted keystore, leaving the signerd process
-- the spend ledger being reset, rebuilt wrong, or made to under-count
+- the spend ledger being reset, rebuilt wrong, or made to under-count — including a spend given
+  back on anything but signerd's own read of the chain provider, or while its transaction is still
+  able to land
 - signerd binding anything other than the loopback interface
 - batch-settlement: a voucher signed for more than the policy counted, a channel whose provider
   key is outside `allowedProviderKeys`, a deposit past `channelDepositMax` or `channelLockedMax`,
@@ -41,12 +43,17 @@ behaviour worth expecting**. They are accepted limitations, not findings:
   mitigation is `MAX_HOT_BALANCE_LOVELACE` — keep in the wallet only what you would accept losing.
 - deleting `ledger.json` **and** `audit.jsonl` together resets the spend cap. No single deletion
   does. File permissions are what covers the pair.
-- a signed payment counts against the budget even if settlement then fails.
+- a signed payment counts against the budget when signed, and comes back only once signerd has read
+  from its chain provider that the transaction can no longer land (past its TTL plus
+  `RELEASE_MARGIN_SECONDS`, and not in a block). That trusts the provider's "not found": one that
+  lied would give back spent budget, bounded by `MAX_HOT_BALANCE_LOVELACE`. A payment signed
+  before this existed, a batch-settlement voucher, and a request waiting for approval are never
+  given back this way.
 - on Koios a facilitator can only settle at `l1Confirmations: 0`; depth needs Blockfrost.
 - on Windows the file-mode check reports that it could not run, rather than passing.
 
 ## Status
 
-`0.2.6`. Verified on preprod, including real on-chain round-trips. It has never run on mainnet, and
+`0.2.7`. Verified on preprod, including real on-chain round-trips. It has never run on mainnet, and
 no part of it has had an external security review. If you are about to point it at real ADA, read
 **Before mainnet** in the README and run `npm run walletctl -- preflight` first.

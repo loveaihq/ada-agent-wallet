@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.6, preprod only.** It has never run on mainnet and has had no external security
+**Status: 0.2.7, preprod only.** It has never run on mainnet and has had no external security
 review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
@@ -26,10 +26,15 @@ signerd.ts   127.0.0.1 only, bearer token, holds the mnemonic
    ├── policy.ts    per-tx max · rolling-24h max · payee, resource, asset and transfer-method
    │                allowlists · per-hour rate · approval threshold · channel deposits and keys
    ├── replay.ts    rebuilds the 24h spend window at startup, and checks what it rebuilds from
+   ├── expiry.ts    which signed payments the chain has moved past, and reading that from Koios or
+   │                Blockfrost: the only way a spend's budget comes back
+   ├── retry.ts     which provider read failures are worth a second try, and the retrying
    ├── serialize.ts one lock per agent for the cap, one per wallet for signing
    ├── keystore.ts  scrypt + AES-256-GCM, so the mnemonic is not plaintext at rest
    ├── verifyTx.ts  reads back the signed transaction: does it pay who was authorised, only them
    ├── channelTx.ts the same for channel transactions: deposits, top-ups, refunds, exits
+   ├── tidy.ts      the UTxO layout channel steps need, the plan to reach it, and the same
+   │                read-back for the one transaction that does
    ├── ledger.json  the spend state the cap is computed from, rewritten after every signature
    ├── audit.jsonl  every decision, hash-chained, the checkpoint pointing into it
    ├── tokens.json  optional: a token per agent, so `agentId` is not self-reported
@@ -38,7 +43,7 @@ signerd.ts   127.0.0.1 only, bearer token, holds the mnemonic
    └── @x402/cardano toClientCardanoSigner (Koios by default, Blockfrost optional)
        subbit-x402   the batch-settlement channel client (preprod, Blockfrost)
 walletctl.ts  status | preflight | pending | approve <id> | deny <id> | audit
-              channels | refund | close | end | elapse | recover
+              channels | refund | close | end | elapse | recover | tidy
 ```
 
 `ledger.json` and `audit.jsonl` are deliberately two files: the cap is state, the log is a log, and
@@ -141,6 +146,8 @@ npm run queue                    # every exit from the approval queue that does 
 npm run posix                    # mode bits and signals; Linux only, since Windows can check neither
 npm run delivery                 # a caller that leaves while a signature is in flight
 npm run context                  # two tool calls at once keep their own reasons in the audit
+npm run tidy                     # preprod: `walletctl tidy` on a wallet whose ADA is inside token UTxOs,
+                                 # read back from the provider; spends one fee, stops on a tidy wallet
 npm run keystore -- create ...   # encrypt the mnemonic at rest
 ```
 
@@ -208,13 +215,29 @@ The operator's side: `walletctl channels`, `walletctl refund <channelId> <url>` 
 co-signs; signerd builds and signs it but talks to no seller, walletctl carries the messages; a
 refund pays the seller what it is still owed in an output of its own, so when that is below an
 output's minimum, about 1 ADA, the seller has to claim first and the refund then owes it nothing),
-`close`, `end` and `elapse` to leave without the seller, and `recover <agentId>` to find an agent's
-channels on chain again after losing the records. An exit waits for its block inside the wallet
-lock, so payments pause while one lands.
+`close`, `end` and `elapse` to leave without the seller, `recover <agentId>` to find an agent's
+channels on chain again after losing the records, and `tidy` (below). An exit waits for its block
+inside the wallet lock, so payments pause while one lands.
 
 Every channel transaction but the opening puts up collateral from an ADA-only UTxO and keeps about
 1 ADA of it back as change. So the wallet needs one ADA-only UTxO of at least about 2 ADA, and ADA
 sitting in a UTxO with tokens does not count. A sponsored channel is the exception (below).
+
+`exact` payments undo that. Each one merges every token and the leftover ADA into a single change
+output, so after a few token payments all of the wallet's ADA can be inside token-bearing UTxOs, and
+a channel step fails `insufficient_funds` although the wallet holds plenty. `walletctl tidy
+[--dry-run] [--collateral <ada>]` puts it right: it spends every UTxO into one output with every
+token at its min-ADA, one ADA-only output of the collateral size (5 ADA unless `--collateral` says
+between 2 and 5), and the rest as ADA-only change. It does nothing when the wallet is already in
+that shape, that is when at most one UTxO holds tokens, it holds no more than its min-ADA and 1 ADA,
+and an ADA-only UTxO holds the collateral. `--dry-run` reads the wallet and says what it would do,
+and builds nothing. It refuses, as `utxo_busy`, while any of the wallet's UTxOs is committed to a
+payment or a channel step that has not settled, and while an output of the wallet's own transaction
+is not listed yet; it refuses more than 60 UTxOs, and a wallet that lacks the ADA for the layout.
+The transaction is read back before it is submitted, as every other is: its inputs are the wallet's
+UTxOs and no others, every output goes to the wallet, every token comes out as it went in, and the
+fee is under 1 ADA. The fee is the wallet's, and no agent's budget is charged for it. Like the
+channel endpoints it is the operator's, and preprod's.
 
 **Sponsored channels (subbit-x402 0.2.1).** A seller may pay for a token channel. Its 402 then
 carries a fee-sponsor offer, one of the seller's ADA-only UTxOs. The channel client opens, tops up
@@ -362,6 +385,33 @@ results are under "Verified".
     reserve the seller's, and `walletctl refund` was sponsored (`470822ba…`).
   - The wallet's ADA did not move, to the lovelace, and its tUSDM went down the 0.025 the vouchers
     signed. The seller paid the five fees, 1.235908 tADA.
+- `npm run expiry` on preprod (2026-09-29, Blockfrost, the release margin at its 60 s floor).
+  Payment A (`34c64379…`, 1.5 tADA, 60 s TTL) was signed and never submitted; payment B
+  (`f1bfe56b…`, 1.6 tADA, 180 s TTL) was submitted straight to the provider and landed. A's budget
+  came back 183 s into the run, once the tip was past its TTL plus the margin, with one
+  `spend_released` naming its transaction, agent, asset, amount and TTL slot. B stayed counted
+  through its own TTL and margin. After a restart the ledger still held B and not A, and the
+  checkpoint kept B's transaction and TTL slot. The first attempt had not got that far: the public
+  test wallet's only UTxO held its tokens and 4.7 tADA, too little to pay 1.5 tADA and still leave
+  its tokens their min-ADA in the change, which is what the next entry is for.
+  - Again through Koios alone (no Blockfrost key), on `@evolution-sdk/evolution` 0.5.15, whose
+    Koios decoding was rewritten: A (`2518cb91…`) came back 191 s into the run on Koios's
+    `/tx_status`, B (`93255b7e…`, landed 59 s after its submit) stayed counted past its TTL and
+    margin and across the restart.
+- `npm run tidy` on preprod (2026-09-29). The wallet as the provider listed it: 3 UTxOs, one of
+  them holding every token and 15.82 of its 27.02 tADA, since B's change in the entry above had
+  folded them together. `tidy` (`79b7b679…`, fee 0.200921) left the tokens in one UTxO at their
+  min-ADA (3.59023), one ADA-only UTxO of exactly 5 tADA for collateral, and the rest ADA-only;
+  every token came through in the same amount, and the wallet's ADA went down by the fee and
+  nothing else. A second `tidy` straight after was refused `utxo_busy`, a dry run once the provider
+  listed the outputs said the wallet was already tidy, and an agent's token was refused
+  `operator_only`.
+- `npm run batch` again on `@evolution-sdk/evolution` 0.5.15 with subbit-x402 0.2.3 (2026-09-29,
+  Blockfrost): 22 purchases on one channel (vouchers 27–38 ms after the opening's first), the lost
+  response and its re-sign, the approval, the `dailyMax` refusal with a top-up on the way, the
+  refused provider key, and `walletctl refund`. Four transactions (`5119e404…`, `8c7c1f74…`,
+  `5b65a64b…`, `4b9cb79f…`); the seller +2.5 tADA, what the vouchers signed, and the wallet −3.667211,
+  that and the fees (1.167211), to the lovelace.
 - `npm run batchexit` on preprod (2026-09-25), the way out without the seller: three purchases,
   `walletctl close` (`95f5f833…`), then signerd restarted with its channel directory deleted;
   `walletctl recover` found the closed channel on chain with its IOU key derived again, and
@@ -533,6 +583,54 @@ the signer — so it constrains an agent that is running this code and being ste
 prompt-injection case, and not one whose process has been replaced. `allowedPayees` is the control
 that binds the transaction itself; treat the resource list as the layer above it.
 
+### Which asset id
+Caps in `policy.json` are keyed by `"lovelace"` or `"<policyId>.<assetNameHex>"`, and the amounts are
+in the smallest unit: `"1000000"` of a 6-decimal token is one token, so
+`"1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378": "5000000"` caps USDCx at 5
+per payment. The wallet pays only assets that are listed, so a lookalike token cannot be paid
+unless you list it. The way that happens is a wrong copy: token names are not unique, and an
+explorer search for "USDCx" returns five policies, only one of them the xReserve USDCx that IOG
+bridges.
+
+The mainnet stablecoins this wallet knows (`src/assets.ts`), checked on 2026-09-29 against the
+chain (Koios), the Cardano token registry and one more source each (Moneta's policy-id page, the
+fingerprint in Circle's announcement, Indigo's contract repository, the Open DJED protocol
+datum; USDA has only CoinGecko besides the registry):
+
+| Ticker | Policy id | Asset name (hex) | Decimals | Issuer |
+| --- | --- | --- | --- | --- |
+| USDCx | `1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34` | `5553444378` | 6 | Circle xReserve, bridged by IOG |
+| USDM | `c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad` | `0014df105553444d` | 6 | Moneta |
+| DJED | `8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61` | `446a65644d6963726f555344` | 6 | COTI, with IOG |
+| iUSD | `f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880` | `69555344` | 6 | Indigo Protocol |
+| USDA | `fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456` | `55534441` | 6 | Anzens |
+
+USDM is a CIP-68 token, so its name is the label prefix `0014df10` and `USDM`; DJED's on-chain
+name is `DjedMicroUSD`. Decimals are what the token registry says (for USDM and the preprod test
+token also the CIP-68 datum); nothing on chain enforces them for a plain native asset, so they are
+the issuer's word. On preprod the wallet knows tUSDM,
+`e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d`, also 6 decimals.
+
+Copycats seen on mainnet on 2026-09-29, searching Koios by exact asset name. None is a token you
+want; all of them are worth nothing next to the real ones:
+- USDCx, four: `038f14bd637e6c7b4ecdb2bf5dde2ccfd69b415f10d01bb5bd0f31da`,
+  `325fb65426e2a2af4749d9347e28d4c109d0895340dec5547036ab05`,
+  `4e74a46ecac6d7cde02e07e4e829659dcec39bc4704b0a40506f2c70`,
+  `82db3e78cea2810a39a97a65820d19621848d132db566ae88105813e`. They are tiny next to the real one:
+  about 2,010 USDCx between them at 6 decimals, in at most five addresses each, against 46.25 million
+  across 1,381 addresses.
+- USDM, twenty-two: fifteen with the same CIP-68 name as Moneta's (`3aba99e1…` even copied the
+  reference token, and did it before Moneta minted its own), five plain `USDM`, two lowercase `usdm`.
+  Most hold a single unit. Moneta's has 6,218 holding addresses.
+- USDA, four: `0b17e18e…`, `203b808c…`, `36a2d845…`, `8bb07d0a…`. `36a2d845…` also mints a fake USDM.
+- iUSD, one: `648823ffdad1610b4162f4dbc87bd47f6f9cf45d772ddef661eff198`.
+- DJED, one, burned to nothing: `4eea0f3c96825d83a42ecffd9f2b4fb6683977ffc557284644c4ee3c`.
+
+`preflight` reads every asset id in every agent's `perTxMax`. A listed one prints its ticker and
+decimals; one whose name matches a known ticker but whose id does not fails on mainnet (warns
+elsewhere) and names the real id; anything else warns that it is not a known stablecoin, so check
+the policy id and its decimals yourself.
+
 ### The key
 ```
 npm run keystore -- create --mnemonic-file ~/.ada-agent-wallet/mnemonic --out ~/.ada-agent-wallet/keystore.json
@@ -582,8 +680,14 @@ in the rate of them is the first sign that something upstream is steering it som
 `{event="signed_undelivered"}` is the one that means the ledger and the world have come apart: a
 transaction was signed and its spend recorded, and the single request it could have been handed to
 had closed. Nothing will broadcast it, and the budget stays spent — a transaction is not unsigned
-by nobody having read it. It takes a caller leaving during the seconds a signature is in flight, so
+by nobody having read it — until its TTL and the release margin have passed and the chain shows it
+was never included. It takes a caller leaving during the seconds a signature is in flight, so
 it should be rare; each one is a payment the agent will have to ask for again.
+
+`{event="spend_released"}` counts budget given back for payments that never landed, and
+`{event="provider_retry"}` counts builds that had to be tried again. Neither is an incident on its
+own; a rate that keeps climbing is the provider, or a facilitator that is not settling what it is
+sent, and worth knowing about before the free tier's rate limit finds it for you.
 
 ### What this still does not do
 Naming these is the point; none is fixed by more policy code.
@@ -601,14 +705,27 @@ Naming these is the point; none is fixed by more policy code.
   buyer you do not choose this — the seller's 402 does — but it governs any facilitator you run.
 
 ## Known behaviour worth expecting
-- **A signed payment counts against the budget even if settlement then fails.** signerd records the
-  spend when it signs, and never hears whether the facilitator got the transaction on chain, so a
-  transient submit failure costs budget without moving funds. This is the conservative direction and
-  deliberately so — refunding it would mean deciding "this will never land", which is exactly the
-  question the facilitator cannot answer either. Observed once here: `dailySpent` of 16.5 tADA
-  against 12.5 tADA actually delivered. The tools say so when it happens: `paid: false` with an
-  `unsettled` note, and the transaction if one was broadcast, since a settlement reported failed can
-  still confirm.
+- **A signed payment counts against the budget when it is signed, and comes back only when the
+  chain shows it never landed.** signerd records the spend at signing and never hears whether the
+  facilitator got the transaction on chain, so a transient submit failure costs budget without
+  moving funds — observed once here: `dailySpent` of 16.5 tADA against 12.5 tADA actually delivered.
+  What signerd can know is this: the `exact` signer always gives a transaction a TTL, and one the
+  chain has passed without including it never will be. So once a minute signerd reads the chain's
+  tip from its own provider, and for every payment whose TTL plus `RELEASE_MARGIN_SECONDS` (default
+  1800, so half an hour) is behind the tip, asks whether the transaction is in a block. A definite
+  no takes the spend off the ledger: `spend_released` in the audit, counted in `/metrics`, and kept
+  across a restart. Anything else leaves it counted — yes, an HTTP error, a timeout, a reply that
+  is not what was asked for. The budget comes back on evidence signerd read itself and on nothing
+  the agent or the seller says about the payment; the agent cannot talk its way to it, and a payment
+  it submitted on its own shows up as in a block and stays spent. `RELEASE_EXPIRED_SPENDS=0` turns
+  it off. Three limits. It trusts the provider's "not found": a provider that answered a clean 404
+  for a transaction that did land would give back budget that was spent, and what bounds that is the
+  balance ceiling, `MAX_HOT_BALANCE_LOVELACE`, not this. A payment signed before this existed
+  carries no transaction hash in its record and is never given back. And a batch-settlement
+  voucher's spend, or budget held by an approval still waiting, is not a signed transaction with a
+  TTL, so neither is released. The tools say so when it happens: `paid: false` with an `unsettled`
+  note, and the transaction if one was broadcast, since a settlement reported failed can still
+  confirm.
 - **Before `@evolution-sdk/evolution` 0.5.14, a 402 round-trip could not complete on Koios at
   all.** Fixed upstream in evolution-sdk#544 (reported from here as #540), released in 0.5.14 on
   2026-09-24, which this package now pins; the `exact` round trip passed on Koios alone the next
@@ -637,7 +754,12 @@ Naming these is the point; none is fixed by more policy code.
   provider call for the wallet's UTxOs failed in under a second, while the identical run passed on
   its own a minute later, as did a direct query of the same endpoint. The cause was not captured —
   a free key's burst limit is the obvious suspect and not a proven one — so treat it as retryable,
-  the way `Koios submitTx failed` above is.
+  the way `Koios submitTx failed` above is. signerd now does that itself for the build: a provider
+  read that failed, or the network under one (`fetch failed`, `ECONNRESET`, a timeout), is tried
+  again after 1s and then 3s, each try logged as `provider_retry`, and only then reported as
+  `sign_failed`. Nothing has been signed or handed out when a build throws, so a second try cannot
+  commit anything twice. A submit failure is never retried this way — the facilitator does the
+  submitting — and neither is `insufficient_funds`, which is an answer about the wallet.
 - The in-flight hold is not what keeps an agent inside its cap; the ledger is. `NONCE_HOLD_SECONDS`
   (120s) only avoids handing back a transaction some other unsettled one has already doomed.
 

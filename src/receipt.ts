@@ -56,9 +56,12 @@ export function describePayment(receipt: Receipt | undefined, signed: boolean): 
   if (receipt?.voucher) out.voucher = receipt.voucher;
   if (receipt?.network) out.network = receipt.network;
   if (signed && !out.paid) {
+    // What signerd does about it is in expiry.ts: the budget goes back only when the chain, read by
+    // signerd, shows the signed transaction can no longer land. Nothing the seller or the agent
+    // reports can do that, so the note says what will and does not offer a way to ask.
     out.unsettled = receipt?.transaction
-      ? `the seller says this did not settle, but transaction ${receipt.transaction} was broadcast: it may still confirm, and it counts against this agent's budget either way`
-      : "a payment was signed and sent, but the seller did not settle it and named no transaction; it still counts against this agent's budget";
+      ? `the seller says this did not settle, but transaction ${receipt.transaction} was broadcast: it may still confirm, so it counts against this agent's budget for now. If it never lands, the budget comes back once its validity window has passed, plus a safety margin`
+      : "a payment was signed and sent, but the seller did not settle it and named no transaction; it still counts against this agent's budget. If the transaction it signed never lands, the budget comes back once its validity window has passed, plus a safety margin (not for a batch-settlement voucher, which is not a transaction)";
     if (receipt?.reason) out.reason = receipt.reason;
   }
   return out;

@@ -29,6 +29,12 @@
  *   POST /channels/refund/result  {channelId, paymentPayload, settleResponse}
  *   POST /channels/close | /channels/end | /channels/elapse  {channelId}  -> {transaction}
  *   POST /channels/recover        {agentId}                              -> channels found on chain
+ *   POST /tidy            {dryRun?, collateralLovelace?}  -> the wallet's UTxOs put in the layout channel
+ *                         steps need: every token in one output at its min-ADA, one ADA-only output of
+ *                         the collateral size (default 5 ADA), the rest as ADA-only change. dryRun builds
+ *                         nothing and answers with the plan. 409 utxo_busy while any of the wallet's UTxOs
+ *                         is committed to a payment or a channel step that has not settled. Its fee is
+ *                         the wallet's, and no agent's budget moves.
  *   The first two take an agent's token; the rest are the operator's.
  *
  * None of POLICY_FILE, AUDIT_FILE or LEDGER_FILE may be writable by the agent's user: between them
@@ -62,6 +68,11 @@
  *                           writable by the agent's user)
  *   BATCH_DEPOSIT_REQUESTS  how many requests at the asked price a channel deposit is sized for,
  *                           within channelDepositMax (default 100)
+ *   RELEASE_MARGIN_SECONDS  default 1800, at least 60. A signed payment's budget is given back only
+ *                           once the chain is this far past the transaction's TTL and the provider
+ *                           still does not have it: slack for a provider that lags and for a rollback
+ *   RELEASE_EXPIRED_SPENDS  set to 0 to never give a budget back; every signed payment then counts
+ *                           for the full 24h whether or not it landed
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -83,13 +94,13 @@ import {
 import { createInterface } from "node:readline";
 import { resolve as resolvePath, dirname, join } from "node:path";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { toClientCardanoSigner, decodeCardanoTransaction, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
+import { toClientCardanoSigner, decodeCardanoTransaction, minUtxoLovelace, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
 import type { PaymentPayload, PaymentPayloadResult, PaymentRequired, PaymentRequirements, SettleResponse } from "@x402/core/types";
-import { Address, Client, KeyHash, preprod } from "@evolution-sdk/evolution";
+import { Address, Assets, Client, KeyHash, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH } from "subbit-x402/subbit";
-import { BlockfrostChain, causeChain } from "subbit-x402/x402/chain";
+import { BlockfrostChain, SubmitError, causeChain, retryQueries } from "subbit-x402/x402/chain";
 import { KoiosChain } from "subbit-x402/x402/koios";
-import { currencyOf, subbedOf, txHashOf, type ChannelView } from "subbit-x402/x402/cardano";
+import { currencyOf, refOf, subbedOf, txHashOf, type ChannelView } from "subbit-x402/x402/cardano";
 import { channelOutputIndex, decodeTx, sortedInputRefs } from "subbit-x402/x402/txcheck";
 import { offerIn, offerOnChainProblem, offerProblem, type FeeSponsorOffer } from "subbit-x402/x402/sponsor";
 import { parseExtra } from "subbit-x402/x402/types";
@@ -99,6 +110,7 @@ import {
   PENDING_MS,
   derivedIouSigner,
   iouRootOf,
+  signedHex,
   type Authorization,
   type ClientChannel,
   type OwnOutput,
@@ -111,6 +123,10 @@ import { replayAudit, sha256, type Checkpoint } from "./replay.js";
 import { mismatch } from "./verifyTx.js";
 import { decryptMnemonic, assertKeystore } from "./keystore.js";
 import { blockfrostBaseUrl, koiosBaseUrl, networkName, sameNetwork } from "./network.js";
+import { describeKnown, displayName, knownAsset, lookalike } from "./assets.js";
+import { chainLookup, landing, reconcile } from "./expiry.js";
+import { isCoinSelectionFailure, isTransientProviderError, withRetries } from "./retry.js";
+import { collateralProblem, describeLayout, tidyPlan, tidyProblem, type Utxo as TidyUtxo } from "./tidy.js";
 
 const PORT = Number(process.env.SIGNERD_PORT ?? 7402);
 const TOKEN = process.env.SIGNERD_TOKEN;
@@ -170,6 +186,14 @@ const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS ?? 60_000);
 const LEDGER_WINDOW_MS = 24 * 60 * 60 * 1000;
 const CHANNELS_DIR = process.env.CHANNELS_DIR ?? "./channels";
 const BATCH_DEPOSIT_REQUESTS = Number(process.env.BATCH_DEPOSIT_REQUESTS ?? 100);
+/**
+ * How far past a transaction's TTL the chain must be, and the provider still not have it, before
+ * its budget is given back. The TTL alone is the rule; this is for the two ways a provider can be
+ * behind the truth — an index that lags its own tip, and a block that is rolled back — and both
+ * are minutes, not half an hour. One slot is one second on every network this runs on.
+ */
+const RELEASE_MARGIN_SECONDS = Number(process.env.RELEASE_MARGIN_SECONDS ?? 1800);
+const RELEASE_EXPIRED_SPENDS = process.env.RELEASE_EXPIRED_SPENDS !== "0";
 
 function fail(msg: string): never {
   console.error(`signerd: ${msg}`);
@@ -199,6 +223,9 @@ if (!Number.isInteger(PROVIDER_TIMEOUT_MS) || PROVIDER_TIMEOUT_MS < 1 || PROVIDE
   fail(`PROVIDER_TIMEOUT_MS must be a whole number of milliseconds from 1 to 120000, got "${process.env.PROVIDER_TIMEOUT_MS}"`);
 if (!Number.isInteger(BATCH_DEPOSIT_REQUESTS) || BATCH_DEPOSIT_REQUESTS < 10)
   fail(`BATCH_DEPOSIT_REQUESTS must be a whole number of at least 10 (the client's own floor), got "${process.env.BATCH_DEPOSIT_REQUESTS}"`);
+// A margin of nothing is the TTL alone, which a provider one block behind would get wrong.
+if (!Number.isInteger(RELEASE_MARGIN_SECONDS) || RELEASE_MARGIN_SECONDS < 60)
+  fail(`RELEASE_MARGIN_SECONDS must be a whole number of seconds, at least 60, got "${process.env.RELEASE_MARGIN_SECONDS}"`);
 // Resolved once, so "is this mainnet" is a fact about a known chain and not a suffix match that
 // would read `cardano:preview` as mainnet's opposite and point it at mainnet's providers.
 const IS_MAINNET = (() => {
@@ -357,7 +384,17 @@ function writeCheckpoint() {
     seq: auditSeq,
     hash: auditPrevHash,
     updatedAt: Date.now(),
-    spends: ledger.map(r => ({ ts: r.ts, agentId: r.agentId, asset: r.asset, amount: r.amount.toString(), ...(r.voucher ? { voucher: true } : {}) })),
+    spends: ledger.map(r => ({
+      ts: r.ts,
+      agentId: r.agentId,
+      asset: r.asset,
+      amount: r.amount.toString(),
+      ...(r.voucher ? { voucher: true } : {}),
+      // Kept beside the spend, or a restart with a checkpoint would forget which transaction it was
+      // and the spend could never be given back.
+      ...(r.tx ? { tx: r.tx } : {}),
+      ...(r.ttlSlot !== undefined ? { ttlSlot: r.ttlSlot } : {}),
+    })),
   };
   const tmp = `${LEDGER_FILE}.tmp`;
   writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
@@ -665,14 +702,25 @@ class UtxoBusy extends AuditedError {}
  * the condition falls back to a plain 500, which is what it was before.
  */
 class InsufficientFunds extends AuditedError {}
-const isCoinSelectionFailure = (e: unknown) =>
-  e instanceof Error && /coin selection failed|cannot create valid change/i.test(`${e.message} ${String((e as { cause?: unknown }).cause ?? "")}`);
+
+/** Waits before the second and third try of a build that failed reading from the provider. */
+const BUILD_RETRY_DELAYS_MS = [1000, 3000];
 
 async function sign(agentId: string, reason: string, input: ClientCardanoSignInput) {
   return withWalletLock(async () => {
     let res: Awaited<ReturnType<typeof signer.buildAndSignPaymentTransaction>>;
     try {
-      res = await signer.buildAndSignPaymentTransaction(input);
+      // Only the build is retried, and only for a provider read that failed or the network under
+      // it. When it throws, nothing has been signed and nothing handed out, so trying again cannot
+      // commit anything twice; everything after it, which records a spend, runs once. It runs
+      // inside the wallet lock, so a retry holds the queue behind it for the seconds it waits.
+      res = await withRetries(() => signer.buildAndSignPaymentTransaction(input), {
+        delaysMs: BUILD_RETRY_DELAYS_MS,
+        retryIf: isTransientProviderError,
+        // The cause is in the record because `fetch failed` says nothing else about why.
+        onRetry: (e, attempt) =>
+          audit("provider_retry", { agentId, reason, attempt, detail: `${e instanceof Error ? e.message : e}${e instanceof Error && e.cause ? ` (${e.cause})` : ""}`.slice(0, 300) }),
+      });
     } catch (e) {
       if (!isCoinSelectionFailure(e)) throw e;
       audit("insufficient_funds", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount });
@@ -684,9 +732,12 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
     // this wallet also paid someone else.
     let wrong: string | undefined;
     let inputs: string[] = [];
+    // What a release will need to name this spend later, read from the transaction itself.
+    let landed: ReturnType<typeof landing> = {};
     try {
       const decoded = decodeCardanoTransaction(res.transaction);
       inputs = decoded.inputs;
+      landed = landing(decoded.txHash, decoded.ttlSlot);
       wrong = mismatch(decoded, {
         payTo: input.payTo,
         asset: input.asset,
@@ -714,13 +765,81 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
     // Held no longer than the nonce: the ledger is what bounds spending, and a settlement that
     // failed must not keep the channel client off these UTXOs for the client's full PENDING_MS.
     for (const i of inputs) inFlight.set(i, Date.now() - PENDING_MS + hold * 1000);
-    ledger.push({ ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount) });
+    ledger.push({ ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount), ...landed });
     pruneLedger();
-    audit("signed", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce, network: input.network });
+    audit("signed", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce, network: input.network, ...landed });
     writeCheckpoint(); // after the audit record, so the checkpoint names it
     return res;
   });
 }
+
+/**
+ * Giving back the budget of a payment that can never land. signerd counts a payment as spent when
+ * it signs it and is never told whether the facilitator got it on chain; what it can know is that
+ * every `exact` transaction carries a TTL, and one the chain has passed without including it never
+ * will be. expiry.ts has the reasoning; this is the part that owns the ledger.
+ *
+ * Only evidence signerd read from the provider itself counts: nothing the agent says about its own
+ * payment can give it budget back. A provider that errors, times out or answers oddly changes
+ * nothing — the budget stays spent, which is where a signerd that is unsure belongs. What it does
+ * not guard against is a provider that lies with a clean "not found", which is why the wallet's
+ * balance ceiling is what bounds the loss and not this.
+ *
+ * Budget held by a queued approval (`reserved`) and a voucher's are never touched here: neither is
+ * a transaction whose TTL has been signed.
+ */
+const RELEASE_INTERVAL_MS = 60_000;
+/** Lookups per pass; the provider is asked about the rest on later passes. */
+const RELEASE_BATCH = 20;
+/** These are small reads, so they get less than a build, which covers coin selection as well. */
+const LOOKUP_TIMEOUT_MS = Math.min(PROVIDER_TIMEOUT_MS, 20_000);
+const chainView = chainLookup({
+  network: NETWORK,
+  blockfrostProjectId: process.env.BLOCKFROST_PROJECT_ID,
+  koiosToken: process.env.KOIOS_TOKEN,
+  timeoutMs: LOOKUP_TIMEOUT_MS,
+});
+/** Seen in a block. In memory only: after a restart they are asked about once more, and no more. */
+const settledTxs = new Set<string>();
+let releaseInFlight = false;
+let releaseRound = 0;
+
+async function releaseExpired() {
+  if (releaseInFlight) return; // a slow provider must not stack up one pass per interval
+  releaseInFlight = true;
+  try {
+    // A copy, because the ledger moves while the provider is being asked.
+    const snapshot = [...ledger];
+    const live = new Set(snapshot.flatMap(s => (s.tx ? [s.tx] : [])));
+    for (const tx of settledTxs) if (!live.has(tx)) settledTxs.delete(tx); // out of the window, so no longer worth remembering
+    const { onChain, absent } = await reconcile(snapshot, chainView, {
+      marginSlots: RELEASE_MARGIN_SECONDS,
+      settled: settledTxs,
+      max: RELEASE_BATCH,
+      round: releaseRound++,
+    });
+    for (const tx of onChain) settledTxs.add(tx);
+    for (const s of absent) {
+      // The agent's lock, as every other change to its ledger: a decision reads the ledger and then
+      // records a spend, and a release must not land between the two.
+      await withAgentLock(s.agentId, async () => {
+        const i = ledger.findIndex(r => r.tx === s.tx && !r.voucher);
+        if (i === -1) return; // aged out of the window while the provider was asked
+        const r = ledger[i];
+        // The record first: if it cannot be written the spend simply stays, and it is the record,
+        // not the ledger in memory, that a restart rebuilds this from.
+        audit("spend_released", { agentId: r.agentId, asset: r.asset, amount: r.amount, tx: s.tx, ttlSlot: s.ttlSlot, signedTs: r.ts });
+        ledger.splice(i, 1);
+        writeCheckpoint(); // after the audit record, so the checkpoint names it
+      });
+    }
+  } catch (e) {
+    console.error(`signerd: giving back expired spends stopped, the rest stay counted: ${e instanceof Error ? e.message : e}`);
+  } finally {
+    releaseInFlight = false;
+  }
+}
+if (RELEASE_EXPIRED_SPENDS) setInterval(releaseExpired, RELEASE_INTERVAL_MS).unref();
 
 /** What an approval signs: an `exact` payment, or a batch-settlement voucher and the step it rides on. */
 type PendingWork =
@@ -1540,6 +1659,22 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     return channelRequest(req.method ?? "GET", url.pathname, body, res);
   }
 
+  // The operator's, like /approve: it is not in AGENT_PATHS, so an agent's token was refused above.
+  if (req.method === "POST" && url.pathname === "/tidy") {
+    // The layout is the one channel steps need, and they run on preprod only: 409, since the request
+    // is fine and it is this wallet's network that cannot do it.
+    if (!channels) return json(res, 409, { error: "batch_unavailable", detail: BATCH_UNAVAILABLE });
+    const { dryRun, collateralLovelace } = body;
+    if (dryRun !== undefined && typeof dryRun !== "boolean") return json(res, 400, { error: "dryRun must be a boolean" });
+    if (collateralLovelace !== undefined && (typeof collateralLovelace !== "string" || !/^[0-9]{1,15}$/.test(collateralLovelace)))
+      return json(res, 400, { error: "collateralLovelace must be a decimal integer string of lovelace" });
+    const collateral = collateralLovelace === undefined ? undefined : BigInt(collateralLovelace as string);
+    const badCollateral = collateral === undefined ? undefined : collateralProblem(collateral);
+    if (badCollateral) return json(res, 400, { error: "bad_request", detail: badCollateral });
+    const out = await tidyWallet(dryRun === true, collateral);
+    return json(res, out.status, out.body);
+  }
+
   if (req.method === "GET" && url.pathname === "/pending") {
     return json(res, 200, [...pending.values()].map(p => ({ id: p.id, createdAt: p.createdAt, agentId: p.agentId, reason: p.reason, payTo: p.payTo, asset: p.asset, amount: p.amount, ...(p.work.scheme === BATCH ? { scheme: BATCH } : {}) })));
   }
@@ -1754,6 +1889,152 @@ async function channelRequest(method: string, path: string, body: Record<string,
   return json(res, 404, { error: "not found" });
 }
 
+// ---- tidy: the operator's fix for a wallet whose ADA is folded into token UTxOs -------------------
+
+/** The SDK's unit strings have no dot between the policy and the name; the decoded transactions @x402/cardano gives, and tidy.ts, have one. */
+const tidyUtxo = (u: UTxO.UTxO): TidyUtxo => ({
+  ref: refOf(u),
+  lovelace: Assets.lovelaceOf(u.assets),
+  assets: Object.fromEntries(
+    Assets.getUnits(u.assets)
+      .filter(unit => unit !== "lovelace")
+      .map(unit => [`${unit.slice(0, 56)}.${unit.slice(56)}`, Assets.getByUnit(u.assets, unit)]),
+  ),
+});
+/** tidy.ts's tokens as the SDK's record: no dot, and no lovelace. */
+const tokenRecord = (tokens: Readonly<Record<string, bigint>>): Record<string, bigint> =>
+  Object.fromEntries(Object.entries(tokens).map(([asset, quantity]) => [asset.replace(".", ""), quantity]));
+
+/**
+ * What the ledger asks of an output at this wallet's address that holds exactly `tokens`, measured
+ * on the SDK's own encoding. The coin is the largest the field can take, as subbit-x402's
+ * `minAdaOutput` does it for ADA alone: the output the builder makes carries less, so this is never
+ * short of what the builder will ask for.
+ */
+function tokenOutputMinAda(tokens: Readonly<Record<string, bigint>>, coinsPerUtxoByte: bigint): bigint {
+  const out = new TxOut.TransactionOutput({ address: Address.fromBech32(address), assets: Assets.fromRecord({ lovelace: 2n ** 63n, ...tokenRecord(tokens) }) });
+  return minUtxoLovelace(TxOut.toCBORBytes(out).length, coinsPerUtxoByte);
+}
+
+/**
+ * Why what the wallet lists cannot be trusted as its layout yet, or undefined. A UTxO held for a
+ * payment or a channel step that has not settled is not ours to spend again, and an output one of
+ * our own transactions paid back that the provider does not list yet makes the wallet look poorer
+ * than it is: tidying from either would plan for a wallet that is not there.
+ */
+function walletUnsettled(listed: readonly string[]): string | undefined {
+  const held = inputBusy(listed);
+  if (held !== undefined) return `utxo ${held} is committed to a payment or a channel step that has not settled`;
+  const seen = new Set(listed);
+  const now = Date.now();
+  for (const [ref, out] of ownOutputs) {
+    if (!seen.has(ref) && !inFlight.has(ref) && now - out.at < PENDING_MS) return `${ref}, which transaction ${out.tx} paid to this wallet, is not listed yet`;
+  }
+  return undefined;
+}
+
+/**
+ * `walletctl tidy`: spends every UTxO of the wallet into the layout channel steps need (tidy.ts) —
+ * every token in one output at its min-ADA, one ADA-only output for collateral, the rest as ADA-only
+ * change — or, with `dryRun`, says what it would do and builds nothing.
+ *
+ * The operator's, and the wallet's own doing: its fee comes out of the wallet's ADA and no agent's
+ * budget moves, since no agent asked for it and no seller is paid. What bounds the fee is
+ * `tidyProblem`, which refuses over 1 ADA, and what bounds the rest is that it reads the signed
+ * transaction back and refuses anything that is not this wallet's own UTxOs going to this wallet's
+ * own address.
+ *
+ * The wallet lock is held from the read to the submit, so no `exact` payment or channel step builds
+ * from these UTxOs meanwhile; afterwards the inputs and the new outputs are booked as the channel
+ * client books its own transactions, so nothing builds from the old ones, and the client waits for
+ * the new ones, until the provider's listing catches up.
+ */
+async function tidyWallet(dryRun: boolean, collateralLovelace: bigint | undefined): Promise<{ status: number; body: Record<string, unknown> }> {
+  const c = channels!;
+  return withWalletLock(async () => {
+    const w = c.wallet;
+    try {
+      const listed = await retryQueries("the wallet's UTxOs", () => w.getWalletUtxos());
+      const unsettled = walletUnsettled(listed.map(refOf));
+      if (unsettled) return { status: 409, body: { error: "utxo_busy", detail: `${unsettled}; try again once it settles`, retryable: true } };
+      // A UTxO that carries a reference script is somebody's to keep in reach, and spending it would
+      // remove the script: it is left where it is, and the layout is the rest.
+      const utxos = listed.filter(u => u.scriptRef === undefined);
+      const mine = utxos.map(tidyUtxo);
+      const layout = describeLayout(mine);
+      const skipped = listed.length - utxos.length;
+      const coinsPerUtxoByte = await c.chain.coinsPerUtxoByte();
+      const plan = tidyPlan(mine, { ...(collateralLovelace !== undefined ? { collateralLovelace } : {}), minAda: tokens => tokenOutputMinAda(tokens, coinsPerUtxoByte) });
+      const seen = { layout, ...(skipped ? { skippedReferenceScripts: skipped } : {}) };
+
+      if ("refused" in plan) return { status: 409, body: { error: "tidy_impossible", detail: plan.refused, retryable: false, ...seen } };
+      if (plan.tidy) return { status: 200, body: { dryRun, alreadyTidy: true, tidied: false, why: plan.why, ...seen } };
+      const wanted = {
+        inputs: plan.inputs.length,
+        tokens: Object.fromEntries(Object.entries(plan.tokens).map(([asset, quantity]) => [asset, quantity.toString()])),
+        collateralLovelace: plan.collateralLovelace.toString(),
+        tokenMinLovelace: plan.tokenMinAda.toString(),
+        totalLovelace: plan.totalLovelace.toString(),
+      };
+      if (dryRun) return { status: 200, body: { dryRun: true, alreadyTidy: false, tidied: false, why: plan.why, plan: wanted, ...seen } };
+
+      const me = await w.address();
+      const byRef = new Map(utxos.map(u => [refOf(u), u]));
+      let tx = w.newTx().collectFrom({ inputs: plan.inputs.map(ref => byRef.get(ref)!) });
+      if (Object.keys(plan.tokens).length > 0)
+        tx = tx.payToAddress({ address: me, assets: Assets.fromRecord({ lovelace: 0n, ...tokenRecord(plan.tokens) }), autoMinUtxo: true });
+      tx = tx.payToAddress({ address: me, assets: Assets.fromLovelace(plan.collateralLovelace) });
+      // Every UTxO is an input already, so there is nothing for coin selection to add. What the two
+      // outputs and the fee leave is the change, and no token is left to ride in it.
+      const built = await retryQueries("tidy", () => tx.build({ changeAddress: me, availableUtxos: [] }));
+      const hex = await signedHex(built);
+
+      let decoded: ReturnType<typeof decodeCardanoTransaction> | undefined;
+      let wrong: string | undefined;
+      try {
+        decoded = decodeCardanoTransaction(Buffer.from(hex, "hex").toString("base64"));
+        wrong = tidyProblem(decoded, plan, address);
+      } catch (e) {
+        wrong = `it could not be decoded: ${e instanceof Error ? e.message : e}`;
+      }
+      if (wrong || !decoded) {
+        audit("tidy_refused", { detail: wrong, inputs: plan.inputs.length, collateralLovelace: plan.collateralLovelace });
+        return { status: 500, body: { error: "tidy_failed", detail: `refusing to submit a transaction that does not match the plan: ${wrong}` } };
+      }
+
+      // Booked before it is sent, as the channel client books its own: a submit that fails on the
+      // way back may have been accepted, and until it is known not to have been, its inputs must
+      // stay out of every other build.
+      const at = Date.now();
+      const created = decoded.outputs.map((_, i) => `${decoded.txHash}#${i}`);
+      for (const input of decoded.inputs) inFlight.set(input, at);
+      for (const ref of created) ownOutputs.set(ref, { tx: decoded.txHash, at });
+      try {
+        await c.chain.submit(hex);
+      } catch (e) {
+        // A refusal from the provider means it does not have the transaction: the UTxOs are free.
+        if (e instanceof SubmitError && e.status < 500) {
+          for (const input of decoded.inputs) inFlight.delete(input);
+          for (const ref of created) ownOutputs.delete(ref);
+        }
+        throw e;
+      }
+      audit("tidied", { tx: decoded.txHash, fee: decoded.fee, inputs: decoded.inputs.length, collateralLovelace: plan.collateralLovelace });
+      return {
+        status: 200,
+        body: { dryRun: false, alreadyTidy: false, tidied: true, tx: decoded.txHash, fee: decoded.fee.toString(), why: plan.why, plan: wanted, ...seen },
+      };
+    } catch (e) {
+      const detail = String(e instanceof Error ? e.message : e);
+      // The builder's own words for a wallet that cannot fund it: the plan counted the fee at its
+      // ceiling, but the wallet's ADA is what it is.
+      if (isCoinSelectionFailure(e)) return { status: 409, body: { error: "tidy_impossible", detail: `the wallet cannot fund the layout: ${detail}`, retryable: false } };
+      audit("tidy_error", { error: detail, causes: causeChain(e).slice(0, 6) });
+      return { status: 500, body: { error: "tidy_failed", detail } };
+    }
+  });
+}
+
 type Sample = [labels: string, value: string | number];
 
 /** Prometheus exposition, behind the same bearer token: what this wallet has spent is not public. */
@@ -1927,6 +2208,22 @@ function preflight() {
         : ungated.length
           ? `${thresholds.map(([a, v]) => `${a} > ${v}`).join(", ")}; no threshold for ${ungated.join(", ")}`
           : thresholds.map(([a, v]) => `${a} > ${v}`).join(", "));
+    // A policy id copied from an explorer can be a copycat's: several policies mint a token named
+    // "USDCx". The wallet only pays what is listed, so the one place a lookalike gets in is here.
+    for (const asset of Object.keys(ap.perTxMax)) {
+      if (asset === "lovelace") continue;
+      const net = networkName(NETWORK);
+      const known = knownAsset(net, asset);
+      const copy = known ? undefined : lookalike(net, asset);
+      const label = known ? known.ticker : `${asset.slice(0, 8)}…`;
+      if (known) add("ok", `${where}: asset ${label}`, describeKnown(known));
+      else if (copy)
+        add(IS_MAINNET ? "fail" : "warn", `${where}: asset ${label}`,
+          `${asset} is named "${displayName(asset)}" but is not ${copy.ticker}; the ${copy.ticker} this wallet knows is ${copy.id}`);
+      else
+        add("warn", `${where}: asset ${label}`,
+          `${asset} is not a known stablecoin; check the policy id and its decimals yourself`);
+    }
     const methods = ap.allowedAssetTransferMethods ?? ["default"];
     add(methods.includes("masumi") ? "warn" : "ok", `${where}: asset transfer methods`,
       methods.includes("masumi")
@@ -2001,7 +2298,9 @@ function gone(res: ServerResponse): boolean {
  * The spend stays on the ledger: a transaction is not unsigned by nobody having read it, its UTXO
  * is claimed either way, and a copy that did leak could still be submitted. So this is a record
  * rather than a refund — and the only thing that ever says the payment the cap is counting did not
- * happen. Alert on it.
+ * happen. Alert on it. The spend does come back the way any other does (`releaseExpired`), but
+ * only once the TTL has passed and the chain shows the transaction was never included, which is
+ * when a leaked copy stops being a risk too.
  */
 function undelivered(agentId: string, reason: string, nonce: string, id?: string) {
   audit("signed_undelivered", { id, agentId, reason, nonce });
@@ -2085,6 +2384,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.error(`agents: ${Object.keys(policy.agents).join(", ")}`);
   console.error(`key:    ${KEYSTORE_FILE ? "encrypted keystore" : "plaintext mnemonic"}`);
   console.error(`batch:  ${channels ? `batch-settlement available, channels in ${resolvePath(CHANNELS_DIR)}` : `batch-settlement unavailable (${BATCH_UNAVAILABLE})`}`);
+  console.error(`release: ${RELEASE_EXPIRED_SPENDS ? `a payment that never lands is given back ${RELEASE_MARGIN_SECONDS}s after its TTL` : "off (RELEASE_EXPIRED_SPENDS=0): every signed payment counts for the full 24h"}`);
   for (const note of permissionNotes) console.error(`  ${note.level === "warn" ? "WARNING " : ""}${note.detail}`);
   console.error(`none of the policy, audit or ledger files, nor the channels directory, may be writable by the agent's user`);
   console.error(`run "walletctl preflight" before pointing this at real money`);

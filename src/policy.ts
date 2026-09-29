@@ -96,6 +96,14 @@ export interface SpendRecord {
   amount: bigint;
   /** A batch-settlement voucher's increment; absent for a transaction. The two have separate hourly limits. */
   voucher?: boolean;
+  /**
+   * An `exact` payment's transaction hash (64 lowercase hex) and the slot after which it can no
+   * longer be put in a block, both read back from the transaction that was signed. They are how
+   * signerd can later tell that this spend never landed and give its budget back (see expiry.ts).
+   * Absent on a voucher, and on a spend recorded before these existed: those are never given back.
+   */
+  tx?: string;
+  ttlSlot?: number;
 }
 
 export interface PaymentRequest {

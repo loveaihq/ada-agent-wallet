@@ -2,11 +2,12 @@
 /**
  * Operator CLI: walletctl status | preflight | pending | approve <id> | deny <id> | audit [n]
  *   batch-settlement: channels | refund <channelId> <url> | close <channelId> | end <channelId>
- *                     | elapse <channelId> | recover <agentId>
+ *                     | elapse <channelId> | recover <agentId> | tidy [--dry-run] [--collateral <ada>]
  */
 import { readFileSync, existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
+import { formatAda, parseAda } from "./tidy.js";
 
 const URL_ = process.env.SIGNERD_URL ?? "http://127.0.0.1:7402";
 const headers = { authorization: `Bearer ${process.env.SIGNERD_TOKEN ?? ""}`, "content-type": "application/json" };
@@ -14,6 +15,7 @@ const [cmd, arg, arg2] = process.argv.slice(2);
 const USAGE = [
   "walletctl status | preflight | pending | approve <id> | deny <id> | audit [n]",
   "          channels | refund <channelId> <url> | close <channelId> | end <channelId> | elapse <channelId> | recover <agentId>",
+  "          tidy [--dry-run] [--collateral <ada>]",
 ].join("\n");
 
 interface PendingEntry {
@@ -179,6 +181,57 @@ try {
       if (!arg) die("recover needs the agent id whose channels to look for");
       console.log(JSON.stringify((await call("/channels/recover", { agentId: arg })).data, null, 2));
       break;
+    case "tidy": {
+      // Channel steps need an ADA-only UTxO for collateral, and `exact` payments can leave the wallet
+      // with none: this puts every token in one output and the ADA where a channel step can use it.
+      let dryRun = false;
+      let collateral: bigint | undefined;
+      const flags = process.argv.slice(3);
+      for (let i = 0; i < flags.length; i++) {
+        if (flags[i] === "--dry-run") dryRun = true;
+        else if (flags[i] === "--collateral") {
+          const given = flags[++i];
+          collateral = given === undefined ? undefined : parseAda(given);
+          if (collateral === undefined) die(`--collateral needs an amount of ADA, such as 5 or 2.5, got "${given ?? ""}"`);
+        } else die(`tidy takes --dry-run and --collateral <ada>, not "${flags[i]}"`);
+      }
+      const { status, data } = await call("/tidy", { ...(dryRun ? { dryRun } : {}), ...(collateral !== undefined ? { collateralLovelace: collateral.toString() } : {}) }, true);
+      const r = data as {
+        error?: string;
+        detail?: string;
+        layout?: string;
+        skippedReferenceScripts?: number;
+        dryRun?: boolean;
+        alreadyTidy?: boolean;
+        why?: string;
+        tx?: string;
+        fee?: string;
+        plan?: { inputs: number; tokens: Record<string, string>; collateralLovelace: string; tokenMinLovelace: string };
+      };
+      if (r.layout) console.log(`the wallet: ${r.layout}`);
+      if (status !== 200) die(`tidy: ${r.error ?? status}: ${r.detail ?? JSON.stringify(data)}`);
+      if (r.skippedReferenceScripts) console.log(`${r.skippedReferenceScripts} UTxO(s) carrying a reference script are left alone`);
+      if (r.alreadyTidy) {
+        console.log(`already tidy: ${r.why}`);
+        break;
+      }
+      const p = r.plan!;
+      const tokenKinds = Object.keys(p.tokens).length;
+      const makes =
+        `${tokenKinds ? `one output with every token (${tokenKinds} kind(s)) at about ${formatAda(BigInt(p.tokenMinLovelace))}, ` : ""}` +
+        `one ADA-only output of ${formatAda(BigInt(p.collateralLovelace))}, and the rest as ADA-only change`;
+      if (r.dryRun) {
+        console.log(`needs tidying: ${r.why}`);
+        console.log(`would spend ${p.inputs} UTxO(s) to make ${makes}`);
+        console.log("nothing was built; run it without --dry-run to do it");
+        break;
+      }
+      console.log(`tidied: ${r.tx}`);
+      console.log(`  spent ${p.inputs} UTxO(s) to make ${makes}`);
+      console.log(`  fee ${formatAda(BigInt(r.fee!))}, paid by the wallet and charged to no agent's budget`);
+      console.log("  the provider lists the new outputs a while after the block; `walletctl tidy --dry-run` says \"already tidy\" once it does");
+      break;
+    }
     default:
       console.log(USAGE);
   }
