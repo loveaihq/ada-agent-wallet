@@ -59,7 +59,8 @@ Masumi's Payment Service (the other Cardano agent-payment stack) has none of the
 ```
 npm i -g ada-agent-wallet
 ```
-Node 20 or newer. Five commands: `ada-signerd`, `ada-wallet-mcp`, `ada-walletctl`, `ada-keystore`,
+Node 22 or newer (Node 20 reached end of life in April 2026), on Linux, macOS or Windows; CI runs
+the tests on all three. Five commands: `ada-signerd`, `ada-wallet-mcp`, `ada-walletctl`, `ada-keystore`,
 and `ada-agent-wallet` (the MCP server again, so an agent config line is `npx -y ada-agent-wallet`).
 To work on the code instead, clone this repo and use the flow below.
 

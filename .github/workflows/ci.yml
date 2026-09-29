@@ -25,7 +25,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node: [20, 22]
+        node: [22, 24]
     steps:
       # The repository's files are LF; a Windows checkout would otherwise turn them into CRLF and
       # test something no one ships.
@@ -37,9 +37,9 @@ jobs:
           cache: npm
       # `prepare` builds dist/ as part of the install, as it does for anyone installing from git.
       - run: npm ci
-      # bash on every runner, Windows included: `test/*.test.ts` is expanded by the shell, as it is
-      # for anyone running `npm test` in one, rather than handed to Node 20, which reads it as a
-      # file name. The output is kept for the step after it.
+      # bash on every runner, so `pipefail` keeps npm test's exit status through the `tee` that keeps
+      # the output for the step after it. (npm itself runs the script with cmd on Windows, where
+      # `test/*.test.ts` reaches Node unexpanded; Node 22 and later read it as a glob.)
       - name: npm test
         shell: bash
         run: |
@@ -51,9 +51,12 @@ jobs:
         shell: bash
         run: |
           [ -f test-output.txt ] || exit 0
-          # One annotation holding the end of the output, newlines encoded the way annotations want.
-          body=$(tail -n 25 test-output.txt | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
-          echo "::error title=npm test, last 25 lines::${body}"
+          # One annotation per kind: every test that did not pass with the lines under it, and the
+          # end of the output. Newlines are encoded the way annotations want them.
+          enc() { sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}'; }
+          notok=$(grep -A 12 -E "^\s*not ok" test-output.txt | head -120 | enc || true)
+          [ -n "$notok" ] && echo "::error title=npm test, what did not pass::${notok}"
+          echo "::error title=npm test, last 25 lines::$(tail -n 25 test-output.txt | enc)"
       - run: npm run typecheck
       # Real mode bits and a signal signerd can drain on: the two things Windows cannot show.
       - if: runner.os != 'Windows'
