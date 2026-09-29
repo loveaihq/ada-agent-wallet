@@ -289,10 +289,15 @@ one voucher's worth.
 results are under "Verified".
 
 ## Verified
-- `npm test`: 106 unit tests over the policy engine, the startup replay, the locks, the keystore,
-  the network table, the signed-transaction and channel-transaction checks (sponsored steps
-  included), the channel index, the batch-settlement proxy and the settlement receipt. None needs a chain. `npm run typecheck` covers
-  `dev/` and `test/` too, which `tsx` runs without checking.
+- `npm test`: 188 unit tests over the policy engine, the startup replay and the release of expired
+  spends, the locks, the keystore, the network table, the signed-transaction and
+  channel-transaction checks (sponsored steps included), the channel index, the batch-settlement
+  proxy, the settlement receipt, the build retry, the known assets and the tidy plan. None needs a
+  chain. `npm run typecheck` covers `dev/` and `test/` too, which `tsx` runs without checking.
+- CI (`.github/workflows/ci.yml`) runs both on Linux, macOS and Windows, each on Node 22 and 24,
+  and `npm run posix` (real mode bits, SIGTERM draining the approval queue) on Linux and macOS.
+  All six passed on 2026-09-29. That is the only macOS this has run on: nothing here has been
+  driven on a Mac by hand, and no preprod round trip has run there.
 - `npm run batch` on preprod (2026-09-25), a real MCP client paying `dev/batchseller.ts` through
   `x402_fetch`, 0.1 tADA a request: the first purchase opened a channel in 38 s (deposit 2.732620
   tADA, reserve included), the next nine were vouchers at 33–39 ms each; a response the seller
