@@ -15,6 +15,8 @@
  * ADA-only change. `tidyProblem` is the check on the built transaction before it is submitted, as
  * verifyTx.ts and channelTx.ts are for a payment and a channel step: the plan decided what should
  * happen, a builder made a transaction from it, and until here nothing looked at what came back.
+ * `autoTidyDecision` is the last of the three: whether a channel step that came up short of ADA-only
+ * funds is worth a tidy that signerd starts by itself.
  *
  * The ledger's min-ADA for an output depends on the protocol parameters and on the size of the
  * output as serialized, which this module cannot know, so `tidyPlan` is given a function for it
@@ -228,4 +230,78 @@ export function describeLayout(utxos: readonly Utxo[]): string {
     (carrying.length ? `${carrying.length} with tokens (${formatAda(sum(carrying.map(u => u.lovelace)))} between them)` : "none with tokens") +
     (adaOnly.length ? `, ${adaOnly.length} ADA-only (largest ${formatAda(largest)})` : ", none ADA-only")
   );
+}
+
+// ---- when signerd tidies by itself ------------------------------------------------------------------
+
+/** What the ADA-only UTxOs hold together: the ADA a channel step can fund from, and put up collateral from. */
+export function adaOnlyLovelace(utxos: readonly Utxo[]): bigint {
+  return sum(utxos.filter(u => !carriesTokens(u)).map(u => u.lovelace));
+}
+
+/**
+ * What the ADA-only UTxOs would hold once `plan` is on chain: everything the wallet holds, less what
+ * the tokens keep and the fee. The fee is counted at its ceiling, `TIDY_FEE_MAX`, so a tidy that
+ * frees less than that reads as no gain, and a real fee of a third of it only makes the result better.
+ * The collateral output and the change are both ADA-only, so both are in it.
+ */
+export function adaOnlyLovelaceAfter(plan: TidyWork): bigint {
+  return plan.totalLovelace - plan.tokenMinAda - TIDY_FEE_MAX;
+}
+
+/** What the audit record says when `AUTO_TIDY=0` is why nothing was tried. */
+export const AUTO_TIDY_OFF = "AUTO_TIDY=0: automatic tidying is turned off";
+
+export interface AutoTidyInput {
+  /** `AUTO_TIDY` is not `0`. */
+  enabled: boolean;
+  /** An automatic tidy is queued or building or submitting right now. */
+  tidyInFlight: boolean;
+  now: number;
+  /** When the last automatic tidy was started, whether or not it went through. */
+  lastAutoTidyAt: number | undefined;
+  minIntervalMs: number;
+  /** Why the wallet's own listing cannot be trusted yet (`walletUnsettled`), when it cannot. */
+  unsettled?: string | undefined;
+  /** `tidyPlan` of `utxos`. */
+  plan: TidyPlan;
+  /** The UTxOs the plan was made from. */
+  utxos: readonly Utxo[];
+}
+export type AutoTidyDecision = { tidy: true; why: string } | { tidy: false; why: string };
+
+/**
+ * Whether a channel step that came up short of ADA-only funds is worth a tidy, and if not, why not:
+ * the `why` goes into the audit record either way, so an operator can see what signerd weighed.
+ *
+ * Worth it means the wallet is not tidy, one transaction can tidy it, and afterwards the ADA-only
+ * UTxOs hold more than they do now, with the fee counted at its ceiling. A wallet whose ADA is all
+ * in ADA-only UTxOs already, however many and however small, gains nothing: tidying moves ADA between
+ * ADA-only UTxOs and pays a fee. What this cannot know is how much the failed step needed, so a tidy
+ * that frees ADA but not enough is still started, and at most once per interval.
+ */
+export function autoTidyDecision(i: AutoTidyInput): AutoTidyDecision {
+  if (!i.enabled) return { tidy: false, why: AUTO_TIDY_OFF };
+  if (i.tidyInFlight) return { tidy: false, why: "an automatic tidy is already running" };
+  // A last start in the future is a clock that went back; it says nothing about how long ago it was.
+  const since = i.lastAutoTidyAt === undefined ? undefined : i.now - i.lastAutoTidyAt;
+  if (since !== undefined && since >= 0 && since < i.minIntervalMs)
+    return { tidy: false, why: `tidied ${formatDuration(since)} ago; at most one automatic tidy every ${formatDuration(i.minIntervalMs)}` };
+  if (i.unsettled) return { tidy: false, why: `the wallet's UTxOs are not settled yet, so there is nothing reliable to tidy: ${i.unsettled}` };
+  if ("refused" in i.plan) return { tidy: false, why: `a tidy is not possible: ${i.plan.refused}` };
+  if (i.plan.tidy) return { tidy: false, why: `the wallet is already tidy: ${i.plan.why}` };
+  const now = adaOnlyLovelace(i.utxos);
+  const after = adaOnlyLovelaceAfter(i.plan);
+  const counts = `the ADA-only UTxOs hold ${formatAda(now)} now and would hold ${formatAda(after)} after a tidy, its fee counted at ${formatAda(TIDY_FEE_MAX)}`;
+  if (after <= now) return { tidy: false, why: `a tidy would free no ADA for channel steps: ${counts}` };
+  return { tidy: true, why: `${counts}; the layout: ${i.plan.why}` };
+}
+
+/** `45 seconds`, `10 minutes`, `2 hours`: seconds under two minutes, minutes under two hours, hours after that. */
+export function formatDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const plural = (n: number, unit: string) => `${n} ${unit}${n === 1 ? "" : "s"}`;
+  if (s < 120) return plural(s, "second");
+  if (s < 7200) return plural(Math.floor(s / 60), "minute");
+  return plural(Math.floor(s / 3600), "hour");
 }

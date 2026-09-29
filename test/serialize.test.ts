@@ -70,3 +70,25 @@ test("plain lock serializes everything", async () => {
   await Promise.all([lock(task), lock(task), lock(task)]);
   assert.equal(peak, 1);
 });
+
+test("a task started from inside the lock and not awaited runs after the current one, and does not wedge it", async () => {
+  // signerd starts an automatic tidy from code that can be inside a locked section, and the tidy
+  // takes the wallet lock itself. Awaiting it there would wait for a lock only the caller can free;
+  // scheduling it and moving on queues it behind the caller instead.
+  const lock = createLock();
+  const events: string[] = [];
+  let inner: Promise<string> | undefined;
+  await lock(async () => {
+    events.push("outer:start");
+    setImmediate(() => {
+      inner = lock(async () => {
+        events.push("inner");
+        return "inner done";
+      });
+    });
+    await tick(20); // still holding the lock when the immediate fires
+    events.push("outer:end");
+  });
+  assert.equal(await (inner as Promise<string> | undefined), "inner done");
+  assert.deepEqual(events, ["outer:start", "outer:end", "inner"]);
+});

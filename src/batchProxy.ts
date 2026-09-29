@@ -5,7 +5,7 @@
  * count stays in step. A drop-in scheme for any x402Client, as the gated signer is for `exact`.
  */
 import type { PaymentPayloadResult, PaymentRequirements, SchemeClientHooks, SchemeNetworkClient } from "@x402/core/types";
-import { PolicyDenied } from "./gatedSigner.js";
+import { denialOf, type PolicyDenied } from "./gatedSigner.js";
 
 export const BATCH = "batch-settlement";
 
@@ -60,7 +60,7 @@ export function createBatchProxy(cfg: BatchProxyConfig): SchemeNetworkClient {
     async createPaymentPayload(x402Version: number, requirements: PaymentRequirements): Promise<PaymentPayloadResult> {
       const { r, data } = await post("/batch/payload", { agentId: cfg.agentId, reason: cfg.reason(), resource: cfg.resource?.(), x402Version, requirements });
       if (!r.ok) {
-        const denied = new PolicyDenied(String(data.rule ?? data.error ?? "error"), String(data.detail ?? ""), typeof data.id === "string" ? data.id : undefined);
+        const denied = denialOf(data);
         cfg.onDenied?.(denied);
         throw denied;
       }

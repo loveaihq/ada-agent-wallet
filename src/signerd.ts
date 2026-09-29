@@ -21,7 +21,14 @@
  * batch-settlement (preprod, through Blockfrost or Koios; see DESIGN-batch-settlement.md):
  *   POST /batch/payload   {agentId, reason, resource?, x402Version, requirements} -> {x402Version, payload}
  *                         a voucher, or a channel opening or top-up with one; 403, 409 and the
- *                         approval queue as for /sign
+ *                         approval queue as for /sign. Its 409s: channel_busy, the chain has not
+ *                         finished showing the channel's last step (retryable); wallet_tidying, below;
+ *                         insufficient_funds, as for /sign (not retryable).
+ *                         409 wallet_tidying: the step needs an ADA-only UTxO the wallet does not have
+ *                         while its ADA sits in UTxOs that carry tokens, and a tidy is under way (this
+ *                         request started it, see AUTO_TIDY) or has been submitted and is not listed
+ *                         yet. retryable, retryAfterSeconds 60. The operator's channel steps
+ *                         (/channels/refund and the rest) answer the same when they run short.
  *   POST /batch/response  {paymentPayload, requirements, settleResponse?, paymentRequired?} -> {recovered}
  *                         the seller's answer, for the channel's count
  *   GET  /channels                                  -> every channel, whose, and what was signed on it
@@ -34,7 +41,9 @@
  *                         the collateral size (default 5 ADA), the rest as ADA-only change. dryRun builds
  *                         nothing and answers with the plan. 409 utxo_busy while any of the wallet's UTxOs
  *                         is committed to a payment or a channel step that has not settled. Its fee is
- *                         the wallet's, and no agent's budget moves.
+ *                         the wallet's, and no agent's budget moves. signerd also starts one itself
+ *                         when a channel step fails short of ADA-only funds and a tidy would help
+ *                         (AUTO_TIDY): audited as `auto_tidy`, and `auto: true` on its `tidied` record.
  *   The first two take an agent's token; the rest are the operator's.
  *
  * None of POLICY_FILE, AUDIT_FILE or LEDGER_FILE may be writable by the agent's user: between them
@@ -73,6 +82,13 @@
  *                           still does not have it: slack for a provider that lags and for a rollback
  *   RELEASE_EXPIRED_SPENDS  set to 0 to never give a budget back; every signed payment then counts
  *                           for the full 24h whether or not it landed
+ *   AUTO_TIDY               set to 0 to never tidy the wallet by itself. Otherwise, wherever
+ *                           batch-settlement is available, a channel opening, top-up or the operator's
+ *                           refund that fails short of ADA-only funds starts a tidy (the same one as
+ *                           POST /tidy) when that would leave more ADA in ADA-only UTxOs. The tidy's
+ *                           fee is the wallet's; no agent's budget moves
+ *   AUTO_TIDY_MIN_INTERVAL_SECONDS  default 600, at least 60. At most one automatic tidy per this
+ *                           long, whether or not the last one went through
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -125,8 +141,8 @@ import { decryptMnemonic, assertKeystore } from "./keystore.js";
 import { blockfrostBaseUrl, koiosBaseUrl, networkName, sameNetwork } from "./network.js";
 import { describeKnown, displayName, knownAsset, lookalike } from "./assets.js";
 import { chainLookup, landing, reconcile } from "./expiry.js";
-import { isCoinSelectionFailure, isTransientProviderError, withRetries } from "./retry.js";
-import { collateralProblem, describeLayout, tidyPlan, tidyProblem, type Utxo as TidyUtxo } from "./tidy.js";
+import { isCoinSelectionFailure, isShortOfFunds, isTokenShortage, isTransientProviderError, withRetries } from "./retry.js";
+import { AUTO_TIDY_OFF, autoTidyDecision, collateralProblem, describeLayout, tidyPlan, tidyProblem, type Utxo as TidyUtxo } from "./tidy.js";
 
 const PORT = Number(process.env.SIGNERD_PORT ?? 7402);
 const TOKEN = process.env.SIGNERD_TOKEN;
@@ -194,6 +210,14 @@ const BATCH_DEPOSIT_REQUESTS = Number(process.env.BATCH_DEPOSIT_REQUESTS ?? 100)
  */
 const RELEASE_MARGIN_SECONDS = Number(process.env.RELEASE_MARGIN_SECONDS ?? 1800);
 const RELEASE_EXPIRED_SPENDS = process.env.RELEASE_EXPIRED_SPENDS !== "0";
+/**
+ * A channel step that fails short of ADA-only funds starts a tidy on its own, when a tidy would help
+ * (`onShortOfFunds`). A tidy costs a fee, about 0.3 ADA, and keeps the wallet's UTxOs out of every
+ * other build for a minute or so. So they are rationed: ten minutes apart by default, and never
+ * closer than a minute, which would be a wallet tidying itself in a loop.
+ */
+const AUTO_TIDY = process.env.AUTO_TIDY !== "0";
+const AUTO_TIDY_MIN_INTERVAL_SECONDS = Number(process.env.AUTO_TIDY_MIN_INTERVAL_SECONDS ?? 600);
 
 function fail(msg: string): never {
   console.error(`signerd: ${msg}`);
@@ -226,6 +250,8 @@ if (!Number.isInteger(BATCH_DEPOSIT_REQUESTS) || BATCH_DEPOSIT_REQUESTS < 10)
 // A margin of nothing is the TTL alone, which a provider one block behind would get wrong.
 if (!Number.isInteger(RELEASE_MARGIN_SECONDS) || RELEASE_MARGIN_SECONDS < 60)
   fail(`RELEASE_MARGIN_SECONDS must be a whole number of seconds, at least 60, got "${process.env.RELEASE_MARGIN_SECONDS}"`);
+if (!Number.isInteger(AUTO_TIDY_MIN_INTERVAL_SECONDS) || AUTO_TIDY_MIN_INTERVAL_SECONDS < 60)
+  fail(`AUTO_TIDY_MIN_INTERVAL_SECONDS must be a whole number of seconds, at least 60, got "${process.env.AUTO_TIDY_MIN_INTERVAL_SECONDS}"`);
 // Resolved once, so "is this mainnet" is a fact about a known chain and not a suffix match that
 // would read `cardano:preview` as mainnet's opposite and point it at mainnet's providers.
 const IS_MAINNET = (() => {
@@ -696,9 +722,10 @@ class UtxoBusy extends AuditedError {}
  * daemon: an x402 endpoint priced in an asset this wallet has never held reaches here, and
  * "something broke" is the wrong thing to tell an agent that needs to stop asking.
  *
- * Matched on the builder's messages because the SDK gives them no code of its own. There are two:
- * a failed coin selection when the wallet holds less than the payment, and no valid change when it
- * holds the payment but not the fee and a change output besides. If those messages ever change,
+ * Matched on the builder's messages because the SDK gives them no code of its own. There are three:
+ * a failed coin selection when the wallet holds less than the payment, no valid change when it
+ * holds the payment but not the fee and a change output besides, and "cannot balance transaction"
+ * when the leftover carries tokens and too little ADA to hold them. If those messages ever change,
  * the condition falls back to a plain 500, which is what it was before.
  */
 class InsufficientFunds extends AuditedError {}
@@ -973,6 +1000,18 @@ class BatchDenied extends AuditedError {
  * it has. Like utxo_busy, the caller is told to retry.
  */
 class ChannelBusy extends AuditedError {}
+
+/**
+ * Not a failure either: a channel step ran short of ADA-only funds while the wallet's ADA sits in
+ * UTxOs that carry tokens, and a tidy of the wallet is under way or waiting for the provider to list
+ * its outputs. Asking again in a minute works, and "the wallet lacks the funds", which `insufficient_funds`
+ * says and marks not retryable, would be wrong and would make an agent give up.
+ */
+class WalletTidying extends AuditedError {}
+/** The sentence an agent is given: what is happening, and what to do. */
+const WALLET_TIDYING_DETAIL = "the wallet is rearranging its funds; try again in about a minute";
+const WALLET_TIDYING_RETRY_SECONDS = 60;
+const walletTidyingBody = () => ({ error: "wallet_tidying", detail: WALLET_TIDYING_DETAIL, retryable: true, retryAfterSeconds: WALLET_TIDYING_RETRY_SECONDS });
 
 /** A voucher over approvalAbove: it is queued, and made again once a human has approved it. */
 class NeedsApproval extends Error {
@@ -1324,13 +1363,6 @@ async function channelList(only?: string) {
 const AGENT_PATHS = new Set(["/sign", "/status", "/batch/payload", "/batch/response"]);
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-/**
- * The channel client's own refusals when the wallet cannot fund a step, or could fund it only by
- * leaving nothing to put up as the refund's collateral.
- */
-const isShortOfFunds = (e: unknown) =>
-  isCoinSelectionFailure(e) || (e instanceof Error && /the wallet holds \d+ of the currency|no UTxO to open|would leave no ADA-only UTxOs/.test(e.message));
-
 let shuttingDown = false;
 
 class BadRequest extends Error {
@@ -1593,7 +1625,14 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
           return { kind: "error", error: new ChannelBusy(e.message) };
         }
         if (isShortOfFunds(e)) {
-          audit("insufficient_funds", { agentId, reason, payTo: r.payTo, asset: r.asset, amount: r.amount, scheme: BATCH });
+          // The batch call has returned, so the wallet lock is free: a tidy started here queues on it
+          // and is not waited for (`onShortOfFunds`).
+          const short = await onShortOfFunds({ agentId, step: "batch/payload", reason, message: e instanceof Error ? e.message : String(e), token: isTokenShortage(e) });
+          if (short.wait) {
+            if (!short.started) audit("wallet_tidying", { agentId, reason, detail: short.why });
+            return { kind: "error", error: new WalletTidying(WALLET_TIDYING_DETAIL) };
+          }
+          audit("insufficient_funds", { agentId, reason, payTo: r.payTo, asset: r.asset, amount: r.amount, scheme: BATCH, tidy: short.why });
           return { kind: "error", error: new InsufficientFunds(`the wallet cannot fund a channel for ${r.amount} of ${r.asset}: ${e instanceof Error ? e.message : e}`) };
         }
         // The SDK's message leaves out what failed underneath it; the chain of causes says.
@@ -1607,6 +1646,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       const e = outcome.error;
       const detail = String(e instanceof Error ? e.message : e);
       if (e instanceof ChannelBusy) return json(res, 409, { error: "channel_busy", detail, retryable: true });
+      if (e instanceof WalletTidying) return json(res, 409, walletTidyingBody());
       if (e instanceof InsufficientFunds) return json(res, 409, { error: "insufficient_funds", detail, retryable: false, asset: r.asset });
       return json(res, 500, { error: "batch_failed", detail });
     }
@@ -1883,7 +1923,18 @@ async function channelRequest(method: string, path: string, body: Record<string,
     const detail = String(e instanceof Error ? e.message : e);
     if (e instanceof BatchDenied) return json(res, 403, { error: "policy_denied", rule: e.rule, detail: e.detail });
     if (/^not yet:/.test(detail)) return json(res, 409, { error: "not_yet", detail });
-    if (!(e instanceof AuditedError)) audit("channel_error", { agentId: entry.agentId, channelId, step: path, error: detail });
+    // The operator's steps put up collateral from an ADA-only UTxO as an agent's do, so a refund or an
+    // exit can run short in the same way, and a tidy is the same help. The lock is free by now.
+    let tidyNote: string | undefined;
+    if (isShortOfFunds(e)) {
+      const short = await onShortOfFunds({ agentId: entry.agentId, step: path.replace(/^\/channels\//, ""), message: detail, token: isTokenShortage(e) });
+      if (short.wait) {
+        if (!short.started) audit("wallet_tidying", { agentId: entry.agentId, channelId, step: path, detail: short.why });
+        return json(res, 409, walletTidyingBody());
+      }
+      tidyNote = short.why;
+    }
+    if (!(e instanceof AuditedError)) audit("channel_error", { agentId: entry.agentId, channelId, step: path, error: detail, ...(tidyNote ? { tidy: tidyNote } : {}) });
     return json(res, e instanceof AuditedError ? 409 : 500, { error: "channel_step_failed", detail });
   }
   return json(res, 404, { error: "not found" });
@@ -1948,8 +1999,11 @@ function walletUnsettled(listed: readonly string[]): string | undefined {
  * from these UTxOs meanwhile; afterwards the inputs and the new outputs are booked as the channel
  * client books its own transactions, so nothing builds from the old ones, and the client waits for
  * the new ones, until the provider's listing catches up.
+ *
+ * `how.auto` is for the tidy signerd starts itself when a channel step runs short (`onShortOfFunds`):
+ * the same tidy, and its `tidied` record says `auto: true`.
  */
-async function tidyWallet(dryRun: boolean, collateralLovelace: bigint | undefined): Promise<{ status: number; body: Record<string, unknown> }> {
+async function tidyWallet(dryRun: boolean, collateralLovelace: bigint | undefined, how: { auto?: boolean } = {}): Promise<{ status: number; body: Record<string, unknown> }> {
   const c = channels!;
   return withWalletLock(async () => {
     const w = c.wallet;
@@ -2009,6 +2063,7 @@ async function tidyWallet(dryRun: boolean, collateralLovelace: bigint | undefine
       const created = decoded.outputs.map((_, i) => `${decoded.txHash}#${i}`);
       for (const input of decoded.inputs) inFlight.set(input, at);
       for (const ref of created) ownOutputs.set(ref, { tx: decoded.txHash, at });
+      lastTidyTx = decoded.txHash;
       try {
         await c.chain.submit(hex);
       } catch (e) {
@@ -2016,10 +2071,11 @@ async function tidyWallet(dryRun: boolean, collateralLovelace: bigint | undefine
         if (e instanceof SubmitError && e.status < 500) {
           for (const input of decoded.inputs) inFlight.delete(input);
           for (const ref of created) ownOutputs.delete(ref);
+          lastTidyTx = undefined;
         }
         throw e;
       }
-      audit("tidied", { tx: decoded.txHash, fee: decoded.fee, inputs: decoded.inputs.length, collateralLovelace: plan.collateralLovelace });
+      audit("tidied", { tx: decoded.txHash, fee: decoded.fee, inputs: decoded.inputs.length, collateralLovelace: plan.collateralLovelace, ...(how.auto ? { auto: true } : {}) });
       return {
         status: 200,
         body: { dryRun: false, alreadyTidy: false, tidied: true, tx: decoded.txHash, fee: decoded.fee.toString(), why: plan.why, plan: wanted, ...seen },
@@ -2032,6 +2088,137 @@ async function tidyWallet(dryRun: boolean, collateralLovelace: bigint | undefine
       audit("tidy_error", { error: detail, causes: causeChain(e).slice(0, 6) });
       return { status: 500, body: { error: "tidy_failed", detail } };
     }
+  });
+}
+
+// ---- tidy, started by signerd itself ---------------------------------------------------------------
+
+/**
+ * The last tidy this process booked, by hand or by itself. Until the provider lists its outputs the
+ * wallet looks emptier than it is, and a channel step that runs short in that while is waiting for
+ * the tidy, not short of funds.
+ */
+let lastTidyTx: string | undefined;
+/** `lastAt` is when the last automatic tidy was started, whether or not it went through; `running` while one is queued, building or submitting. */
+const autoTidy: { lastAt: number | undefined; running: boolean } = { lastAt: undefined, running: false };
+
+/** What ran short, for the decision and for the audit record that says why a tidy was started. */
+interface Shortage {
+  agentId: string;
+  /** `batch/payload` for an agent's opening or top-up; `refund`, `close`, `end` or `elapse` for the operator's. */
+  step: string;
+  reason?: string;
+  message: string;
+  /** A shortage of the token itself, which a tidy cannot make up. */
+  token: boolean;
+}
+type ShortAnswer = { wait: true; started: boolean; why: string } | { wait: false; why: string };
+
+/** The output of the last tidy that the provider does not list yet, while it can still be on its way. */
+function tidyUnlisted(listed: readonly string[]): string | undefined {
+  if (lastTidyTx === undefined) return undefined;
+  const seen = new Set(listed);
+  const now = Date.now();
+  for (const [ref, out] of ownOutputs) {
+    if (out.tx === lastTidyTx && !seen.has(ref) && !inFlight.has(ref) && now - out.at < PENDING_MS)
+      return `tidy ${out.tx} has been submitted and the provider does not list its output ${ref} yet`;
+  }
+  return undefined;
+}
+
+/**
+ * A channel step ran short of ADA-only funds. Either a tidy is on its way (`wait`, and the caller
+ * answers `wallet_tidying`: ask again in a minute), or it is not, and `why` says what was weighed
+ * and the caller answers as it always did.
+ *
+ * A tidy is on its way when one was started by this call, or is running, or was submitted and its
+ * outputs are not listed. A new one is started when `autoTidyDecision` says it would help. It is
+ * never awaited here: it takes 20 to 60 seconds to be listed and the agent is told to come back.
+ *
+ * Reading the wallet can fail, and then there is nothing to decide from: the answer is the old one.
+ */
+async function onShortOfFunds(s: Shortage): Promise<ShortAnswer> {
+  try {
+    if (s.token) return { wait: false, why: "the shortage is of the token itself, and rearranging the wallet's UTxOs moves none in" };
+    if (autoTidy.running) return { wait: true, started: false, why: "an automatic tidy is already running" };
+    // Nothing to read the wallet for, and no operator's tidy to wait for.
+    if (!AUTO_TIDY && lastTidyTx === undefined) return { wait: false, why: AUTO_TIDY_OFF };
+    const c = channels!;
+    const listed = await retryQueries("the wallet's UTxOs", () => c.wallet.getWalletUtxos());
+    const refs = listed.map(refOf);
+    const unlisted = tidyUnlisted(refs);
+    if (unlisted) return { wait: true, started: false, why: unlisted };
+    // As tidyWallet sees the wallet: a UTxO that carries a reference script is left alone.
+    const utxos = listed.filter(u => u.scriptRef === undefined).map(tidyUtxo);
+    const coinsPerUtxoByte = await c.chain.coinsPerUtxoByte();
+    const decision = autoTidyDecision({
+      enabled: AUTO_TIDY,
+      tidyInFlight: autoTidy.running,
+      now: Date.now(),
+      lastAutoTidyAt: autoTidy.lastAt,
+      minIntervalMs: AUTO_TIDY_MIN_INTERVAL_SECONDS * 1000,
+      unsettled: walletUnsettled(refs),
+      plan: tidyPlan(utxos, { minAda: tokens => tokenOutputMinAda(tokens, coinsPerUtxoByte) }),
+      utxos,
+    });
+    if (!decision.tidy) {
+      // Another request may have started one while this one was reading the wallet.
+      return autoTidy.running ? { wait: true, started: false, why: decision.why } : { wait: false, why: decision.why };
+    }
+    startAutoTidy(s, decision.why);
+    return { wait: true, started: true, why: decision.why };
+  } catch (e) {
+    return { wait: false, why: `could not read the wallet to decide on a tidy: ${e instanceof Error ? e.message : e}`.slice(0, 300) };
+  }
+}
+
+/**
+ * Starts `tidyWallet` and returns at once. Every path that can get here runs after the channel step
+ * has returned and its wallet lock is free, but this does not depend on it: `tidyWallet` takes the
+ * wallet lock itself, and started from inside a task that holds it, awaiting it would wait for a
+ * lock that only this task can release. So it is not awaited, and it starts on the next turn of the
+ * event loop, when whatever is running now has returned and any lock it took is queued behind it.
+ * Locks are only ever taken agent, then wallet, and `tidyWallet` takes the wallet lock alone, so it
+ * cannot close a cycle either.
+ *
+ * Whatever happens to it, nothing here throws: this is a promise no request is waiting on, and a
+ * rejection nobody handles ends the process. What went wrong is audited, and logged once.
+ */
+function startAutoTidy(s: Shortage, why: string) {
+  // Audited before anything is set: an audit that cannot be written throws, and a tidy that was never
+  // scheduled must not leave `running` true for good.
+  audit("auto_tidy", { agentId: s.agentId, step: s.step, ...(s.reason !== undefined ? { reason: s.reason } : {}), message: s.message.slice(0, 500), why });
+  const before = autoTidy.lastAt;
+  autoTidy.lastAt = Date.now();
+  autoTidy.running = true;
+  const failed = (event: string, data: Record<string, unknown>, line: string) => {
+    console.error(`signerd: automatic tidy ${line}`);
+    try {
+      audit(event, data);
+    } catch (e) {
+      console.error(`signerd: and could not audit it: ${e instanceof Error ? e.message : e}`);
+    }
+  };
+  setImmediate(() => {
+    void (async () => {
+      try {
+        const out = await tidyWallet(false, undefined, { auto: true });
+        if (out.body.tidied === true) return;
+        const detail = String(out.body.detail ?? out.body.why ?? "");
+        if (out.status === 200) {
+          // The wallet was already tidy by the time this ran: the shortage was not the layout's.
+          failed("auto_tidy_skipped", { status: out.status, detail }, `did nothing: ${detail}`);
+        } else {
+          // utxo_busy builds nothing and costs nothing, so it does not use up the interval.
+          if (out.status === 409 && out.body.error === "utxo_busy") autoTidy.lastAt = before;
+          failed("auto_tidy_failed", { status: out.status, error: out.body.error, detail }, `failed: ${String(out.body.error ?? out.status)}: ${detail}`);
+        }
+      } catch (e) {
+        failed("auto_tidy_failed", { error: String(e) }, `failed: ${e instanceof Error ? e.message : e}`);
+      } finally {
+        autoTidy.running = false;
+      }
+    })();
   });
 }
 

@@ -10,8 +10,14 @@
  * selection failure is an answer about the wallet, not about the network.
  */
 
-/** The builder's own words for a wallet that cannot fund the payment. There is no code to match on. */
-const COIN_SELECTION = /coin selection failed|cannot create valid change/i;
+/**
+ * The builder's own words for a wallet that cannot fund the payment. There is no code to match on.
+ * `Cannot balance transaction: Native assets present in leftover but insufficient lovelace (3216191 <
+ * 3590230 minUTxO)` is the same answer said differently: seen from an `exact` payment out of a wallet
+ * whose one UTxO held many tokens and 4.7 tADA, which could not pay and still give the tokens back
+ * their min-ADA.
+ */
+const COIN_SELECTION = /coin selection failed|cannot create valid change|cannot balance transaction/i;
 const PROVIDER_READ = /\b(blockfrost|koios) \w+ failed\b/i;
 const NETWORK = /fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|UND_ERR_\w+/i;
 const SUBMIT = /submit/i;
@@ -39,6 +45,22 @@ function describe(e: unknown): string {
 }
 
 export const isCoinSelectionFailure = (e: unknown) => e instanceof Error && COIN_SELECTION.test(describe(e));
+
+/**
+ * The channel client's own refusals when the wallet cannot fund a step: a failed coin selection, no
+ * UTxO to open from, no ADA-only UTxO large enough for the collateral (which is how it says so
+ * before it has tried to build a top-up or a refund), or a step that could be funded only by leaving
+ * nothing to put up as the refund's collateral. All of them are about how the wallet's ADA is laid
+ * out or how much of it there is, which is what tidy.ts is for.
+ */
+const SHORT_OF_FUNDS = /the wallet holds \d+ of the currency|no UTxO to open|would leave no ADA-only UTxOs|no ADA-only UTxOs large enough for collateral/;
+export const isShortOfFunds = (e: unknown) => isCoinSelectionFailure(e) || (e instanceof Error && SHORT_OF_FUNDS.test(e.message));
+
+/**
+ * The one of those that is about a token and not about ADA: a token channel's deposit is more of the
+ * token than the wallet holds. Rearranging the wallet's UTxOs moves no token in, so it cannot help.
+ */
+export const isTokenShortage = (e: unknown) => e instanceof Error && /the wallet holds \d+ of the currency/.test(e.message);
 
 /**
  * A provider read that failed, or the network under one. False for anything that mentions a submit

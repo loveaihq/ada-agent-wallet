@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isCoinSelectionFailure, isTransientProviderError, withRetries } from "../src/retry.ts";
+import { isCoinSelectionFailure, isShortOfFunds, isTokenShortage, isTransientProviderError, withRetries } from "../src/retry.ts";
 
 /** What undici throws: `fetch failed`, with the socket's reason as the cause, carrying a code. */
 const fetchFailed = (code: string, message = code) =>
@@ -53,6 +53,61 @@ test("a coin selection failure is an answer about the wallet, not the network", 
     assert.equal(isCoinSelectionFailure(new Error(message)), true, message);
   }
   assert.equal(isTransientProviderError(new Error("failed", { cause: new Error("coin selection failed") })), false);
+});
+
+test("a builder that cannot balance the transaction is the same answer about the wallet", () => {
+  // Word for word what an `exact` payment out of a wallet with one token-laden UTxO and 4.7 tADA got.
+  const seen = "Cannot balance transaction: Native assets present in leftover but insufficient lovelace (3216191 < 3590230 minUTxO) after 1 selection attempts.";
+  for (const message of [seen, seen.toLowerCase(), `sign_failed: ${seen}`, "CANNOT BALANCE TRANSACTION"]) {
+    assert.equal(isCoinSelectionFailure(new Error(message)), true, message);
+    assert.equal(isTransientProviderError(new Error(message)), false, message);
+  }
+  // It arrives wrapped, and after a provider read that did fail: still an answer about the wallet.
+  assert.equal(isCoinSelectionFailure(new Error("build failed", { cause: new Error(seen) })), true);
+  assert.equal(isTransientProviderError(new Error("Blockfrost getUtxos failed", { cause: new Error(seen) })), false);
+  assert.equal(isTransientProviderError(new TypeError("fetch failed", { cause: new Error(seen) })), false);
+  // Only errors count, as before.
+  assert.equal(isCoinSelectionFailure(seen), false);
+  // Near misses are not it.
+  for (const message of ["Cannot balance", "cannot build transaction", "transaction balanced"]) assert.equal(isCoinSelectionFailure(new Error(message)), false, message);
+});
+
+test("what the channel client says when the wallet is short of funds for a step", () => {
+  for (const message of [
+    "no UTxO to open a lovelace channel from",
+    "an opening of 3000000 would leave no ADA-only UTxOs large enough for the refund's collateral (left: 1500000)",
+    "a top-up of 1000000 would leave no ADA-only UTxOs large enough for the refund's collateral (left: none)",
+    // What a top-up or a refund says when the wallet has too little ADA-only ADA before it builds anything.
+    "no ADA-only UTxOs large enough for collateral (largest three 1700000)",
+    "no ADA-only UTxOs large enough for collateral (largest three )",
+    "the wallet holds 0 of the currency, 1000 needed",
+    "Coin selection failed: insufficient funds",
+    "Cannot create valid change",
+    "Cannot balance transaction: Native assets present in leftover but insufficient lovelace (1 < 2 minUTxO)",
+  ]) {
+    assert.equal(isShortOfFunds(new Error(message)), true, message);
+  }
+  for (const message of [
+    "channel abababababababab… is still opening (tx); retry shortly",
+    "channel abababababababab…: its top-up tx is not on chain yet; retry shortly",
+    "Blockfrost getUtxos failed",
+    "fetch failed",
+    "owed 5 tokens; the server must claim them before a refund",
+    "the builder put up collateral other than the offer",
+  ]) {
+    assert.equal(isShortOfFunds(new Error(message)), false, message);
+  }
+  assert.equal(isShortOfFunds("no UTxO to open a lovelace channel from"), false);
+  assert.equal(isShortOfFunds(undefined), false);
+});
+
+test("a shortage of the token itself is told apart, since rearranging the wallet cannot make it up", () => {
+  assert.equal(isTokenShortage(new Error("the wallet holds 0 of the currency, 1000 needed")), true);
+  assert.equal(isTokenShortage(new Error("the wallet holds 999 of the currency, 1000 needed")), true);
+  for (const message of ["no UTxO to open a lovelace channel from", "Coin selection failed", "no ADA-only UTxOs large enough for collateral (largest three )"]) {
+    assert.equal(isTokenShortage(new Error(message)), false, message);
+  }
+  assert.equal(isTokenShortage("the wallet holds 0 of the currency, 1 needed"), false);
 });
 
 test("anything else, and anything that is not an error, is not transient", () => {

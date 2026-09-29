@@ -25,9 +25,45 @@ export interface GatedSignerConfig {
 }
 
 export class PolicyDenied extends Error {
-  constructor(public readonly rule: string, public readonly detail: string, public readonly pendingId?: string) {
+  constructor(
+    public readonly rule: string,
+    public readonly detail: string,
+    public readonly pendingId?: string,
+    /** signerd's own word on whether asking again can help: `utxo_busy`, `channel_busy` and `wallet_tidying` say yes, `insufficient_funds` no. */
+    public readonly retryable?: boolean,
+    public readonly retryAfterSeconds?: number,
+  ) {
     super(`policy ${rule}: ${detail}`);
   }
+}
+
+/**
+ * signerd's refusal as the agent will meet it. `rule` is the policy rule when there is one and
+ * otherwise the error code, so a 409 `wallet_tidying` reaches the agent under that name, with the
+ * sentence signerd wrote for it and the flag that says it is a wait and not an answer. Both proxies
+ * build their denials here, so they cannot disagree about what a code means.
+ */
+export function denialOf(data: Record<string, unknown>): PolicyDenied {
+  const after = data.retryAfterSeconds;
+  return new PolicyDenied(
+    String(data.rule ?? data.error ?? "error"),
+    String(data.detail ?? ""),
+    typeof data.id === "string" ? data.id : undefined,
+    typeof data.retryable === "boolean" ? data.retryable : undefined,
+    typeof after === "number" && Number.isFinite(after) && after > 0 ? after : undefined,
+  );
+}
+
+/** What a tool tells the agent about a denial. `retryable` and `retryAfterSeconds` are there only when signerd said them. */
+export function denialReport(d: PolicyDenied): Record<string, unknown> {
+  return {
+    denied: true,
+    rule: d.rule,
+    detail: d.detail,
+    pendingId: d.pendingId,
+    ...(d.retryable !== undefined ? { retryable: d.retryable } : {}),
+    ...(d.retryAfterSeconds !== undefined ? { retryAfterSeconds: d.retryAfterSeconds } : {}),
+  };
 }
 
 export async function createGatedSigner(cfg: GatedSignerConfig): Promise<ClientCardanoSigner> {
@@ -57,9 +93,9 @@ export async function createGatedSigner(cfg: GatedSignerConfig): Promise<ClientC
           throw new Error("signerd did not answer within the client's 300s wait; a payment queued for approval was withdrawn unsigned, so ask again once it can be approved promptly");
         throw new Error(`signerd is not answering at ${cfg.signerdUrl}: ${e instanceof Error ? e.message : e}`);
       });
-      const data = (await r.json().catch(() => ({}))) as Record<string, string>;
+      const data = (await r.json().catch(() => ({}))) as Record<string, unknown>;
       if (!r.ok) {
-        const denied = new PolicyDenied(data.rule ?? data.error ?? "error", data.detail ?? "", data.id);
+        const denied = denialOf(data);
         cfg.onDenied?.(denied);
         throw denied;
       }

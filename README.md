@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.7, preprod only.** It has never run on mainnet and has had no external security
+**Status: 0.2.8, preprod only.** It has never run on mainnet and has had no external security
 review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
@@ -240,6 +240,24 @@ UTxOs and no others, every output goes to the wallet, every token comes out as i
 fee is under 1 ADA. The fee is the wallet's, and no agent's budget is charged for it. Like the
 channel endpoints it is the operator's, and preprod's.
 
+signerd also does it by itself. When a channel opening, a top-up or the operator's refund fails
+short of ADA-only funds (the client's `no UTxO to open`, `would leave no ADA-only UTxOs`, a failed
+coin selection), signerd reads the wallet, and if a tidy would leave more ADA in ADA-only UTxOs than
+there is now, with its fee counted at 1 ADA, it starts one in the background and answers `409
+wallet_tidying`: retryable, "the wallet is rearranging its funds; try again in about a minute".
+That replaces `insufficient_funds`, which says the wallet lacks the funds and not to ask again. The
+agent is not held while the tidy confirms. The provider lists its outputs 20 to 60 seconds after
+the block, and a step that comes up short until then gets the same answer. The agent's tools pass it
+on as `denied: true, rule: "wallet_tidying", retryable: true, retryAfterSeconds: 60`. The audit has
+`auto_tidy`, naming the agent, the step and the shortage, and the tidy's `tidied` record says
+`auto: true`. It costs one tidy fee, about 0.2 to 0.3 ADA, paid by the wallet; no agent's budget is
+charged. There is at most one automatic tidy per `AUTO_TIDY_MIN_INTERVAL_SECONDS` (600; at least
+60), whether or not the last one went through. A shortage inside that time, or one a tidy would not
+fix, is `insufficient_funds` as before, and its audit record says why no tidy was tried: the wallet
+is already tidy, lacks the ADA for the layout, holds its ADA in ADA-only UTxOs that are merely
+small, or is short of the token itself. An `exact` payment never starts a tidy. `AUTO_TIDY=0` turns
+it off, and then only `walletctl tidy` does it.
+
 **Sponsored channels (subbit-x402 0.2.1).** A seller may pay for a token channel. Its 402 then
 carries a fee-sponsor offer, one of the seller's ADA-only UTxOs. The channel client opens, tops up
 and refunds on that offer, so a wallet that holds only a stablecoin can pay (subbit-x402's
@@ -265,7 +283,8 @@ A walkthrough, from the seller to the refund, is in
 A top-up is sized for `BATCH_DEPOSIT_REQUESTS` requests at the price that ran short. When the
 wallet cannot fund that much, it tops up what it can, keeping back the fee and such a UTxO for the
 refund. Failing that, it tops up at least what this request is short of. A top-up that would leave
-nothing to put up as the refund's collateral is refused as `insufficient_funds`. Right after a
+nothing to put up as the refund's collateral is refused as `insufficient_funds`, or as
+`wallet_tidying` when signerd tidies the wallet in answer. Right after a
 channel transaction of its own, the client waits, for up to a minute, for Blockfrost to list that
 transaction's change before it builds again.
 
@@ -285,15 +304,15 @@ structured content with its JSON as that block. A retry after any other result i
 one voucher's worth.
 
 `npm run batchseller` is the preprod seller, with its MCP tools on :7414. `npm run batch`,
-`batchexit`, `batchend`, `mcpbatch` and `batchsponsored` are the round trips against it; the
-results are under "Verified".
+`batchexit`, `batchend`, `mcpbatch`, `batchsponsored` and `autotidy` are the round trips against
+it; the results are under "Verified".
 
 ## Verified
-- `npm test`: 188 unit tests over the policy engine, the startup replay and the release of expired
+- `npm test`: 207 unit tests over the policy engine, the startup replay and the release of expired
   spends, the locks, the keystore, the network table, the signed-transaction and
   channel-transaction checks (sponsored steps included), the channel index, the batch-settlement
-  proxy, the settlement receipt, the build retry, the known assets and the tidy plan. None needs a
-  chain. `npm run typecheck` covers `dev/` and `test/` too, which `tsx` runs without checking.
+  proxy, the settlement receipt, the build retry, the known assets, the tidy plan and when to tidy
+  by itself. None needs a chain. `npm run typecheck` covers `dev/` and `test/` too, which `tsx` runs without checking.
 - CI (`.github/workflows/ci.yml`) runs both on Linux, macOS and Windows, each on Node 22 and 24,
   and `npm run posix` (real mode bits, SIGTERM draining the approval queue) on Linux and macOS.
   All six passed on 2026-09-29. That is the only macOS this has run on: nothing here has been
@@ -412,6 +431,18 @@ results are under "Verified".
   nothing else. A second `tidy` straight after was refused `utxo_busy`, a dry run once the provider
   listed the outputs said the wallet was already tidy, and an agent's token was refused
   `operator_only`.
+- `npm run autotidy` on preprod (2026-09-29, Blockfrost), through a real MCP client. The script
+  put the wallet out of order itself (`e84e5c63…`): every token and 19.25 of its 21.16 tADA in one
+  UTxO, 1.90 tADA ADA-only. The agent's purchase could not fund an opening; signerd answered
+  `wallet_tidying` within 2 s, retryable after 60 s, and started one tidy in the background
+  (`123d865d…`, `auto: true`); a second ask straight after was told to wait and started none. Once
+  the tidy was listed (21 s), the same purchase opened the channel (`1ef92388…`) and paid by
+  voucher. Put out of order again two minutes later, the top-up's shortage was
+  `insufficient_funds`, with "tidied 2 minutes ago; at most one automatic tidy every 10 minutes"
+  in its audit record; a tidy by hand (`b9ad35ba…`) let the same purchase top the channel up
+  (`336d32f7…`). After the refund (`ecf439de…`) the seller had +1.3 tADA, what the vouchers
+  signed, and the wallet −2.927010: that and the seven transactions' fees, the automatic tidy's
+  0.199337 among them, to the lovelace.
 - `npm run batch` again on `@evolution-sdk/evolution` 0.5.15 with subbit-x402 0.2.3 (2026-09-29,
   Blockfrost): 22 purchases on one channel (vouchers 27–38 ms after the opening's first), the lost
   response and its re-sign, the approval, the `dailyMax` refusal with a top-up on the way, the
@@ -696,6 +727,12 @@ it should be rare; each one is a payment the agent will have to ask for again.
 own; a rate that keeps climbing is the provider, or a facilitator that is not settling what it is
 sent, and worth knowing about before the free tier's rate limit finds it for you.
 
+`{event="auto_tidy"}` counts the tidies signerd started itself because a channel step ran short of
+ADA-only funds. Each costs a fee, and there is at most one per `AUTO_TIDY_MIN_INTERVAL_SECONDS`, so
+a count that keeps climbing means `exact` payments keep folding the wallet's ADA into its tokens
+about as fast as the tidies undo it. `auto_tidy_failed` and `auto_tidy_skipped` are the ones that
+did not go through.
+
 ### What this still does not do
 Naming these is the point; none is fixed by more policy code.
 - **There is no hardware-wallet or KMS path.** The keystore means a file read is no longer enough,
@@ -746,11 +783,20 @@ Naming these is the point; none is fixed by more policy code.
   either, because the SDK always takes `utxos[0]` as the payment nonce: if the wallet's first UTXO
   is one it cannot read, nothing that wallet does can pay. The cause was the provider decoding the
   creating transaction's whole `/tx_info` row, three fields of which Koios returns as `null`.
-- **Two batch-settlement answers mean "ask again", not "broken".** `channel_busy` (409, retryable):
+- **Three batch-settlement answers mean "ask again", not "broken".** `channel_busy` (409, retryable):
   the channel is between two states the chain has not finished showing — right after a top-up of
   this wallet's own, Blockfrost's index can still show the channel where the top-up spent it, and
-  the client waits up to 30 s for it before saying so. `not_yet` (409): `walletctl elapse` before
-  the channel's `elapse_at`, refused rather than waited out inside the wallet lock.
+  the client waits up to 30 s for it before saying so. `wallet_tidying` (409, retryable, 60 s):
+  a channel step ran short of ADA-only funds and signerd is tidying the wallet, or has and the
+  provider does not list the result yet (see the tidy paragraph under batch-settlement). `not_yet`
+  (409): `walletctl elapse` before the channel's `elapse_at`, refused rather than waited out inside
+  the wallet lock. Only `insufficient_funds` is an answer about the wallet.
+- **A wallet that cannot fund an `exact` payment is `insufficient_funds`, in three of the builder's
+  wordings.** `Coin selection failed`, `Cannot create valid change`, and `Cannot balance
+  transaction: Native assets present in leftover but insufficient lovelace`, the last seen from a
+  wallet whose one UTxO held many tokens and 4.7 tADA: it could pay, but not and still give the
+  tokens back their min-ADA. That one was a 500 `sign_failed` until it was classed with the
+  others. An `exact` payment does not start a tidy, whichever it is; only channel steps do.
 - **Koios can refuse a submit moments after confirming the transaction it chains from.** A payment
   spending the change of a just-confirmed transaction was rejected with `Koios submitTx failed`,
   and the identical payment succeeded on retry: its query view had the new UTXO before its submit

@@ -4,7 +4,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { PaymentRequirements } from "@x402/core/types";
 import { createBatchProxy, preferBatch } from "../src/batchProxy.ts";
-import { PolicyDenied } from "../src/gatedSigner.ts";
+import { PolicyDenied, denialOf, denialReport } from "../src/gatedSigner.ts";
 
 const req = (scheme: string): PaymentRequirements => ({ scheme, network: "cardano:preprod", asset: "lovelace", amount: "1000", payTo: "addr_test1seller", maxTimeoutSeconds: 300, extra: {} });
 
@@ -50,6 +50,49 @@ test("a refusal comes back as the policy's verdict, before @x402/fetch flattens 
   } finally {
     await s.close();
   }
+});
+
+test("a wallet that is rearranging its funds reaches the agent as a wait, with the sentence and the delay", async () => {
+  const body = { error: "wallet_tidying", detail: "the wallet is rearranging its funds; try again in about a minute", retryable: true, retryAfterSeconds: 60 };
+  const s = await fakeSignerd({ "/batch/payload": [{ status: 409, body }] });
+  let denied: PolicyDenied | undefined;
+  const proxy = createBatchProxy({ signerdUrl: s.url, token: "t", agentId: "a", reason: () => "r", onDenied: d => (denied = d) });
+  try {
+    await assert.rejects(proxy.createPaymentPayload(2, req("batch-settlement")), (e: unknown) => e instanceof PolicyDenied && e.rule === "wallet_tidying");
+    assert.equal(denied?.retryable, true);
+    assert.equal(denied?.retryAfterSeconds, 60);
+    assert.deepEqual(denialReport(denied!), {
+      denied: true,
+      rule: "wallet_tidying",
+      detail: "the wallet is rearranging its funds; try again in about a minute",
+      pendingId: undefined,
+      retryable: true,
+      retryAfterSeconds: 60,
+    });
+  } finally {
+    await s.close();
+  }
+});
+
+test("what signerd says about retrying is passed on as it said it, and only when it said it", () => {
+  // The other refusals that are states and the one that is an answer.
+  assert.equal(denialOf({ error: "channel_busy", detail: "d", retryable: true }).retryable, true);
+  assert.equal(denialOf({ error: "utxo_busy", detail: "d", retryable: true }).retryAfterSeconds, undefined);
+  const gone = denialOf({ error: "insufficient_funds", detail: "d", retryable: false });
+  assert.equal(gone.retryable, false);
+  assert.deepEqual(denialReport(gone), { denied: true, rule: "insufficient_funds", detail: "d", pendingId: undefined, retryable: false });
+  // A policy refusal says nothing about retrying, and the report has neither key.
+  const policy = denialOf({ error: "policy_denied", rule: "daily_max", detail: "over", id: "p1" });
+  assert.deepEqual(denialReport(policy), { denied: true, rule: "daily_max", detail: "over", pendingId: "p1" });
+  assert.equal("retryable" in denialReport(policy), false);
+  assert.equal("retryAfterSeconds" in denialReport(policy), false);
+  // Nothing that is not a flag or a positive number is believed.
+  const odd = denialOf({ error: "wallet_tidying", retryable: "yes", retryAfterSeconds: "60" });
+  assert.equal(odd.retryable, undefined);
+  assert.equal(odd.retryAfterSeconds, undefined);
+  for (const after of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) assert.equal(denialOf({ error: "wallet_tidying", retryable: true, retryAfterSeconds: after }).retryAfterSeconds, undefined, String(after));
+  // No rule and no error is still a denial with a name.
+  assert.equal(denialOf({}).rule, "error");
 });
 
 test("the seller's answer goes to signerd; a corrected count asks for one retry", async () => {

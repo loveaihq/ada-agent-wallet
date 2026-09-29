@@ -1,16 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  AUTO_TIDY_OFF,
   COLLATERAL_CEILING,
   COLLATERAL_FLOOR,
   DEFAULT_COLLATERAL,
   TIDY_FEE_MAX,
   TOKEN_SLACK,
+  adaOnlyLovelace,
+  adaOnlyLovelaceAfter,
+  autoTidyDecision,
   describeLayout,
   formatAda,
+  formatDuration,
   parseAda,
   tidyPlan,
   tidyProblem,
+  type AutoTidyInput,
   type DecodedTx,
   type TidyWork,
   type Utxo,
@@ -290,4 +296,122 @@ test("the layout is one line", () => {
   );
   assert.equal(describeLayout([utxo(ADA)]), "1 UTxO holding 1 ADA: none with tokens, 1 ADA-only (largest 1 ADA)");
   assert.equal(describeLayout([utxo(ADA, { [USDM]: 1n })]), "1 UTxO holding 1 ADA: 1 with tokens (1 ADA between them), none ADA-only");
+});
+
+// ---- the ADA-only ADA, and whether a tidy would add to it -----------------------------------------
+
+test("the ADA-only ADA now is what the UTxOs without tokens hold, and a quantity of nothing is not a token", () => {
+  assert.equal(adaOnlyLovelace([]), 0n);
+  assert.equal(adaOnlyLovelace([utxo(44n * ADA, { [USDM]: 1n }), utxo(3n * ADA), utxo(2n * ADA, { [OTHER]: 0n })]), 5n * ADA);
+  assert.equal(adaOnlyLovelace([utxo(9n * ADA, { [USDM]: 1n })]), 0n);
+});
+
+test("the ADA-only ADA after is everything less the tokens' min-ADA and the fee at its ceiling", () => {
+  const folded = work(tidyPlan([utxo(44n * ADA, { [USDM]: 1n }), utxo(1_500_000n)], opts));
+  // 45.5 in all, 1.2 for the tokens, 1 for the fee.
+  assert.equal(adaOnlyLovelaceAfter(folded), 45_500_000n - 1_200_000n - TIDY_FEE_MAX);
+  // No tokens, no min-ADA to keep back.
+  const plain = work(tidyPlan([utxo(3n * ADA), utxo(3n * ADA), utxo(3n * ADA)], opts));
+  assert.equal(adaOnlyLovelaceAfter(plain), 9n * ADA - TIDY_FEE_MAX);
+});
+
+// ---- autoTidyDecision -----------------------------------------------------------------------------
+
+const NOW = 1_800_000_000_000;
+const TEN_MINUTES = 600_000;
+/** A wallet that decides on its own listing: the plan is made from the same UTxOs it is given. */
+const decide = (utxos: Utxo[], over: Partial<AutoTidyInput> = {}) =>
+  autoTidyDecision({ enabled: true, tidyInFlight: false, now: NOW, lastAutoTidyAt: undefined, minIntervalMs: TEN_MINUTES, plan: tidyPlan(utxos, opts), utxos, ...over });
+/** Every ADA in the one token UTxO, which is what a run of `exact` payments leaves. */
+const folded = () => [utxo(44n * ADA, { [USDM]: 1n }), utxo(1_500_000n)];
+
+test("a wallet whose ADA is folded into its tokens is worth a tidy, and the reason has the numbers", () => {
+  const d = decide(folded());
+  assert.equal(d.tidy, true);
+  assert.match(d.why, /ADA-only UTxOs hold 1.5 ADA now and would hold 43.3 ADA after a tidy, its fee counted at 1 ADA/);
+  assert.match(d.why, /holds 44 ADA, more than the 1.2 ADA they need/);
+});
+
+test("switched off, it says so, whatever else is true", () => {
+  assert.deepEqual(decide(folded(), { enabled: false }), { tidy: false, why: AUTO_TIDY_OFF });
+  assert.match(AUTO_TIDY_OFF, /AUTO_TIDY=0/);
+  // The switch is the first thing asked: a tidy in flight and a recent one do not change the answer.
+  assert.deepEqual(decide(folded(), { enabled: false, tidyInFlight: true, lastAutoTidyAt: NOW }), { tidy: false, why: AUTO_TIDY_OFF });
+});
+
+test("one already running is not started twice", () => {
+  const d = decide(folded(), { tidyInFlight: true });
+  assert.deepEqual(d, { tidy: false, why: "an automatic tidy is already running" });
+  // ...and that is said before the interval is.
+  assert.match(decide(folded(), { tidyInFlight: true, lastAutoTidyAt: NOW - 1000 }).why, /already running/);
+});
+
+test("not more than one in the interval, and the interval's own edge is the first moment it may", () => {
+  const at = (ago: number, minIntervalMs = TEN_MINUTES) => decide(folded(), { lastAutoTidyAt: NOW - ago, minIntervalMs });
+  assert.equal(at(0).tidy, false);
+  const blocked = at(TEN_MINUTES - 1);
+  assert.equal(blocked.tidy, false);
+  assert.equal(blocked.why, "tidied 9 minutes ago; at most one automatic tidy every 10 minutes");
+  assert.equal(at(TEN_MINUTES).tidy, true);
+  assert.equal(at(TEN_MINUTES + 1).tidy, true);
+  // The shortest interval signerd accepts is a minute, and the same edge holds there.
+  assert.equal(at(59_999, 60_000).why, "tidied 59 seconds ago; at most one automatic tidy every 60 seconds");
+  assert.equal(at(60_000, 60_000).tidy, true);
+  assert.equal(decide(folded(), { lastAutoTidyAt: undefined }).tidy, true);
+});
+
+test("a last tidy dated in the future is a clock that went back, and does not block", () => {
+  assert.equal(decide(folded(), { lastAutoTidyAt: NOW + 5 * TEN_MINUTES }).tidy, true);
+});
+
+test("a wallet whose UTxOs are not settled is not tidied from a listing that cannot be trusted", () => {
+  const d = decide(folded(), { unsettled: "utxo abc#0 is committed to a payment or a channel step that has not settled" });
+  assert.equal(d.tidy, false);
+  assert.match(d.why, /not settled yet.*utxo abc#0 is committed/);
+  // The interval is asked before it, and the plan after.
+  assert.match(decide(folded(), { unsettled: "x", lastAutoTidyAt: NOW - 1 }).why, /^tidied 0 seconds ago/);
+});
+
+test("a tidy the wallet cannot afford is not tried, and the refusal is the reason", () => {
+  // 2 + 3 ADA: the layout needs 5 collateral, 1.2 for the tokens, a fee and change.
+  const d = decide([utxo(2n * ADA, { [USDM]: 1n }), utxo(3n * ADA)]);
+  assert.equal(d.tidy, false);
+  assert.match(d.why, /^a tidy is not possible: the wallet holds 5 ADA in all, and the layout needs at least 8.2 ADA/);
+  assert.match(decide([]).why, /a tidy is not possible: the wallet holds no UTxOs/);
+});
+
+test("a wallet already in shape has nothing a tidy would fix, so the shortage is real", () => {
+  const d = decide([utxo(1_400_000n, { [USDM]: 1n }), utxo(8n * ADA)]);
+  assert.equal(d.tidy, false);
+  assert.match(d.why, /^the wallet is already tidy: /);
+  assert.match(d.why, /ADA-only UTxO of 8 ADA/);
+});
+
+test("ADA-only UTxOs that are merely small gain nothing from a tidy, which only pays a fee", () => {
+  const d = decide([utxo(4n * ADA), utxo(4n * ADA), utxo(4n * ADA), utxo(4n * ADA)]);
+  assert.equal(d.tidy, false);
+  assert.match(d.why, /would free no ADA for channel steps: the ADA-only UTxOs hold 16 ADA now and would hold 15 ADA after a tidy/);
+});
+
+test("it is worth a tidy only when the ADA-only ADA would be larger after it, to the lovelace", () => {
+  // Tokens in two UTxOs: gathering them frees what they hold beyond the 1.2 ADA one output needs, and the
+  // fee ceiling is 1 ADA, so the two must hold more than 2.2 ADA together for the tidy to add anything.
+  const wallet = (held: bigint) => [utxo(1_200_000n, { [USDM]: 1n }), utxo(held - 1_200_000n, { [USDM]: 1n }), utxo(9n * ADA)];
+  const even = decide(wallet(2_200_000n));
+  assert.equal(even.tidy, false);
+  assert.match(even.why, /hold 9 ADA now and would hold 9 ADA after/);
+  const better = decide(wallet(2_200_001n));
+  assert.equal(better.tidy, true);
+  assert.match(better.why, /hold 9 ADA now and would hold 9.000001 ADA after/);
+  assert.equal(decide(wallet(2_199_999n)).tidy, false);
+});
+
+test("a duration is said in the unit that reads best", () => {
+  assert.equal(formatDuration(0), "0 seconds");
+  assert.equal(formatDuration(1000), "1 second");
+  assert.equal(formatDuration(119_999), "119 seconds");
+  assert.equal(formatDuration(120_000), "2 minutes");
+  assert.equal(formatDuration(TEN_MINUTES), "10 minutes");
+  assert.equal(formatDuration(7_199_999), "119 minutes");
+  assert.equal(formatDuration(7_200_000), "2 hours");
 });

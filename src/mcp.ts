@@ -19,7 +19,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
 import { ExactCardanoScheme } from "@x402/cardano";
-import { createGatedSigner, PolicyDenied } from "./gatedSigner.js";
+import { createGatedSigner, denialReport, PolicyDenied } from "./gatedSigner.js";
 import { BATCH, createBatchProxy, preferBatch } from "./batchProxy.js";
 import { decodePaymentResponseHeader } from "@x402/core/http";
 import { receiptOf, describePayment, type Receipt } from "./receipt.js";
@@ -107,7 +107,7 @@ async function batchAllowed(): Promise<boolean> {
   }
 }
 
-const server = new McpServer({ name: "ada-agent-wallet", version: "0.2.7" });
+const server = new McpServer({ name: "ada-agent-wallet", version: "0.2.8" });
 
 server.tool("wallet_status", "Wallet address, per-agent remaining budget (rolling 24h), pending approvals.", {}, { readOnlyHint: true, openWorldHint: false }, async () => {
   try {
@@ -127,7 +127,7 @@ server.tool("wallet_status", "Wallet address, per-agent remaining budget (rollin
 
 server.tool(
   "x402_fetch",
-  "Fetch a URL that may require x402 payment on Cardano. If it returns 402, the wallet pays within policy and retries. Always give a concrete reason — it goes in the audit log.",
+  "Fetch a URL that may require x402 payment on Cardano. If it returns 402, the wallet pays within policy and retries. Always give a concrete reason — it goes in the audit log. A denial with retryable: true (rule wallet_tidying, for one) is the wallet asking you to wait, not refusing: call again after retryAfterSeconds.",
   {
     // `z.string().url()` accepts every scheme the URL parser does, file: and data: included.
     url: z
@@ -183,7 +183,7 @@ server.tool(
         // call context rather than from the caught value.
         const denied = e instanceof PolicyDenied ? e : callContext.getStore()?.denial;
         if (denied) {
-          return { content: [{ type: "text", text: JSON.stringify({ denied: true, rule: denied.rule, detail: denied.detail, pendingId: denied.pendingId }) }], isError: true };
+          return { content: [{ type: "text", text: JSON.stringify(denialReport(denied)) }], isError: true };
         }
         return { content: [{ type: "text", text: `error: ${String(e)}` }], isError: true };
       }
@@ -213,7 +213,7 @@ const httpUrl = z
   .refine(u => /^https?:$/.test(new URL(u).protocol), { message: "must be http or https" });
 
 async function withRemote<T>(serverUrl: string, kind: "http" | "sse", use: (paid: x402MCPClient) => Promise<T>): Promise<T> {
-  const paid = wrapMCPClientWithPayment(new McpClient({ name: "ada-agent-wallet", version: "0.2.7" }), client, {
+  const paid = wrapMCPClientWithPayment(new McpClient({ name: "ada-agent-wallet", version: "0.2.8" }), client, {
     autoPayment: true,
   });
   try {
@@ -248,7 +248,7 @@ server.tool(
 
 server.tool(
   "x402_mcp_call",
-  "Call a tool on a remote MCP server that may charge for it. If it asks for payment, the wallet pays within policy and retries. Always give a concrete reason — it goes in the audit log.",
+  "Call a tool on a remote MCP server that may charge for it. If it asks for payment, the wallet pays within policy and retries. Always give a concrete reason — it goes in the audit log. A denial with retryable: true (rule wallet_tidying, for one) is the wallet asking you to wait, not refusing: call again after retryAfterSeconds.",
   {
     server: httpUrl,
     tool: z.string().min(1).max(200),
@@ -297,7 +297,7 @@ server.tool(
         const denied = e instanceof PolicyDenied ? e : callContext.getStore()?.denial;
         if (denied)
           return {
-            content: [{ type: "text", text: JSON.stringify({ denied: true, rule: denied.rule, detail: denied.detail, pendingId: denied.pendingId }) }],
+            content: [{ type: "text", text: JSON.stringify(denialReport(denied)) }],
             isError: true,
           };
         return { content: [{ type: "text", text: `error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
