@@ -30,8 +30,8 @@ jobs:
       # The repository's files are LF; a Windows checkout would otherwise turn them into CRLF and
       # test something no one ships.
       - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
           cache: npm
