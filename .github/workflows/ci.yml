@@ -37,7 +37,22 @@ jobs:
           cache: npm
       # `prepare` builds dist/ as part of the install, as it does for anyone installing from git.
       - run: npm ci
-      - run: npm test
+      # bash on every runner, Windows included: `test/*.test.ts` is expanded by the shell, as it is
+      # for anyone running `npm test` in one, rather than handed to Node 20, which reads it as a
+      # file name. The output is kept for the step after it.
+      - name: npm test
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test-output.txt
+      # A job's log needs a signed-in viewer; its annotations do not. So a failure names itself.
+      - name: name the failures
+        if: failure()
+        shell: bash
+        run: |
+          [ -f test-output.txt ] || exit 0
+          { grep -E "✖" test-output.txt | head -5; grep -iE "error|cannot|not found|expected|actual" test-output.txt | grep -v "✔" | head -5; } |
+            while IFS= read -r line; do echo "::error::${line}"; done
       - run: npm run typecheck
       # Real mode bits and a signal signerd can drain on: the two things Windows cannot show.
       - if: runner.os != 'Windows'
