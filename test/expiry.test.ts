@@ -74,10 +74,20 @@ function fakeFetch(handler: (url: string, init: RequestInit) => Response | Promi
   return { fn, seen };
 }
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-/** Never answers, but gives up when the caller's signal does, as a real fetch does. */
+/**
+ * Never answers, but gives up when the caller's signal does, as a real fetch does. A real fetch
+ * also keeps the process alive while it waits, and this has to as well: `AbortSignal.timeout`'s
+ * timer is unref'd, so with nothing else pending Node 22 ends the event loop before it fires and
+ * cancels the test (Node 24's runner happened to keep the loop alive). signerd is never in that
+ * position, since its server holds the loop open.
+ */
 const hang = (init: RequestInit) =>
   new Promise<Response>((_, reject) => {
-    init.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+    const alive = setInterval(() => {}, 1000);
+    init.signal?.addEventListener("abort", () => {
+      clearInterval(alive);
+      reject(init.signal!.reason);
+    });
   });
 /** For `assert.rejects`, which wants to be told what to expect: any error will do here. */
 const anyError = () => true;
