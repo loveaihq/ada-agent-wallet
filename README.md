@@ -583,19 +583,19 @@ it; the results are under "Verified".
 - the spend cap holds under concurrency: four simultaneous requests against a cap that fits one
   produce one `signed` and three `daily_max` denials. Before the agent lock the same probe signed
   every one of them, on one shared nonce.
-- what the registry serves is what was built: `ada-agent-wallet@0.2.7` on npm is byte for byte the
-  tarball checked before publishing (24 files, shasum `94736c62…`, the one `npm publish` printed).
-  Installed from the registry into an empty directory, it brings `subbit-x402@0.2.3` and one copy
-  of the SDK (0.5.15), and no `typescript` or `tsx`, because both packages ship prebuilt.
+- what the registry serves is what was built: `ada-agent-wallet@0.2.8` on npm is byte for byte the
+  tarball checked before publishing (24 files, shasum `89016212…`, the one `npm publish` printed),
+  and says Node 22 or newer. Installed from the registry into an empty directory, it brings
+  `subbit-x402@0.2.3` and one copy of the SDK (0.5.15), and no `typescript` or `tsx`, because both
+  packages ship prebuilt.
   - `ada-walletctl` prints its usage, `tidy` included.
   - `ada-wallet-mcp` gets as far as its own "signerd is not answering" check.
   - `ada-signerd`, from the same bytes installed before publishing, comes up on preprod on Koios
-    with batch-settlement available and the release loop on, and answers `/status`, a `/tidy`
-    dry run and `/preflight`.
+    with batch-settlement available and the release loop on.
 
-  Earlier releases were checked the same way: 0.2.6 (`44bfa586…`), 0.2.5 (`43b7f48d…`), 0.2.4 (`87f7ffb1…`), 0.2.3
-  (`dde3cc15…`), 0.2.2 (`b27996d7…`), 0.2.1 (`e11f0510…`), 0.2.0 (`6edfe7ba…`) and 0.1.0 (17
-  files, `a6c269ca…`).
+  Earlier releases were checked the same way: 0.2.7 (`94736c62…`), 0.2.6 (`44bfa586…`), 0.2.5
+  (`43b7f48d…`), 0.2.4 (`87f7ffb1…`), 0.2.3 (`dde3cc15…`), 0.2.2 (`b27996d7…`), 0.2.1
+  (`e11f0510…`), 0.2.0 (`6edfe7ba…`) and 0.1.0 (17 files, `a6c269ca…`).
 
 ## Before mainnet
 ```
