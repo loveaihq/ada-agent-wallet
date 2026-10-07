@@ -113,7 +113,9 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { toClientCardanoSigner, decodeCardanoTransaction, minUtxoLovelace, type ClientCardanoSignInput, type ClientCardanoSigner } from "@x402/cardano";
 import type { PaymentPayload, PaymentPayloadResult, PaymentRequired, PaymentRequirements, SettleResponse } from "@x402/core/types";
 import { Address, Assets, Client, KeyHash, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
-import { SUBBIT_HASH } from "subbit-x402/subbit";
+// A channel record without a scriptHash predates subbit-x402 0.3, which opens at Subbit's fixed
+// build, so such a channel sits at the build before the fix.
+import { UPSTREAM_66648DB } from "subbit-x402/subbit";
 import { BlockfrostChain, SubmitError, causeChain, retryQueries } from "subbit-x402/x402/chain";
 import { KoiosChain } from "subbit-x402/x402/koios";
 import { currencyOf, refOf, subbedOf, txHashOf, type ChannelView } from "subbit-x402/x402/cardano";
@@ -1170,8 +1172,10 @@ function checkChannelTx(
   let wrong: string | undefined;
   try {
     wrong =
-      stepProblem(step, hex, { network: on.channel.network ?? "cardano:preprod", scriptHash: SUBBIT_HASH, consumer: c.consumer, coinsPerUtxoByte }, on) ??
-      summaryProblem(step, summarize(decodeTx(hex, step), SUBBIT_HASH), { wallet: address, ...(want ?? {}) });
+      // The channel's own validator: subbit-x402 0.3 opens at Subbit's fixed build, and channels
+      // opened earlier stay at the build before it.
+      stepProblem(step, hex, { network: on.channel.network ?? "cardano:preprod", scriptHash: on.channel.scriptHash ?? UPSTREAM_66648DB.hash, consumer: c.consumer, coinsPerUtxoByte }, on) ??
+      summaryProblem(step, summarize(decodeTx(hex, step), on.channel.scriptHash ?? UPSTREAM_66648DB.hash), { wallet: address, ...(want ?? {}) });
   } catch (e) {
     wrong = `it could not be read: ${e instanceof Error ? e.message : e}`;
   }
@@ -1837,7 +1841,8 @@ async function channelRequest(method: string, path: string, body: Record<string,
     // Reads the chain and writes records, signs nothing: the agent's lock, not the wallet's.
     const out = await withAgentLock(agentId, async () => {
       const { client, storage } = batchClient(agentId);
-      const found = await client.recover("cardano:preprod", SUBBIT_HASH);
+      // Every build the client trusts, so channels opened before the fixed build are found too.
+      const found = await client.recover("cardano:preprod");
       let indexed = 0;
       for (const r of await storage.list()) {
         const owner = c.store.get(r.channelId)?.agentId;
@@ -1849,12 +1854,12 @@ async function channelRequest(method: string, path: string, body: Record<string,
           continue;
         }
         if (!r.channelRef || (r.status !== "open" && r.status !== "closing")) continue;
-        const view = await c.chain.followChannel(r.channelRef, r.scriptHash ?? SUBBIT_HASH, r.channelId);
+        const view = await c.chain.followChannel(r.channelRef, r.scriptHash ?? UPSTREAM_66648DB.hash, r.channelId);
         if (!view) continue;
         c.store.set(r.channelId, {
           agentId,
           network: r.network ?? "cardano:preprod",
-          scriptHash: r.scriptHash ?? SUBBIT_HASH,
+          scriptHash: r.scriptHash ?? UPSTREAM_66648DB.hash,
           asset: r.channelConfig.token,
           payTo: r.channelConfig.receiver,
           providerKey: r.channelConfig.receiverAuthorizer,

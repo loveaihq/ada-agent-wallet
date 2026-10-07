@@ -39,7 +39,7 @@ import { createPaymentWrapper, createToolResourceUrl } from "@x402/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Address, Client, KeyHash, preprod } from "@evolution-sdk/evolution";
-import { SUBBIT_HASH } from "subbit-x402/subbit";
+import { SUBBIT_HASH, UPSTREAM_VALIDATORS } from "subbit-x402/subbit";
 import { BlockfrostChain } from "subbit-x402/x402/chain";
 import { KoiosChain } from "subbit-x402/x402/koios";
 import { BatchSettlementCardanoFacilitator } from "subbit-x402/x402/facilitator";
@@ -79,7 +79,7 @@ const providerKey = KeyHash.toHex(providerAddress.paymentCredential as KeyHash.K
 /** A key nobody holds: the second seller's 402 names it, and the wallet must refuse to open a channel to it. */
 const otherKey = randomBytes(28).toString("hex");
 
-const facilitator = new x402Facilitator().register(NETWORK, new BatchSettlementCardanoFacilitator(chain, { scriptHash: SUBBIT_HASH, confirmationTimeoutMs: 120_000 }));
+const facilitator = new x402Facilitator().register(NETWORK, new BatchSettlementCardanoFacilitator(chain, { validators: UPSTREAM_VALIDATORS, confirmationTimeoutMs: 120_000 }));
 await listen(7413, async (req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   if (req.method === "GET" && url.pathname === "/supported") return send(res, 200, {}, facilitator.getSupported());

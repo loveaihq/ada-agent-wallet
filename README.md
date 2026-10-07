@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.8, preprod only.** It has never run on mainnet and has had no external security
+**Status: 0.2.9, preprod only.** It has never run on mainnet and has had no external security
 review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
@@ -583,6 +583,10 @@ it; the results are under "Verified".
 - the spend cap holds under concurrency: four simultaneous requests against a cap that fits one
   produce one `signed` and three `daily_max` denials. Before the agent lock the same probe signed
   every one of them, on one shared nonce.
+- on `subbit-x402@0.3.0`, which opens channels at Subbit's fixed validator (`6d877463…`), `batch`
+  and `batchexit` passed again (2026-10-07): both channels sat at that validator, and `recover`
+  found channels at the build before it as well. Channels opened at that earlier build keep
+  working, and a record that names no validator is read as one of them.
 - what the registry serves is what was built: `ada-agent-wallet@0.2.8` on npm is byte for byte the
   tarball checked before publishing (24 files, shasum `89016212…`, the one `npm publish` printed),
   and says Node 22 or newer. Installed from the registry into an empty directory, it brings
