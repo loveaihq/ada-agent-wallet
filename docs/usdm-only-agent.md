@@ -122,9 +122,10 @@ Register the MCP server with your agent (Claude Desktop, Claude Code, or any MCP
   "env": { "SIGNERD_TOKEN": "<the same token>", "AGENT_ID": "default" } } } }
 ```
 
-Here the agent and `ada-walletctl` share one token, which is enough for a walkthrough. To make
-paying and operating separate authorities, give the agent its own token with `AGENT_TOKENS_FILE`
-(the README, "Who an agent is").
+Here the agent and `ada-walletctl` share one token, which is enough for a walkthrough on preprod:
+signerd warns about it, because an agent holding the operator's token can approve its own queued
+payments. To make paying and operating separate authorities, give the agent its own token with
+`AGENT_TOKENS_FILE` (the README, "Who an agent is"); mainnet will not start without it.
 
 Then ask it to fetch `http://127.0.0.1:7411/token` 25 times, with a reason each time. The agent
 calls `x402_fetch`. What happens underneath:

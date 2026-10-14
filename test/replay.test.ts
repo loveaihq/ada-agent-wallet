@@ -224,7 +224,7 @@ const released = (tx: unknown, over: Record<string, unknown> = {}) => ({
 const asCheckpoint = (r: {
   lastSeq: number;
   lastHash: string;
-  spends: Array<{ ts: number; agentId: string; asset: string; amount: bigint; voucher?: boolean; tx?: string; ttlSlot?: number }>;
+  spends: Array<{ ts: number; agentId: string; asset: string; amount: bigint; voucher?: boolean; tx?: string; ttlSlot?: number; overhead?: boolean }>;
 }): Checkpoint => ({
   version: 1,
   seq: r.lastSeq,
@@ -236,6 +236,7 @@ const asCheckpoint = (r: {
     asset: s.asset,
     amount: s.amount.toString(),
     ...(s.voucher ? { voucher: true } : {}),
+    ...(s.overhead ? { overhead: true } : {}),
     ...(s.tx ? { tx: s.tx } : {}),
     ...(s.ttlSlot !== undefined ? { ttlSlot: s.ttlSlot } : {}),
   })),
@@ -377,4 +378,76 @@ test("a release does not disturb the approvals or the chain around it", async ()
   assert.equal(r.lastSeq, 4);
   assert.deepEqual(r.openApprovals, []);
   assert.equal(r.spends.length, 0);
+});
+
+// ---- the ADA that leaves with a payment -----------------------------------------------------------
+// A signed payment's fee and the min-UTxO ADA riding to the payee are a second spend, in lovelace,
+// beside the payment and with its transaction. The log states it as `overheadLovelace` on the
+// `signed` record, and the window has to rebuild it from there after a restart.
+
+const USDM = "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d";
+
+test("a signed record's overhead is a second lovelace spend with the payment's transaction", async () => {
+  const lines = chain([signed("1", { asset: USDM, tx: TX_A, ttlSlot: 500, overheadLovelace: "1331843" })]);
+  const r = await replayAudit(lines, WINDOW);
+  assert.deepEqual(
+    r.spends.map(s => [s.asset, s.amount, s.tx, s.ttlSlot, Boolean(s.overhead)]),
+    [[USDM, 1n, TX_A, 500, false], ["lovelace", 1331843n, TX_A, 500, true]],
+  );
+  assert.equal(r.malformedAt, undefined);
+});
+
+test("the overhead survives the checkpoint, and is not counted again from the log it was written against", async () => {
+  const lines = chain([signed("1", { asset: USDM, tx: TX_A, ttlSlot: 500, overheadLovelace: "1331843" })]);
+  const first = await replayAudit(lines, WINDOW);
+  const again = await replayAudit(lines, { ...WINDOW, checkpoint: asCheckpoint(first) });
+  assert.deepEqual(again.spends.map(s => [s.asset, s.amount, Boolean(s.overhead)]), [[USDM, 1n, false], ["lovelace", 1331843n, true]]);
+  // And one logged after the checkpoint is added to it.
+  const tail = chain([signed("2", { asset: USDM, tx: TX_B, ttlSlot: 600, overheadLovelace: "200000" })], first.lastSeq, first.lastHash);
+  const later = await replayAudit([...lines, ...tail], { ...WINDOW, checkpoint: asCheckpoint(first) });
+  assert.equal(total(later.spends.filter(s => s.asset === "lovelace")), 1531843n);
+});
+
+test("no overhead, a zero overhead and a record from before it existed add nothing", async () => {
+  const lines = chain([signed("100"), signed("200", { overheadLovelace: "0" }), signed("300", { tx: TX_A, ttlSlot: 5 })]);
+  const r = await replayAudit(lines, WINDOW);
+  assert.deepEqual(r.spends.map(s => s.amount), [100n, 200n, 300n]);
+  assert.equal(r.spends.some(s => s.overhead), false);
+});
+
+test("an overhead that cannot be read is reported, never skipped", async () => {
+  // Skipping it would hand the agent back the ADA it spent.
+  for (const bad of ["1.5", "-3", "lots", 7, null, {}]) {
+    const r = await replayAudit(chain([signed("100", { tx: TX_A, ttlSlot: 5, overheadLovelace: bad })]), WINDOW);
+    assert.equal(r.malformedAt, 1, JSON.stringify(bad));
+  }
+});
+
+test("a lovelace payment's overhead is its fee, beside its own amount", async () => {
+  const r = await replayAudit(chain([signed("5000000", { tx: TX_A, ttlSlot: 500, overheadLovelace: "172453" })]), WINDOW);
+  assert.equal(total(r.spends), 5_172_453n);
+});
+
+test("a release takes one record, so a payment and its overhead need one release each", async () => {
+  const pair = signed("1", { asset: USDM, tx: TX_A, ttlSlot: 500, overheadLovelace: "1331843" });
+  const one = await replayAudit(chain([pair, released(TX_A)]), WINDOW);
+  assert.equal(one.spends.length, 1);
+  const both = await replayAudit(chain([pair, released(TX_A), released(TX_A)]), WINDOW);
+  assert.equal(both.spends.length, 0);
+  // A third release has nothing left to take.
+  const extra = await replayAudit(chain([pair, released(TX_A), released(TX_A), released(TX_A)]), WINDOW);
+  assert.equal(extra.spends.length, 0);
+});
+
+test("both records are released from a checkpoint by two releases logged after it", async () => {
+  const head = chain([signed("1", { asset: USDM, tx: TX_A, ttlSlot: 500, overheadLovelace: "1331843" }), signed("9", { tx: TX_B, ttlSlot: 500 })]);
+  const upTo = await replayAudit(head, WINDOW);
+  const tail = chain([released(TX_A), released(TX_A)], upTo.lastSeq, upTo.lastHash);
+  const r = await replayAudit([...head, ...tail], { ...WINDOW, checkpoint: asCheckpoint(upTo) });
+  assert.deepEqual(r.spends.map(s => [s.amount, s.tx]), [[9n, TX_B]]);
+});
+
+test("a voucher never carries an overhead, whatever its record says", async () => {
+  const r = await replayAudit(chain([{ event: "voucher_signed", agentId: "a", asset: "lovelace", amount: "50", overheadLovelace: "999" }]), WINDOW);
+  assert.deepEqual(r.spends.map(s => [s.amount, Boolean(s.voucher)]), [[50n, true]]);
 });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decide, decideDeposit, parsePolicy, remaining, type SpendRecord } from "../src/policy.ts";
+import { decide, decideDeposit, decideOverhead, parsePolicy, remaining, LOVELACE_CAPS_DETAIL, type SpendRecord } from "../src/policy.ts";
 
 const USDM = "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d"; // USDM preprod
 const PAYEE = "addr1q9payee";
@@ -277,4 +277,103 @@ test("parsePolicy checks the batch-settlement fields", () => {
   const tokenOnly = { perTxMax: { [USDM]: "1" }, allowedPayees: ["*"], channelLockedMax: { lovelace: "9", [USDM]: "9" } };
   assert.doesNotThrow(() => parsePolicy({ agents: { a: tokenOnly } }));
   assert.doesNotThrow(() => parse({ allowedSchemes: ["batch-settlement"], allowedProviderKeys: ["*", KEY], maxWithdrawDelay: 900 }));
+});
+
+// ---- the ADA that leaves with a token payment ---------------------------------------------------
+
+const withCaps = parsePolicy({
+  agents: {
+    // Token payments, and the lovelace caps they need for their fee and min-UTxO ADA.
+    capped: {
+      perTxMax: { [USDM]: "5000000", lovelace: "2000000" },
+      dailyMax: { lovelace: "3000000" },
+      allowedPayees: ["*"],
+    },
+    // Token payments with no lovelace caps at all.
+    bare: { perTxMax: { [USDM]: "5000000" }, allowedPayees: ["*"] },
+    // Lovelace payments, whose fee leaves in the same transaction.
+    ada: { perTxMax: { lovelace: "5000000" }, dailyMax: { lovelace: "12000000" }, allowedPayees: ["*"] },
+  },
+});
+const cost = (over: Partial<Parameters<typeof decideOverhead>[2]> = {}) => ({
+  agentId: "capped", asset: USDM, amount: 1n, overhead: 1_331_843n, now: T0, ...over,
+});
+const rec = (over: Partial<SpendRecord>): SpendRecord => ({ ts: T0 - 1000, agentId: "capped", asset: "lovelace", amount: 1n, ...over });
+
+test("mainnet refuses a token payment from an agent with no lovelace caps, before it can be queued", () => {
+  const tokens = { agentId: "bare", payTo: PAYEE, asset: USDM, amount: 1n, reason: "pay for data api", now: T0 };
+  const d = decide(withCaps, [], { ...tokens, mainnet: true });
+  assert.equal(d.verdict, "deny");
+  assert.equal(d.rule, "lovelace_caps");
+  assert.match(d.detail!, /token payments also spend ADA \(fee \+ min-UTxO\); declare lovelace caps/);
+  assert.equal(d.detail, LOVELACE_CAPS_DETAIL);
+  // The same payment off mainnet goes ahead, as it always did.
+  assert.equal(decide(withCaps, [], tokens).verdict, "allow");
+  assert.equal(decide(withCaps, [], { ...tokens, mainnet: false }).verdict, "allow");
+  // And with lovelace caps declared, mainnet allows it.
+  assert.equal(decide(withCaps, [], { ...tokens, agentId: "capped", mainnet: true }).verdict, "allow");
+});
+
+test("mainnet's lovelace-caps rule is about token payments only", () => {
+  // A lovelace payment needs lovelace caps to be allowed at all; and a voucher moves no ADA until redeemed.
+  assert.equal(decide(withCaps, [], { agentId: "ada", payTo: PAYEE, asset: "lovelace", amount: 1n, reason: "pay for data api", now: T0, mainnet: true }).verdict, "allow");
+});
+
+test("a token payment's fee and min-UTxO ADA are judged against the lovelace caps", () => {
+  assert.equal(decideOverhead(withCaps, [], cost()).verdict, "allow");
+  // Per transaction: one lovelace above perTxMax is refused, at it is not.
+  assert.equal(decideOverhead(withCaps, [], cost({ overhead: 2_000_000n })).verdict, "allow");
+  const big = decideOverhead(withCaps, [], cost({ overhead: 2_000_001n }));
+  assert.equal(big.rule, "overhead_per_tx_max");
+  assert.match(big.detail!, /2000001 lovelace leaves with this transaction \(2000001 of fee and min-UTxO ADA\) > perTxMax 2000000/);
+});
+
+test("the overhead is spent against the rolling daily cap, and earlier overhead counts", () => {
+  const one = rec({ amount: 1_331_843n, overhead: true });
+  assert.equal(decideOverhead(withCaps, [one], cost()).verdict, "allow"); // 2.66M of 3M
+  const d = decideOverhead(withCaps, [one, { ...one }], cost()); // 2.66M + 1.33M > 3M
+  assert.equal(d.rule, "overhead_daily_max");
+  assert.match(d.detail!, /spent 2663686 \+ 1331843 \(1331843 of fee and min-UTxO ADA\) > dailyMax 3000000 \(lovelace, rolling 24h\)/);
+  // A day later it has rolled off.
+  const old = [one, { ...one }].map(r => ({ ...r, ts: T0 - 25 * 3600e3 }));
+  assert.equal(decideOverhead(withCaps, old, cost()).verdict, "allow");
+  // Another agent's does not count against this one.
+  assert.equal(decideOverhead(withCaps, [one, { ...one }].map(r => ({ ...r, agentId: "ada" })), cost()).verdict, "allow");
+});
+
+test("a lovelace payment is judged with its fee: the cap is on what leaves, not on the amount alone", () => {
+  const pay = (amount: bigint, overhead: bigint, over: Partial<SpendRecord>[] = []) =>
+    decideOverhead(withCaps, over.map(o => rec({ agentId: "ada", ...o })), { agentId: "ada", asset: "lovelace", amount, overhead, now: T0 });
+  assert.equal(pay(4_800_000n, 180_000n).verdict, "allow");
+  assert.equal(pay(5_000_000n, 0n).verdict, "allow");
+  // decide() let 5 ADA through, since it is not above perTxMax; the 0.18 ADA fee takes the transaction past it.
+  assert.equal(pay(5_000_000n, 180_000n).rule, "overhead_per_tx_max");
+  // The day: 12M cap, 11.9M spent already; a 0.1M payment fits on its own, its fee does not.
+  assert.equal(pay(100_000n, 180_000n, [{ amount: 11_900_000n }]).rule, "overhead_daily_max");
+  assert.equal(pay(100_000n, 0n, [{ amount: 11_900_000n }]).verdict, "allow");
+});
+
+test("with no lovelace caps, mainnet refuses a token payment and everywhere else goes ahead", () => {
+  const d = decideOverhead(withCaps, [], cost({ agentId: "bare", mainnet: true }));
+  assert.equal(d.rule, "lovelace_caps");
+  assert.equal(d.detail, LOVELACE_CAPS_DETAIL);
+  assert.equal(decideOverhead(withCaps, [], cost({ agentId: "bare" })).verdict, "allow");
+  assert.equal(decideOverhead(withCaps, [], cost({ agentId: "bare", overhead: 99_999_999_999n })).verdict, "allow");
+  assert.equal(decideOverhead(withCaps, [], cost({ agentId: "nobody" })).rule, "unknown_agent");
+});
+
+test("the overhead is spend, not a payment: it does not use up the hourly rate", () => {
+  const p = parsePolicy({ agents: { a: { perTxMax: { lovelace: "5000000" }, dailyMax: { lovelace: "50000000" }, allowedPayees: ["*"], maxPerHour: 2 } } });
+  const payment = (n: number): SpendRecord[] => [
+    { ts: T0 - n * 60e3, agentId: "a", asset: "lovelace", amount: 1_000_000n },
+    { ts: T0 - n * 60e3, agentId: "a", asset: "lovelace", amount: 180_000n, overhead: true },
+  ];
+  const r = { agentId: "a", payTo: PAYEE, asset: "lovelace", amount: 1_000_000n, reason: "pay for data api", now: T0 };
+  // One payment, two records: a second payment is still within maxPerHour 2...
+  assert.equal(decide(p, payment(1), r).verdict, "allow");
+  assert.equal(remaining(p, payment(1), "a", T0)!.paymentsLastHour, 1);
+  // ...and the third is not.
+  assert.equal(decide(p, [...payment(1), ...payment(2)], r).rule, "rate");
+  // But the overhead is in the day's lovelace: 1.18M, not 1M.
+  assert.equal(remaining(p, payment(1), "a", T0)!.assets.lovelace.dailySpent, "1180000");
 });

@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join, resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { freePort } from "./port.js";
+import { feeOf } from "./fee.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SIGNERD = resolvePath(HERE, "../src/signerd.ts");
@@ -25,7 +26,7 @@ const URL_ = `http://127.0.0.1:${PORT}`;
 const CONCURRENCY = Number(process.env.RACE_CONCURRENCY ?? 4);
 const NETWORK = process.env.CARDANO_NETWORK ?? "cardano:preprod";
 const AMOUNT = 1_500_000n;
-const CAP = 2_000_000n; // fits exactly one payment
+const CAP = 2_000_000n; // fits one payment, and its fee
 
 const TOKEN = process.env.SIGNERD_TOKEN;
 const PAY_TO = process.env.SELLER_ADDRESS;
@@ -41,8 +42,10 @@ const check = (condition: boolean, description: string) => {
   if (!condition) problems.push(description);
 };
 
+// perTxMax leaves room for the fee, which leaves the wallet in the same transaction as the amount and is
+// held to the same cap (SpendRecord.overhead); a limit equal to the price would refuse the payment.
 const agent = (overrides: Record<string, unknown> = {}) => ({
-  perTxMax: { lovelace: AMOUNT.toString() },
+  perTxMax: { lovelace: CAP.toString() },
   dailyMax: { lovelace: CAP.toString() },
   allowedPayees: ["*"],
   maxPerHour: 60,
@@ -78,7 +81,8 @@ await withSignerd({ network: NETWORK, agents: { alpha: agent(), beta: agent() } 
     "the other was refused as retryable, not as a server error",
   );
   for (const id of ["alpha", "beta"]) {
-    const expected = signed.some(r => r.agentId === id) ? AMOUNT.toString() : "0";
+    const mine = signed.find(r => r.agentId === id);
+    const expected = mine ? (AMOUNT + feeOf(mine.data.transaction)).toString() : "0"; // the payment and its fee
     const spent = await dailySpent(id);
     check(spent === expected, `${id} was charged ${spent}, expected ${expected}`);
   }

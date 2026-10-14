@@ -178,9 +178,12 @@ export async function reconcile(
   const start = due.length > o.max ? (o.round * o.max) % due.length : 0;
   const asked = due.length > o.max ? [...due.slice(start), ...due.slice(0, start)].slice(0, o.max) : due;
   if (asked.length === 0) return { onChain: [], absent: [] };
-  const answers = await chain.onChain(asked.map(s => s.tx));
+  // A payment and its overhead (see SpendRecord.overhead) are two spends of one transaction: it is
+  // asked about once, and the answer applies to both, even when the pass's limit fell between them.
+  const txs = [...new Set(asked.map(s => s.tx))];
+  const answers = await chain.onChain(txs);
   return {
-    onChain: asked.filter(s => answers.get(s.tx) === true).map(s => s.tx),
-    absent: asked.filter(s => answers.get(s.tx) === false),
+    onChain: txs.filter(tx => answers.get(tx) === true),
+    absent: due.filter(s => txs.includes(s.tx) && answers.get(s.tx) === false),
   };
 }

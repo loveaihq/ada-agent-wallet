@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join, resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { freePort } from "./port.js";
+import { feeOf } from "./fee.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SIGNERD = resolvePath(HERE, "../src/signerd.ts");
@@ -64,7 +65,9 @@ try {
   });
   check(signed.status === 200, `a payment signs (HTTP ${signed.status})`);
   const spent = await dailySpent();
-  check(spent === AMOUNT, `the spend is recorded (dailySpent ${spent})`);
+  // The payment, and beside it the fee that left with it (SpendRecord.overhead).
+  const recorded = (BigInt(AMOUNT) + feeOf(signed.data.transaction)).toString();
+  check(spent === recorded, `the spend is recorded (dailySpent ${spent}, expected ${recorded})`);
   check(existsSync(ledgerFile), "a ledger checkpoint is written");
   const checkpoint = JSON.parse(readFileSync(ledgerFile, "utf8"));
   check(

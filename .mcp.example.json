@@ -7,7 +7,7 @@
         "/path/to/ada-agent-wallet/src/mcp.ts"
       ],
       "env": {
-        "SIGNERD_TOKEN": "${SIGNERD_TOKEN}",
+        "SIGNERD_TOKEN": "${ADA_AGENT_TOKEN}",
         "SIGNERD_URL": "http://127.0.0.1:7402",
         "AGENT_ID": "default"
       }

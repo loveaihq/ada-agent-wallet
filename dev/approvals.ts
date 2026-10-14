@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join, resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { freePort } from "./port.js";
+import { feeOf } from "./fee.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SIGNERD = resolvePath(HERE, "../src/signerd.ts");
@@ -96,8 +97,12 @@ try {
   const approved = (await pending())[0];
   const approveResponse = await post("/approve", { id: approved.id });
   check(approveResponse.status === 200, `approve accepted (HTTP ${approveResponse.status})`);
-  check((await second).status === 200, "the waiting caller got its transaction");
-  check(await spentIs("1500000"), `the reservation became the spend rather than doubling it (dailySpent ${await dailySpent()}, expected 1500000)`);
+  const secondAnswer = await second;
+  check(secondAnswer.status === 200, "the waiting caller got its transaction");
+  // The payment, and beside it the fee that left with it: one spend of 1500000 and one of the fee.
+  const fee = feeOf(secondAnswer.data.transaction);
+  const signedSpend = (BigInt(AMOUNT) + fee).toString();
+  check(await spentIs(signedSpend), `the reservation became the spend rather than doubling it (dailySpent ${await dailySpent()}, expected ${signedSpend})`);
   check((await pending()).length === 0, "the queue is empty");
 
   // --- timed out: the reservation goes back too --------------------------------------------------
@@ -105,22 +110,23 @@ try {
   console.log("\n4. let one time out (30s floor on the approval window)");
   const abandoned = sign("nobody is going to answer this", 1);
   await settle(() => pending().then(p => p.length === 1), "queued");
-  check(await spentIs("3000000"), `held while waiting (dailySpent ${await dailySpent()}, expected 3000000)`);
+  const heldWhileWaiting = (BigInt(AMOUNT) + BigInt(signedSpend)).toString();
+  check(await spentIs(heldWhileWaiting), `held while waiting (dailySpent ${await dailySpent()}, expected ${heldWhileWaiting})`);
   const timedOut = await abandoned;
   check(timedOut.status === 403 && /timed out/.test(String(timedOut.data.detail)), "the caller was told it timed out");
-  check(await spentIs("1500000"), `the reservation was released (dailySpent ${await dailySpent()}, expected 1500000)`);
+  check(await spentIs(signedSpend), `the reservation was released (dailySpent ${await dailySpent()}, expected ${signedSpend})`);
 
   // --- the policy in force at approval time is the one that governs -----------------------------
   console.log("\n5. tighten the policy while a payment waits in the queue");
   const stale = sign("queued under a policy that is about to change");
   await settle(() => pending().then(p => p.length === 1), "queued");
-  writePolicy("2000000"); // 1500000 already signed, so this one no longer fits
+  writePolicy("2000000"); // 1500000 and its fee already signed, so this one no longer fits
   const staleId = (await pending())[0].id;
   const refused = await post("/approve", { id: staleId });
   check(refused.status === 409, `approving it is refused (HTTP ${refused.status})`);
   check(refused.data.error === "policy_changed" && refused.data.rule === "daily_max", `and says which limit now blocks it (${refused.data.rule})`);
   check((await stale).status === 403, "the waiting caller is told, rather than left hanging");
-  check(await spentIs("1500000"), `the reservation was released (dailySpent ${await dailySpent()}, expected 1500000)`);
+  check(await spentIs(signedSpend), `the reservation was released (dailySpent ${await dailySpent()}, expected ${signedSpend})`);
   writePolicy("10000000"); // put it back, so the audit check below reads a normal state
 
   const events = auditEvents();

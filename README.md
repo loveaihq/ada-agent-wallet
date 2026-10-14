@@ -11,11 +11,11 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.9, preprod only.** It has never run on mainnet and has had no external security
-review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
+**Status: 0.2.10. Exact payments may be used on mainnet, at your own risk; batch-settlement stays
+on preprod.** It has never run on mainnet and has had no external security review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
-`MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Apache-2.0: provided as is, without
-warranty; the risk of running it is yours.
+`MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Read the [disclaimer](#disclaimer)
+first.
 
 ```
 agent (Claude / any MCP client)
@@ -55,6 +55,25 @@ What this adds: key isolation, rolling daily/hourly limits, payee allowlist, hum
 enforced in the process that holds the key, so an agent cannot loosen its own limits.
 Masumi's Payment Service (the other Cardano agent-payment stack) has none of these on the buying side.
 
+## Disclaimer
+
+ada-agent-wallet is experimental software, offered free under the Apache License 2.0, **as is,
+without warranty of any kind**. By running it you accept that:
+
+- **You can lose money.** It holds a hot key and signs real transactions. A bug in this code, in
+  its dependencies, in the chain providers it reads, or on the machine it runs on can send funds
+  where you did not mean them to go, and a Cardano transaction cannot be reversed.
+- **It has not been audited.** No independent security review has been done. Batch-settlement
+  channels rely on Subbit's validator, which its authors call alpha and which is unaudited too;
+  this wallet allows them on preprod only.
+- **Keep only what you can afford to lose** in the hot wallet: small amounts, tight caps, and
+  `MAX_HOT_BALANCE_LOVELACE` set.
+- **You are responsible** for your keys, your policy, the payees you allow, and the laws that
+  apply to you. Nothing here is financial, legal or tax advice.
+- **No liability.** To the extent the law allows, the authors and contributors are not liable for
+  any loss or damage that comes from using it (sections 7 and 8 of the [license](LICENSE)).
+
+
 ## Install
 ```
 npm i -g ada-agent-wallet
@@ -75,6 +94,16 @@ npm run signerd                                            # prints the address 
 ```
 The policy file declares the network it was written for, and signerd refuses to start on a mismatch.
 A plaintext mnemonic is fine for a faucet wallet; for anything else see "The key" below.
+
+That is single-token mode: the one `SIGNERD_TOKEN` is the operator's, and an agent given it could read
+the approval queue and approve its own payments. It is only for trying this on a faucet wallet, and
+signerd warns about it on startup and in preflight. Give the agent a token of its own instead:
+```
+umask 077
+mkdir -p ~/.ada-agent-wallet
+echo "{\"$(openssl rand -hex 16)\": \"default\"}" > ~/.ada-agent-wallet/agent-tokens.json   # {"<token>": "<agentId>"}, chmod 600
+export AGENT_TOKENS_FILE=~/.ada-agent-wallet/agent-tokens.json
+```
 
 Koios is enough for signerd and, since `@evolution-sdk/evolution` 0.5.14, a whole `exact` 402
 round-trip: before it, the facilitator's verify step could not read most UTXOs through Koios (see
@@ -101,12 +130,23 @@ talking to endpoints you chose; and `allowedAssetTransferMethods: ["default"]` r
 escrow, whose cost is not only `amount` — it also locks buyer collateral that no field in the
 policy can see, up to the SDK's 15 ADA ceiling, and not released until the contract's
 `submit_result_time`. Enabling masumi means accepting that charge; bound it with
-`MASUMI_MAX_COLLATERAL_LOVELACE`.
-MCP registration (Claude Desktop / Code / Cowork):
+`MASUMI_MAX_COLLATERAL_LOVELACE`. The collateral travels to the payee in the same output as the
+payment, so it also has to fit under `MAX_RIDE_LOVELACE` (default 2 ADA, see "Before mainnet"),
+which a masumi lock usually needs raised, and it counts against the agent's lovelace caps. The
+`script` method is the same: the seller's datum is on that output, and the ADA it must hold grows
+with the datum.
+
+MCP registration (Claude Desktop / Code / Cowork) — the agent's own token from `AGENT_TOKENS_FILE`,
+never the operator's:
 ```json
 { "mcpServers": { "ada-wallet": { "command": "npx", "args": ["tsx", "/path/ada-agent-wallet/src/mcp.ts"],
-  "env": { "SIGNERD_TOKEN": "<same token>", "AGENT_ID": "default" } } } }
+  "env": { "SIGNERD_TOKEN": "<the agent's token from AGENT_TOKENS_FILE>", "AGENT_ID": "default" } } } }
 ```
+The variable is called `SIGNERD_TOKEN` on the MCP server's side because that is what it sends; the
+value is the agent's token, which signs and reads its own budget and is refused everywhere else
+(`/pending`, `/approve`, `/preflight`). The operator's `SIGNERD_TOKEN` stays in the shell you run
+`walletctl` from, and nowhere an agent can read.
+
 Human approval: `npm run walletctl -- pending` → `npm run walletctl -- approve <id>`.
 
 A queued payment holds the agent's `/sign` request open while the human decides, and that request
@@ -308,11 +348,16 @@ one voucher's worth.
 it; the results are under "Verified".
 
 ## Verified
-- `npm test`: 207 unit tests over the policy engine, the startup replay and the release of expired
+- `npm test`: 273 tests over the policy engine, the startup replay and the release of expired
   spends, the locks, the keystore, the network table, the signed-transaction and
   channel-transaction checks (sponsored steps included), the channel index, the batch-settlement
   proxy, the settlement receipt, the build retry, the known assets, the tidy plan and when to tidy
-  by itself. None needs a chain. `npm run typecheck` covers `dev/` and `test/` too, which `tsx` runs without checking.
+  by itself; the start-up rules (token length, secret-file modes, agent tokens); redirects, against
+  local servers; and, since 0.2.10, the real signerd started against a fake chain provider on
+  127.0.0.1 with inflated protocol parameters, to show the fee and payee-ride bounds, the ADA
+  overhead on the ledger and after a restart, and the mainnet refusals. None needs a chain, and
+  none can reach one: the signerd those tests start has every connection but the loopback refused.
+  `npm run typecheck` covers `dev/` and `test/` too, which `tsx` runs without checking.
 - CI (`.github/workflows/ci.yml`) runs both on Linux, macOS and Windows, each on Node 22 and 24,
   and `npm run posix` (real mode bits, SIGTERM draining the approval queue) on Linux and macOS.
   All six passed on 2026-09-29. That is the only macOS this has run on: nothing here has been
@@ -616,8 +661,62 @@ allowlist, no approval threshold, masumi enabled, Koios as the provider.
 
 On mainnet signerd additionally refuses to start when the policy, audit or ledger file is group- or
 world-writable, because "the agent cannot raise its own limits" stops being true the moment the
-agent's user can write any of them. On Windows the mode bits do not carry that meaning, so the
-check reports that it could not run rather than passing: verify the ACL yourself.
+agent's user can write any of them. The files that hold a secret — the mnemonic, the agent tokens,
+the keystore and its passphrase — are held to more: mode `0600`, with no group or other bit at all,
+because for those it is being *read* that gives them away (preprod warns instead of refusing). On
+Windows the mode bits do not carry that meaning, so the check reports that it could not run rather
+than passing: verify the ACL yourself.
+
+Keep the key, the policy, the audit log and the ledger outside any directory an AI agent works in,
+and run signerd as a user the agent's process cannot read or write as. Use the keystore
+(`WALLET_KEYSTORE_FILE`) rather than a plaintext mnemonic. On Windows, run signerd under a separate
+account and give its files ACLs that name that account alone. Parent directories are not checked
+(see SECURITY.md): a 0600 file inside a directory the agent can rename or replace is not protected.
+
+**What mainnet refuses to start without.**
+- `AGENT_TOKENS_FILE`. In single-token mode the only token is the operator's, so the agent has to
+  be given it, and with it the agent can list its own queued payments and approve them: the human
+  gate becomes the agent clicking its own button. With the file, each agent has a token of its own
+  (put it in the MCP config as above), and `/pending`, `/approve` and the rest are refused to it.
+  Preflight fails the "agent identity" check without it on mainnet and warns on preprod.
+- A `SIGNERD_TOKEN` of at least 32 characters (`openssl rand -hex 16` makes one). Preprod warns.
+
+**A transaction's fee and the ADA riding with it are bounded.** The fee, and the minimum ADA an
+output must carry, are computed from protocol parameters the chain provider answers with, and the
+policy's `amount` constrains neither. A provider that inflated `min_fee_a` got a 34 ADA fee, or
+`coins_per_utxo_size` 347 ADA sent to the payee, out of an honest builder, for a one-unit token
+payment. So signerd reads the signed transaction back and refuses it, unsigned, when
+- its fee is above `MAX_FEE_LOVELACE` (default 1000000; a mainnet fee is about 0.17 ADA);
+- the payee's outputs carry more than `MAX_RIDE_LOVELACE` (default 2000000) of lovelace on top of
+  the authorised amount — for a token payment all of its min-UTxO ADA, about 1.2 ADA for a plain
+  output, and more with a datum;
+- it carries a certificate, a withdrawal, a mint, a vote or proposal, or a donation: none is part
+  of a payment, and each moves value the outputs do not show.
+
+The `script` and `masumi` methods put the seller's datum on the payee's output, and a larger
+datum needs more ADA to hold it (about 5.5 ADA for 1000 bytes at mainnet's parameters). Neither
+passes the 2 ADA default for anything but a small datum; raise `MAX_RIDE_LOVELACE` for them
+deliberately, knowing it is now the seller who sets how much rides along, up to that number.
+Preflight warns on both methods, as it does for masumi's collateral. Both methods pay the one
+output to `payTo` and nothing else, so neither is exempt from the "no third address" check any more.
+
+**Token payments need lovelace caps.** A payment in a token also spends ADA: the fee, and the
+min-UTxO ADA riding to the payee with the token. The policy's token caps do not see either, so that
+ADA is counted against the agent's *lovelace* `perTxMax` and `dailyMax`, recorded as a lovelace
+spend beside the payment and given back with it if the transaction never lands. On mainnet an agent
+with no lovelace caps cannot make a token payment at all (`lovelace_caps`: "token payments also
+spend ADA (fee + min-UTxO); declare lovelace caps"), and preflight fails it. On preprod it still
+goes ahead, and the ADA is recorded but not capped. Declaring lovelace caps also lets that agent pay
+in lovelace; leave `allowedPayees` and `approvalAbove` as tight for ADA as you would for any asset.
+For a lovelace payment the fee leaves in the same transaction as the amount, so the amount and its
+fee are held to the caps together: a price equal to `perTxMax` is now refused, and `perTxMax` needs
+a fee's headroom (a quarter of an ADA is plenty).
+
+**Redirects are not followed.** `allowedResources` is checked against the URL the agent asked for,
+and a client that followed a redirect would pay the 402 at the destination, which no policy saw.
+`x402_fetch` therefore returns the 3xx with its `Location`, unpaid, and the agent has to ask for
+the new URL itself, where it is checked as a resource of its own. The MCP transports behind
+`x402_mcp_tools` and `x402_mcp_call` follow none either, not even within the server's own origin.
 
 `allowedResources` bounds which URLs an agent may buy from. It is checked against a URL the agent
 process reports, because the reference `@x402/cardano` client does not pass the resource through to
@@ -697,10 +796,11 @@ daily cap bounds an agent. Nothing bounds someone who has the key, except how mu
 wallet, so decide that number deliberately and alert on `ada_wallet_balance_over_ceiling`.
 
 ### Who an agent is
-By default there is one token, and `agentId` arrives in the request body. With a single agent that
-is fine. With several it means the split between them is a convention: any process holding that
-token can spend any agent's budget by naming it, which is the opposite of what a per-agent policy
-is for. Preflight says so when the policy has more than one agent.
+Without `AGENT_TOKENS_FILE` there is one token, the operator's, and `agentId` arrives in the request
+body. Whatever process is given it can spend any agent's budget by naming it, and can read the
+approval queue and approve from it, which is the opposite of what a human gate is for. That is
+tolerable on a faucet wallet and nowhere else: mainnet will not start this way, and preprod's
+preflight warns about it.
 
 `AGENT_TOKENS_FILE` is a JSON map of `{"<token>": "<agentId>"}`. With it, a token *is* an identity:
 `/sign` takes the agent from the token and refuses a body that names another, `/status` returns only
@@ -753,6 +853,10 @@ Naming these is the point; none is fixed by more policy code.
   buyer you do not choose this — the seller's 402 does — but it governs any facilitator you run.
 
 ## Known behaviour worth expecting
+- **A payment's budget includes the ADA that left with it.** Each signed payment is two ledger
+  records, the payment and, beside it, its fee plus any lovelace that rode to the payee with a
+  token (`dailySpent` for lovelace includes it). Both carry the transaction's hash and TTL and are
+  given back together, one `spend_released` each. The hourly rate counts payments, not records.
 - **A signed payment counts against the budget when it is signed, and comes back only when the
   chain shows it never landed.** signerd records the spend at signing and never hears whether the
   facilitator got the transaction on chain, so a transient submit failure costs budget without

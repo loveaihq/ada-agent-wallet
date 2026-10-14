@@ -67,10 +67,23 @@
  *                           (a deliberate rotation). It waives the check, not the ledger: recorded
  *                           spends come from the checkpoint and survive.
  *   SIGNERD_PORT      default 7402
- *   SIGNERD_TOKEN     the operator's secret (required)
- *   AGENT_TOKENS_FILE JSON of {"<token>": "<agentId>"}. Without it `agentId` is whatever the
- *                     caller says it is, so the per-agent split is a convention rather than a
- *                     boundary; with it, a token is an identity and cannot claim another.
+ *   SIGNERD_TOKEN     the operator's secret (required; at least 32 characters on mainnet, and a
+ *                     warning below that elsewhere). It reads the approval queue and approves from
+ *                     it, so it is never the agent's.
+ *   AGENT_TOKENS_FILE JSON of {"<token>": "<agentId>"}, mode 0600. Without it `agentId` is whatever
+ *                     the caller says it is, and the only token is the operator's, which the agent
+ *                     would have to hold — and with it the agent approves its own queued payments.
+ *                     So mainnet refuses to start without it, and elsewhere preflight warns. With
+ *                     it, a token is an identity and cannot claim another.
+ *   MAX_FEE_LOVELACE        default 1000000. A built transaction with a higher fee is refused
+ *                           unsigned: the fee comes from protocol parameters the chain provider
+ *                           supplies, and a provider that inflates them could otherwise make it
+ *                           anything
+ *   MAX_RIDE_LOVELACE       default 2000000. The most lovelace a payee's output may carry on top of
+ *                           the authorised amount (for a token, all of its min-UTxO ADA; more with
+ *                           a seller's datum, which `script` and `masumi` payments carry). A
+ *                           payment above it is refused unsigned. Raise it for the `script` and
+ *                           `masumi` methods, whose datums need more than a plain token output
  *   MASUMI_MAX_COLLATERAL_LOVELACE  ceiling on the collateral a masumi escrow may lock
  *   NONCE_HOLD_SECONDS              how long a handed-out UTXO is treated as in flight
  *   CHANNELS_DIR            default ./channels (batch-settlement's records; like the ledger, not
@@ -133,12 +146,13 @@ import {
   type ClientChannel,
   type OwnOutput,
 } from "subbit-x402/x402/client";
-import { BATCH, decide, decideDeposit, parsePolicy, remaining, type Decision, type Policy, type SpendRecord } from "./policy.js";
+import { BATCH, decide, decideDeposit, decideOverhead, parsePolicy, remaining, LOVELACE_CAPS_DETAIL, type Decision, type Policy, type SpendRecord } from "./policy.js";
 import { ChannelStore, type ChannelEntry } from "./channelStore.js";
 import { stepProblem, summarize, summaryProblem, type ChannelStep, type Expected } from "./channelTx.js";
 import { createKeyedLock, createLock } from "./serialize.js";
 import { replayAudit, sha256, type Checkpoint } from "./replay.js";
-import { mismatch } from "./verifyTx.js";
+import { mismatch, overheadOf } from "./verifyTx.js";
+import { agentIdentityProblem, modeProblem, operatorTokenProblem, type FileKind } from "./hardening.js";
 import { decryptMnemonic, assertKeystore } from "./keystore.js";
 import { blockfrostBaseUrl, koiosBaseUrl, networkName, sameNetwork } from "./network.js";
 import { describeKnown, displayName, knownAsset, lookalike } from "./assets.js";
@@ -159,6 +173,15 @@ const KEYSTORE_FILE = process.env.WALLET_KEYSTORE_FILE;
 const PASSPHRASE_FILE = process.env.WALLET_PASSPHRASE_FILE;
 const MAX_HOT_BALANCE = lovelaceEnv("MAX_HOT_BALANCE_LOVELACE");
 const MASUMI_MAX_COLLATERAL = lovelaceEnv("MASUMI_MAX_COLLATERAL_LOVELACE");
+/**
+ * What one signed transaction may cost beyond the payment itself. The builder derives the fee, and
+ * the min-UTxO ADA that rides to the payee with a token, from protocol parameters the chain provider
+ * answers with, and nothing about the policy's `amount` constrains either: a provider that inflates
+ * `min_fee_a` or `coins_per_utxo_size` gets a 34 ADA fee, or 347 ADA sent to the payee, out of an
+ * honest builder. A mainnet fee is around 0.17 ADA and a plain token output holds about 1.2.
+ */
+const MAX_FEE = lovelaceEnv("MAX_FEE_LOVELACE") ?? 1_000_000n;
+const MAX_RIDE = lovelaceEnv("MAX_RIDE_LOVELACE") ?? 2_000_000n;
 const MAX_BODY_BYTES = 1 << 20;
 /**
  * Caps on the free text a caller can put into the audit log.
@@ -239,6 +262,7 @@ function lovelaceEnv(name: string): bigint | undefined {
 }
 
 if (!TOKEN) fail("SIGNERD_TOKEN is required");
+if (MAX_FEE === 0n) fail("MAX_FEE_LOVELACE must be at least 1: a fee of nothing is not a transaction");
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) fail(`SIGNERD_PORT must be a port number, got "${process.env.SIGNERD_PORT}"`);
 // Not a number is NaN, and `NaN <= Date.now()` is false — so a nonce claimed under it would never
 // expire, and the first payment would leave the wallet answering utxo_busy for as long as it runs.
@@ -263,6 +287,38 @@ const IS_MAINNET = (() => {
     return fail(`CARDANO_NETWORK: ${e instanceof Error ? e.message : e}`);
   }
 })();
+
+// Before anything is read or decrypted, so a refusal never costs a passphrase prompt. Both are fatal
+// on mainnet and a warning elsewhere; the warning is repeated in the banner and in preflight.
+const operatorTokenNote = operatorTokenProblem(TOKEN);
+const agentIdentityNote = agentIdentityProblem(AGENT_TOKENS_FILE ? 1 : 0);
+if (IS_MAINNET && operatorTokenNote) fail(`refusing to run on ${NETWORK}: ${operatorTokenNote}`);
+if (IS_MAINNET && agentIdentityNote) fail(`refusing to run on ${NETWORK}: ${agentIdentityNote}`);
+
+/**
+ * Fatal on mainnet, a warning elsewhere. A secret (the mnemonic, the agent tokens, the keystore and
+ * its passphrase) must be 0600: it is group or other being able to read it that gives it away.
+ * Policy, audit, ledger and the channel index are not secret and only need to be unwritable by them.
+ */
+const permissionNotes: Array<{ level: "ok" | "warn"; detail: string }> = [];
+function checkFileMode(label: string, file: string, kind: FileKind = "shared") {
+  if (!existsSync(file)) return;
+  if (process.platform === "win32") {
+    // A check that could not run is not a check that passed.
+    permissionNotes.push({ level: "warn", detail: `${label}: not checked — Windows mode bits do not carry this meaning; verify the ACL by hand` });
+    return;
+  }
+  const mode = statSync(file).mode & 0o777;
+  const problem = modeProblem(kind, mode);
+  if (!problem) return permissionNotes.push({ level: "ok", detail: `${label}: mode ${mode.toString(8)}` });
+  const msg = `${label} ${file} ${problem}`;
+  if (IS_MAINNET) fail(`refusing to run on ${NETWORK}: ${msg}`);
+  permissionNotes.push({ level: "warn", detail: msg });
+}
+if (MNEMONIC_FILE) checkFileMode("mnemonic", MNEMONIC_FILE, "secret");
+if (AGENT_TOKENS_FILE) checkFileMode("agent tokens", AGENT_TOKENS_FILE, "secret");
+if (KEYSTORE_FILE) checkFileMode("keystore", KEYSTORE_FILE, "secret");
+if (PASSPHRASE_FILE) checkFileMode("passphrase", PASSPHRASE_FILE, "secret");
 
 /** Keystore, then plaintext file, then environment — best to worst. See README, "The key". */
 async function loadMnemonic(): Promise<string> {
@@ -306,22 +362,6 @@ async function readPassphrase(): Promise<string> {
 }
 
 const mnemonic = await loadMnemonic();
-
-/** Group- or world-writable is fatal on mainnet, a warning elsewhere. */
-const permissionNotes: Array<{ level: "ok" | "warn"; detail: string }> = [];
-function checkFileMode(label: string, file: string) {
-  if (!existsSync(file)) return;
-  if (process.platform === "win32") {
-    // A check that could not run is not a check that passed.
-    permissionNotes.push({ level: "warn", detail: `${label}: not checked — Windows mode bits do not carry this meaning; verify the ACL by hand` });
-    return;
-  }
-  const mode = statSync(file).mode & 0o777;
-  if (!(mode & 0o022)) return permissionNotes.push({ level: "ok", detail: `${label}: mode ${mode.toString(8)}` });
-  const msg = `${label} ${file} is writable by group or other (mode ${mode.toString(8)})`;
-  if (IS_MAINNET) fail(`refusing to run on ${NETWORK}: ${msg}`);
-  permissionNotes.push({ level: "warn", detail: msg });
-}
 
 /** Caps are bare integers, so a preprod file means something very different against real ADA. */
 function assertPolicyNetwork(p: Policy) {
@@ -376,10 +416,7 @@ try {
 }
 checkFileMode("policy", POLICY_FILE);
 checkFileMode("audit", AUDIT_FILE);
-if (MNEMONIC_FILE) checkFileMode("mnemonic", MNEMONIC_FILE);
-if (AGENT_TOKENS_FILE) checkFileMode("agent tokens", AGENT_TOKENS_FILE);
-if (KEYSTORE_FILE) checkFileMode("keystore", KEYSTORE_FILE);
-if (PASSPHRASE_FILE) checkFileMode("passphrase", PASSPHRASE_FILE);
+// The secrets' modes were checked before they were read, above.
 
 /**
  * The cap is computed from this checkpoint, not from the audit log. The log is chained, and the
@@ -418,6 +455,7 @@ function writeCheckpoint() {
       asset: r.asset,
       amount: r.amount.toString(),
       ...(r.voucher ? { voucher: true } : {}),
+      ...(r.overhead ? { overhead: true } : {}),
       // Kept beside the spend, or a restart with a checkpoint would forget which transaction it was
       // and the spend could never be given back.
       ...(r.tx ? { tx: r.tx } : {}),
@@ -732,10 +770,26 @@ class UtxoBusy extends AuditedError {}
  */
 class InsufficientFunds extends AuditedError {}
 
+/**
+ * The policy refused after the transaction was built, on what it costs beyond the payment: the fee and
+ * the min-UTxO ADA riding to the payee are only known once there is a transaction (`decideOverhead`).
+ * The `denied` record is already written, and nothing was claimed or recorded.
+ */
+class OverheadDenied extends AuditedError {
+  constructor(public readonly rule: string, public readonly detail: string) {
+    super(`${rule}: ${detail}`);
+  }
+}
+
 /** Waits before the second and third try of a build that failed reading from the provider. */
 const BUILD_RETRY_DELAYS_MS = [1000, 3000];
 
-async function sign(agentId: string, reason: string, input: ClientCardanoSignInput) {
+/**
+ * `approving` is the id of the queued request being approved, whose own reservation is left out of
+ * the ledger this payment is judged against: it is this payment, and counting it twice would refuse
+ * what the human just allowed. Both callers hold the agent's lock.
+ */
+async function sign(agentId: string, reason: string, input: ClientCardanoSignInput, approving?: string) {
   return withWalletLock(async () => {
     let res: Awaited<ReturnType<typeof signer.buildAndSignPaymentTransaction>>;
     try {
@@ -763,24 +817,53 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
     let inputs: string[] = [];
     // What a release will need to name this spend later, read from the transaction itself.
     let landed: ReturnType<typeof landing> = {};
+    // What it costs beyond the payment: the fee, and any lovelace riding to the payee with it.
+    let fee = 0n;
+    let overhead = 0n;
     try {
       const decoded = decodeCardanoTransaction(res.transaction);
       inputs = decoded.inputs;
       landed = landing(decoded.txHash, decoded.ttlSlot);
-      wrong = mismatch(decoded, {
+      fee = decoded.fee;
+      const authorised = {
         payTo: input.payTo,
         asset: input.asset,
         amount: input.amount,
         changeTo: address,
         nonce: res.nonce,
-        assetTransferMethod: typeof input.extra?.assetTransferMethod === "string" ? input.extra.assetTransferMethod : undefined,
-      });
+        maxFeeLovelace: MAX_FEE,
+        maxRideLovelace: MAX_RIDE,
+      };
+      wrong = mismatch(decoded, authorised);
+      if (!wrong) overhead = overheadOf(decoded, authorised);
     } catch (e) {
       wrong = `it could not be decoded: ${e instanceof Error ? e.message : e}`;
     }
     if (wrong) {
-      audit("transaction_mismatch", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, detail: wrong });
+      audit("transaction_mismatch", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, ...(fee ? { fee: fee.toString() } : {}), detail: wrong });
       throw new AuditedError(`refusing to hand over a transaction that does not match what was authorised: ${wrong}`);
+    }
+
+    // The ADA that leaves beyond the payment is judged against the agent's lovelace caps, as the ledger
+    // stands now: under the agent's lock, and before the nonce is claimed, so a refusal leaves nothing behind.
+    let current: Policy;
+    try {
+      current = refreshPolicy();
+    } catch (e) {
+      const detail = String(e instanceof Error ? e.message : e);
+      audit("policy_error", { agentId, reason, detail });
+      throw new OverheadDenied("policy_unreadable", detail);
+    }
+    const cost = decideOverhead(current, approving ? ledgerExcluding(approving) : effectiveLedger(), {
+      agentId,
+      asset: input.asset,
+      amount: BigInt(input.amount),
+      overhead,
+      mainnet: IS_MAINNET,
+    });
+    if (cost.verdict === "deny") {
+      audit("denied", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, rule: cost.rule, detail: cost.detail, stage: "built", fee: fee.toString(), overheadLovelace: overhead.toString() });
+      throw new OverheadDenied(cost.rule, cost.detail);
     }
 
     const hold = Math.min(approvalWindow(input), NONCE_HOLD_SECONDS);
@@ -794,9 +877,13 @@ async function sign(agentId: string, reason: string, input: ClientCardanoSignInp
     // Held no longer than the nonce: the ledger is what bounds spending, and a settlement that
     // failed must not keep the channel client off these UTXOs for the client's full PENDING_MS.
     for (const i of inputs) inFlight.set(i, Date.now() - PENDING_MS + hold * 1000);
-    ledger.push({ ts: Date.now(), agentId, asset: input.asset, amount: BigInt(input.amount), ...landed });
+    const signedAt = Date.now();
+    ledger.push({ ts: signedAt, agentId, asset: input.asset, amount: BigInt(input.amount), ...landed });
+    // The ADA that left with it, beside it and with its transaction: expiry gives both back together
+    // (a lovelace payment's own record and this are two spends of one transaction).
+    if (overhead > 0n) ledger.push({ ts: signedAt, agentId, asset: "lovelace", amount: overhead, overhead: true, ...landed });
     pruneLedger();
-    audit("signed", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce, network: input.network, ...landed });
+    audit("signed", { agentId, reason, payTo: input.payTo, asset: input.asset, amount: input.amount, nonce: res.nonce, network: input.network, fee: fee.toString(), overheadLovelace: overhead.toString(), ...landed });
     writeCheckpoint(); // after the audit record, so the checkpoint names it
     return res;
   });
@@ -1505,6 +1592,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         reason,
         assetTransferMethod: typeof method === "string" ? method : undefined,
         resource: typeof resource === "string" ? resource : undefined,
+        mainnet: IS_MAINNET,
       });
 
       if (d.verdict === "deny") {
@@ -1544,6 +1632,8 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       if (e instanceof UtxoBusy) return json(res, 409, { error: "utxo_busy", detail, retryable: true });
       if (e instanceof InsufficientFunds)
         return json(res, 409, { error: "insufficient_funds", detail, retryable: false, asset: input.asset, amount: input.amount });
+      // The policy's own refusal, reached after the build: the same answer as one reached before it.
+      if (e instanceof OverheadDenied) return json(res, 403, { error: "policy_denied", rule: e.rule, detail: e.detail });
       return json(res, 500, { error: "sign_failed", detail });
     }
     if (outcome.kind === "signed") {
@@ -1752,6 +1842,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
           reason: p.reason,
           assetTransferMethod: typeof input.extra?.assetTransferMethod === "string" ? input.extra.assetTransferMethod : undefined,
           resource: p.resource,
+          mainnet: IS_MAINNET,
         });
       } catch (e) {
         verdict = { verdict: "deny", rule: "policy_unreadable", detail: String(e instanceof Error ? e.message : e) };
@@ -1765,7 +1856,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       pending.delete(p.id);
       clearTimeout(p.timer);
       try {
-        const out = await sign(p.agentId, p.reason, input);
+        const out = await sign(p.agentId, p.reason, input, p.id);
         reserved.delete(p.id);
         audit("approved", { id: p.id, agentId: p.agentId });
         p.resolve(out);
@@ -2346,14 +2437,14 @@ function preflight() {
 
   const agentCount = Object.keys(current?.agents ?? {}).length;
   add(
-    agentTokens.size > 0 ? "ok" : agentCount > 1 ? "warn" : "ok",
+    agentTokens.size > 0 ? "ok" : IS_MAINNET ? "fail" : "warn",
     "agent identity",
     agentTokens.size > 0
       ? `${agentTokens.size} token(s), each fixed to one agent`
-      : agentCount > 1
-        ? `AGENT_TOKENS_FILE is unset and there are ${agentCount} agents, so any holder of the operator token can spend any of their budgets by naming it`
-        : "one agent, so there is no other budget to claim",
+      : `${agentIdentityProblem(0)}${agentCount > 1 ? `. With ${agentCount} agents, any holder of the operator token can also spend any of their budgets by naming it` : ""}`,
   );
+  add(operatorTokenNote ? (IS_MAINNET ? "fail" : "warn") : "ok", "operator token", operatorTokenNote ?? `${TOKEN!.length} characters`);
+  add("ok", "fee and ride bounds", `a transaction is refused unsigned above ${MAX_FEE} lovelace of fee (MAX_FEE_LOVELACE), or when more than ${MAX_RIDE} lovelace rides to the payee on top of the payment (MAX_RIDE_LOVELACE)`);
 
   const cp = existsSync(LEDGER_FILE);
   add(cp ? "ok" : ledger.length ? "warn" : "ok", "spend ledger checkpoint",
@@ -2416,11 +2507,24 @@ function preflight() {
         add("warn", `${where}: asset ${label}`,
           `${asset} is not a known stablecoin; check the policy id and its decimals yourself`);
     }
+    // A token payment spends ADA too, and only the lovelace caps can bound that.
+    if (Object.keys(ap.perTxMax).some(a => a !== "lovelace")) {
+      const lovelaceCapped = ap.perTxMax.lovelace !== undefined;
+      add(lovelaceCapped ? "ok" : IS_MAINNET ? "fail" : "warn", `${where}: lovelace caps for token payments`,
+        lovelaceCapped
+          ? `perTxMax ${ap.perTxMax.lovelace}, dailyMax ${ap.dailyMax?.lovelace ?? ap.perTxMax.lovelace}: the fee and min-UTxO ADA of a token payment count against them (and so lets this agent pay in lovelace too)`
+          : `${LOVELACE_CAPS_DETAIL}${IS_MAINNET ? "; mainnet refuses its token payments until it does" : "; until then its ADA overhead is recorded but not capped"}`);
+    }
     const methods = ap.allowedAssetTransferMethods ?? ["default"];
-    add(methods.includes("masumi") ? "warn" : "ok", `${where}: asset transfer methods`,
-      methods.includes("masumi")
-        ? `masumi enabled; its collateral sits outside these caps, bounded only by MASUMI_MAX_COLLATERAL_LOVELACE (${process.env.MASUMI_MAX_COLLATERAL_LOVELACE ?? "unset, so the SDK default"})`
-        : methods.join(", "));
+    const heavy = [
+      ...(methods.includes("masumi")
+        ? [`masumi enabled; its collateral sits outside these caps, bounded only by MASUMI_MAX_COLLATERAL_LOVELACE (${process.env.MASUMI_MAX_COLLATERAL_LOVELACE ?? "unset, so the SDK default"}) and, as ADA riding to the payee, by MAX_RIDE_LOVELACE (${MAX_RIDE}), which a masumi lock usually needs raised`]
+        : []),
+      ...(methods.includes("script")
+        ? [`script enabled; the payee's output carries the seller's datum, and the ADA it must hold grows with the datum's size, which the policy's amount does not show: bounded only by MAX_RIDE_LOVELACE (${MAX_RIDE})`]
+        : []),
+    ];
+    add(heavy.length ? "warn" : "ok", `${where}: asset transfer methods`, heavy.length ? heavy.join("; ") : methods.join(", "));
     if ((ap.allowedSchemes ?? ["exact"]).includes(BATCH)) {
       const keys = ap.allowedProviderKeys ?? [];
       add(keys.includes("*") ? "warn" : keys.length ? "ok" : "warn", `${where}: channel provider keys`,
@@ -2577,6 +2681,9 @@ server.listen(PORT, "127.0.0.1", () => {
   console.error(`key:    ${KEYSTORE_FILE ? "encrypted keystore" : "plaintext mnemonic"}`);
   console.error(`batch:  ${channels ? `batch-settlement available, channels in ${resolvePath(CHANNELS_DIR)}` : `batch-settlement unavailable (${BATCH_UNAVAILABLE})`}`);
   console.error(`release: ${RELEASE_EXPIRED_SPENDS ? `a payment that never lands is given back ${RELEASE_MARGIN_SECONDS}s after its TTL` : "off (RELEASE_EXPIRED_SPENDS=0): every signed payment counts for the full 24h"}`);
+  console.error(`bounds: fee <= ${MAX_FEE} lovelace, payee ride <= ${MAX_RIDE} lovelace (MAX_FEE_LOVELACE, MAX_RIDE_LOVELACE); the ADA overhead of a payment counts against the agent's lovelace caps`);
+  if (operatorTokenNote) console.error(`  WARNING ${operatorTokenNote}`);
+  if (agentIdentityNote) console.error(`  WARNING ${agentIdentityNote}`);
   for (const note of permissionNotes) console.error(`  ${note.level === "warn" ? "WARNING " : ""}${note.detail}`);
   console.error(`none of the policy, audit or ledger files, nor the channels directory, may be writable by the agent's user`);
   console.error(`run "walletctl preflight" before pointing this at real money`);

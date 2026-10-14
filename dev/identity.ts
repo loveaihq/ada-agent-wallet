@@ -61,7 +61,8 @@ try {
 
   await withSignerd({ AGENT_TOKENS_FILE: join(dir, "tokens.json") }, async () => {
     console.log("\n2. a token per agent");
-    const own = await sign(SCANNER_TOKEN, undefined, "900000");
+    // 700000, not 900000: its fee leaves in the same transaction, and scanner's cap is 1000000 for both.
+    const own = await sign(SCANNER_TOKEN, undefined, "700000");
     check(own.status === 200, `scanner's token signs within scanner's cap (HTTP ${own.status})`);
     // "the agent never sees a key" is a claim about this response and nothing else. A signed
     // transaction carries a signature and a public key, which are meant to leave; anything else

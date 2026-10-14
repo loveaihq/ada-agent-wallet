@@ -309,3 +309,30 @@ test("a pass never asks about more than max, and asks about all when there are f
   await reconcile(spends.slice(0, 3), chain, PASS);
   assert.equal(asked.txs[1].length, 3);
 });
+
+// A signed payment and the ADA that left with it (SpendRecord.overhead) are two spends of one
+// transaction, so the chain is asked about the transaction once and the answer is for both.
+test("a payment and its overhead share one question, and one answer releases both", async () => {
+  const [lack, have] = [hash(1), hash(2)];
+  const pair = (tx: string) => [spend({ tx, ttlSlot: 10, amount: 1n, asset: "token" }), spend({ tx, ttlSlot: 10, amount: 1_331_843n, overhead: true })];
+  const { chain, asked } = fakeChain({ tip: 10_000, answers: { [lack]: false, [have]: true } });
+  const r = await reconcile([...pair(lack), ...pair(have)], chain, PASS);
+  assert.deepEqual(asked.txs, [[lack, have]], "each transaction is asked about once");
+  assert.deepEqual(r.onChain, [have]);
+  assert.deepEqual(r.absent.map(s => [s.tx, s.amount, Boolean(s.overhead)]), [[lack, 1n, false], [lack, 1_331_843n, true]]);
+});
+
+test("a pass that fits only one of the pair still releases both", async () => {
+  const [a, b] = [hash(1), hash(2)];
+  const spends = [
+    spend({ tx: a, ttlSlot: 10, amount: 1n }),
+    spend({ tx: a, ttlSlot: 10, amount: 500n, overhead: true }),
+    spend({ tx: b, ttlSlot: 10, amount: 2n }),
+    spend({ tx: b, ttlSlot: 10, amount: 600n, overhead: true }),
+  ];
+  const { chain, asked } = fakeChain({ tip: 10_000, answers: { [a]: false, [b]: false } });
+  // max 1: one record is all a pass has room for, and it is the first transaction's payment.
+  const r = await reconcile(spends, chain, { ...PASS, max: 1 });
+  assert.deepEqual(asked.txs, [[a]]);
+  assert.deepEqual(r.absent.map(s => s.amount), [1n, 500n]);
+});

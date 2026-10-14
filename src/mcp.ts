@@ -11,7 +11,10 @@
  * allows it, with `batch-settlement` vouchers on a channel; signerd holds the channel keys and signs
  * those too.
  *
- * Env: SIGNERD_URL (default http://127.0.0.1:7402), SIGNERD_TOKEN, AGENT_ID (default "default")
+ * Env: SIGNERD_URL (default http://127.0.0.1:7402), AGENT_ID (default "default"), and SIGNERD_TOKEN, which
+ * here is this agent's own token from signerd's AGENT_TOKENS_FILE: never the operator's, which reads the
+ * approval queue and approves from it.
+ * Redirects are not followed (see redirects.ts): a 3xx is handed back, and the agent asks again.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -23,6 +26,7 @@ import { createGatedSigner, denialReport, PolicyDenied } from "./gatedSigner.js"
 import { BATCH, createBatchProxy, preferBatch } from "./batchProxy.js";
 import { decodePaymentResponseHeader } from "@x402/core/http";
 import { receiptOf, describePayment, type Receipt } from "./receipt.js";
+import { MCP_NO_REDIRECTS, redirectTo, withoutRedirects } from "./redirects.js";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -93,7 +97,10 @@ const client = x402Client.fromConfig({
   spendControls: false,
   policies: [preferBatch(() => callContext.getStore()?.batchAllowed === true)],
 });
-const payingFetch = wrapFetchWithPayment(fetch, client);
+// A redirect is handed back, never followed. signerd checks `allowedResources` against the URL the
+// agent asked for, and a client that followed a 3xx would pay the 402 at the destination, which no
+// policy saw. The agent has to ask for the new URL itself, and that one is checked.
+const payingFetch = wrapFetchWithPayment(withoutRedirects(fetch), client);
 
 /** Whether to prefer batch-settlement on this call: signerd offers it, and this agent may use it. */
 async function batchAllowed(): Promise<boolean> {
@@ -107,7 +114,7 @@ async function batchAllowed(): Promise<boolean> {
   }
 }
 
-const server = new McpServer({ name: "ada-agent-wallet", version: "0.2.9" });
+const server = new McpServer({ name: "ada-agent-wallet", version: "0.2.10" });
 
 server.tool("wallet_status", "Wallet address, per-agent remaining budget (rolling 24h), pending approvals.", {}, { readOnlyHint: true, openWorldHint: false }, async () => {
   try {
@@ -127,7 +134,7 @@ server.tool("wallet_status", "Wallet address, per-agent remaining budget (rollin
 
 server.tool(
   "x402_fetch",
-  "Fetch a URL that may require x402 payment on Cardano. If it returns 402, the wallet pays within policy and retries. Always give a concrete reason — it goes in the audit log. A denial with retryable: true (rule wallet_tidying, for one) is the wallet asking you to wait, not refusing: call again after retryAfterSeconds.",
+  "Fetch a URL that may require x402 payment on Cardano. If it returns 402, the wallet pays within policy and retries. Redirects are not followed: a 3xx comes back with its destination, and you call again with that URL, which the policy then checks as a resource of its own. Always give a concrete reason — it goes in the audit log. A denial with retryable: true (rule wallet_tidying, for one) is the wallet asking you to wait, not refusing: call again after retryAfterSeconds.",
   {
     // `z.string().url()` accepts every scheme the URL parser does, file: and data: included.
     url: z
@@ -159,6 +166,7 @@ server.tool(
           }
         }
         const LIMIT = 20000;
+        const moved = redirectTo(url, r.status, r.headers.get("location"));
         return {
           content: [
             {
@@ -167,6 +175,9 @@ server.tool(
               text: JSON.stringify(
                 {
                   status: r.status,
+                  ...(moved
+                    ? { redirect: { to: moved, followed: false, note: "not followed, and nothing was paid at the new address; call x402_fetch with that URL to go there, and it will be checked against the policy as its own resource" } }
+                    : {}),
                   ...describePayment(receipt, Boolean(callContext.getStore()?.signed)),
                   truncated: text.length > LIMIT,
                   bytes: text.length,
@@ -213,11 +224,17 @@ const httpUrl = z
   .refine(u => /^https?:$/.test(new URL(u).protocol), { message: "must be http or https" });
 
 async function withRemote<T>(serverUrl: string, kind: "http" | "sse", use: (paid: x402MCPClient) => Promise<T>): Promise<T> {
-  const paid = wrapMCPClientWithPayment(new McpClient({ name: "ada-agent-wallet", version: "0.2.9" }), client, {
+  const paid = wrapMCPClientWithPayment(new McpClient({ name: "ada-agent-wallet", version: "0.2.10" }), client, {
     autoPayment: true,
   });
   try {
-    await paid.connect(kind === "sse" ? new SSEClientTransport(new URL(serverUrl)) : new StreamableHTTPClientTransport(new URL(serverUrl)));
+    // No redirect is followed to another address than the one named: `allowedResources` is checked
+    // against `serverUrl`, and the payment goes to whatever the connection reaches.
+    await paid.connect(
+      kind === "sse"
+        ? new SSEClientTransport(new URL(serverUrl), MCP_NO_REDIRECTS)
+        : new StreamableHTTPClientTransport(new URL(serverUrl), MCP_NO_REDIRECTS),
+    );
   } catch (e) {
     // Naming the transport matters: "http" against an SSE-only server fails here and nowhere else.
     throw new Error(`could not connect to the MCP server at ${serverUrl} over ${kind}: ${e instanceof Error ? e.message : e}`);

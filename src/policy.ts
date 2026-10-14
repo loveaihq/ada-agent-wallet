@@ -14,6 +14,8 @@
  *   7. payments in the last hour < maxPerHour
  *   8. amount > approvalAbove[asset]  → "needs_approval" (a human must approve via walletctl)
  *   otherwise → "allow"
+ * An `exact` payment is judged once more after its transaction is built (`decideOverhead`): the fee
+ * and the min-UTxO ADA riding to the payee leave the wallet too, and count against the lovelace caps.
  *
  * `batch-settlement` pays by vouchers on a channel it has locked a deposit in. Each voucher goes
  * through the same flow for its increment — what it adds to the most already signed on that
@@ -104,6 +106,14 @@ export interface SpendRecord {
    */
   tx?: string;
   ttlSlot?: number;
+  /**
+   * The ADA that left the wallet with a payment beyond the payment itself: its fee, and the min-UTxO
+   * ADA that rode to the payee with a token. Always lovelace, always beside the payment's own record
+   * and carrying its `tx` and `ttlSlot`, so a release takes it with the payment. It counts against
+   * the lovelace caps like any lovelace spend, but is not a payment of its own: the hourly count
+   * leaves it out.
+   */
+  overhead?: boolean;
 }
 
 export interface PaymentRequest {
@@ -120,6 +130,28 @@ export interface PaymentRequest {
   scheme?: string;
   /** For batch-settlement: the channel's provider key (the 402's `receiverAuthorizer`). */
   providerKey?: string;
+  /** The wallet is on mainnet, where a token payment is refused unless the agent has lovelace caps. */
+  mainnet?: boolean;
+  now?: number;
+}
+
+/**
+ * A token payment spends ADA as well: the fee, and the min-UTxO ADA that rides to the payee with the
+ * token (more with a datum). The amount the policy decides on is in the token, so on mainnet an agent
+ * with no lovelace caps would spend ADA that nothing bounds.
+ */
+export const LOVELACE_CAPS_DETAIL =
+  "token payments also spend ADA (fee + min-UTxO); declare lovelace caps (perTxMax and dailyMax for \"lovelace\") for this agent";
+
+/** What a signed transaction cost in ADA beyond the payment, for `decideOverhead`. */
+export interface OverheadRequest {
+  agentId: string;
+  /** The payment's own asset and amount: a lovelace payment's amount leaves in the same transaction. */
+  asset: string;
+  amount: bigint;
+  /** Fee plus whatever rode to the payee on top of the payment: see `overheadOf` in verifyTx.ts. */
+  overhead: bigint;
+  mainnet?: boolean;
   now?: number;
 }
 
@@ -310,6 +342,11 @@ export function decide(policy: Policy, ledger: readonly SpendRecord[], req: Paym
   if (perTx === undefined)
     return { verdict: "deny", rule: "asset", detail: `asset ${req.asset} not allowed for ${req.agentId}` };
 
+  // Said here as well as after the build (`decideOverhead`), so a payment that cannot go through is
+  // refused before it waits in the approval queue for a human who would approve it into an error.
+  if (!batch && req.mainnet && req.asset !== "lovelace" && ap.perTxMax.lovelace === undefined)
+    return { verdict: "deny", rule: "lovelace_caps", detail: LOVELACE_CAPS_DETAIL };
+
   if (!ap.allowedPayees.includes("*") && !ap.allowedPayees.includes(req.payTo))
     return { verdict: "deny", rule: "payee", detail: `payee ${req.payTo} not in allowlist` };
 
@@ -348,7 +385,7 @@ export function decide(policy: Policy, ledger: readonly SpendRecord[], req: Paym
   // Vouchers and transactions are counted apart: a channel exists to pay many small amounts, and
   // a rate that suits one would starve or unbound the other.
   const perHour = batch ? (ap.maxVouchersPerHour ?? DEFAULT_MAX_VOUCHERS_PER_HOUR) : (ap.maxPerHour ?? 60);
-  const lastHour = ledger.filter(r => r.agentId === req.agentId && Boolean(r.voucher) === batch && now - r.ts < HOUR).length;
+  const lastHour = ledger.filter(r => r.agentId === req.agentId && !r.overhead && Boolean(r.voucher) === batch && now - r.ts < HOUR).length;
   if (lastHour >= perHour)
     return {
       verdict: "deny",
@@ -364,6 +401,56 @@ export function decide(policy: Policy, ledger: readonly SpendRecord[], req: Paym
       verdict: "needs_approval",
       rule: "approval_above",
       detail: `${req.amount} > approvalAbove ${threshold} (${req.asset}); run: walletctl approve <id>`,
+    };
+
+  return { verdict: "allow" };
+}
+
+/**
+ * Whether the ADA that leaves with a built `exact` transaction fits the agent's lovelace caps. `decide`
+ * judged the payment on its own amount, and for a token that is not the ADA: the fee, and the
+ * min-UTxO ADA riding to the payee, come out of the wallet too and are only known once the
+ * transaction is built.
+ *
+ * A lovelace payment's own amount leaves in the same transaction as its fee, so the two are judged
+ * together: a cap is not a cap if the fee can take the payment past it. For a token payment the
+ * overhead is judged alone, against the same lovelace caps. Allow or deny; nothing here queues.
+ *
+ * With no lovelace caps, mainnet refuses a token payment (it would spend ADA nothing bounds) and
+ * everywhere else it goes ahead as it always did: the overhead is still recorded by the caller.
+ */
+export function decideOverhead(policy: Policy, ledger: readonly SpendRecord[], req: OverheadRequest): Decision {
+  const now = req.now ?? Date.now();
+  const ap = policy.agents[req.agentId];
+  if (!ap) return { verdict: "deny", rule: "unknown_agent", detail: `no policy for agent "${req.agentId}"` };
+
+  const lovelace = req.asset === "lovelace";
+  const perTx = ap.perTxMax.lovelace;
+  if (perTx === undefined) {
+    if (!lovelace && req.mainnet) return { verdict: "deny", rule: "lovelace_caps", detail: LOVELACE_CAPS_DETAIL };
+    return { verdict: "allow" };
+  }
+
+  const leaving = (lovelace ? req.amount : 0n) + req.overhead;
+  const what = lovelace
+    ? `${req.amount} payment + ${req.overhead} fee and min-UTxO ADA`
+    : `${req.overhead} of fee and min-UTxO ADA`;
+  if (leaving > BigInt(perTx))
+    return {
+      verdict: "deny",
+      rule: "overhead_per_tx_max",
+      detail: `${leaving} lovelace leaves with this transaction (${what}) > perTxMax ${perTx} (lovelace)`,
+    };
+
+  const dailyCap = BigInt(ap.dailyMax?.lovelace ?? perTx);
+  const spentToday = ledger
+    .filter(r => r.agentId === req.agentId && r.asset === "lovelace" && now - r.ts < DAY)
+    .reduce((s, r) => s + r.amount, 0n);
+  if (spentToday + leaving > dailyCap)
+    return {
+      verdict: "deny",
+      rule: "overhead_daily_max",
+      detail: `spent ${spentToday} + ${leaving} (${what}) > dailyMax ${dailyCap} (lovelace, rolling 24h)`,
     };
 
   return { verdict: "allow" };
@@ -431,7 +518,7 @@ export function remaining(policy: Policy, ledger: readonly SpendRecord[], agentI
       overBudget: spent > cap,
     };
   }
-  const lastHour = (voucher: boolean) => ledger.filter(r => r.agentId === agentId && Boolean(r.voucher) === voucher && now - r.ts < HOUR).length;
+  const lastHour = (voucher: boolean) => ledger.filter(r => r.agentId === agentId && !r.overhead && Boolean(r.voucher) === voucher && now - r.ts < HOUR).length;
   const schemes = ap.allowedSchemes ?? DEFAULT_SCHEMES;
   return {
     assets: out,

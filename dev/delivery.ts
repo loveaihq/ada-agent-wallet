@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join, resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { freePort } from "./port.js";
+import { feeOf } from "./fee.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SIGNERD = resolvePath(HERE, "../src/signerd.ts");
@@ -170,7 +171,9 @@ try {
   await sleep(1500);
   const stillQueued = await pending();
   check(stillQueued.length === 0, `nothing is left in the queue (${stillQueued.map(p => p.id).join(", ") || "empty"})`);
-  check(await dailySpent() === DIRECT, `only the signed payment is counted (dailySpent ${await dailySpent()}, expected ${DIRECT})`);
+  // The payment, and beside it the fee that left with it (see SpendRecord.overhead).
+  const onlySigned = (BigInt(DIRECT) + feeOf(signedAhead.data.transaction)).toString();
+  check(await dailySpent() === onlySigned, `only the signed payment is counted (dailySpent ${await dailySpent()}, expected ${onlySigned})`);
   check(countOf("pending_abandoned") === 1, `the withdrawal is recorded (${countOf("pending_abandoned")} pending_abandoned)`);
 
   // === 2. leaving while your own approved payment is signing ====================================
@@ -198,7 +201,9 @@ try {
   const undelivered = records().find(r => r.event === "signed_undelivered");
   note(`signed_undelivered: id=${undelivered?.id} nonce=${String(undelivered?.nonce).slice(0, 24)}…`);
   check(undelivered?.id === id, "and names the approval it belongs to");
-  const expected = (BigInt(DIRECT) + BigInt(QUEUED)).toString();
+  // The second signature reached nobody, so its fee is read from the audit's `signed` record, which keeps it.
+  const fees = records().filter(r => r.event === "signed").reduce((n, r) => n + BigInt(r.overheadLovelace ?? "0"), 0n);
+  const expected = (BigInt(DIRECT) + BigInt(QUEUED) + fees).toString();
   check(await dailySpent() === expected, `the spend stays on the ledger rather than being refunded (dailySpent ${await dailySpent()}, expected ${expected})`);
 
   // === 3. the books balance ====================================================================

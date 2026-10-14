@@ -18,6 +18,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SIGNERD = resolvePath(HERE, "../src/signerd.ts");
 const MNEMONIC = Array(23).fill("abandon").join(" ") + " art";
 const TOKEN = "posix-check-token-0123456789abcdef";
+const AGENT_TOKEN = "posix-agent-token-fedcba9876543210";
 const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
 const NL = "\n";
 
@@ -185,11 +186,56 @@ try {
     const policyFile = join(dir, "policy.json");
     writeFileSync(policyFile, JSON.stringify(POLICY("cardano:mainnet")));
     chmodSync(policyFile, 0o664);
+    // Mainnet also wants agent tokens, so give it a good file: this case is about the policy's mode.
+    const tokens = join(dir, "agent-tokens.json");
+    writeFileSync(tokens, JSON.stringify({ [AGENT_TOKEN]: "default" }), { mode: 0o600 });
     // Nothing here reaches the chain: checkFileMode runs before the signer is built.
-    const s = await start(dir, { network: "cardano:mainnet", wait: false });
+    const s = await start(dir, { network: "cardano:mainnet", env: { AGENT_TOKENS_FILE: tokens }, wait: false });
     const code = await s.exited;
     check(code === 1, `signerd refused to start (exit ${code})`);
-    check(/refusing to run on cardano:mainnet/.test(s.stderr()), `and said why: ${firstLines(s.stderr(), 1)}`);
+    check(/refusing to run on cardano:mainnet: policy .* is writable by group or other/.test(s.stderr()), `and said why: ${firstLines(s.stderr(), 1)}`);
+  }
+
+  // === 3b. secrets are 0600, and the operator's token is not the agent's =========================
+  console.log(`${NL}3b. mainnet and the secrets: modes, token length, and one token per agent`);
+  {
+    const dir = workdir();
+    const policyFile = join(dir, "policy.json");
+    writeFileSync(policyFile, JSON.stringify(POLICY("cardano:mainnet")));
+    chmodSync(policyFile, 0o600);
+    const tokens = join(dir, "agent-tokens.json");
+    writeFileSync(tokens, JSON.stringify({ [AGENT_TOKEN]: "default" }));
+
+    // None of these reaches the chain: each is refused before the signer is built.
+    const single = await start(dir, { network: "cardano:mainnet", wait: false });
+    check((await single.exited) === 1 && /AGENT_TOKENS_FILE is unset/.test(single.stderr()), `no AGENT_TOKENS_FILE: refused (${firstLines(single.stderr(), 1)})`);
+
+    chmodSync(tokens, 0o644); // readable by anyone on the host, which is how an agent's user reads every token
+    const readable = await start(dir, { network: "cardano:mainnet", env: { AGENT_TOKENS_FILE: tokens }, wait: false });
+    check((await readable.exited) === 1 && /agent tokens .* is accessible to group or other \(mode 644\)/.test(readable.stderr()), `a 0644 token file: refused (${firstLines(readable.stderr(), 1)})`);
+
+    chmodSync(tokens, 0o600);
+    const mnemonicFile = join(dir, "mnemonic");
+    writeFileSync(mnemonicFile, MNEMONIC);
+    chmodSync(mnemonicFile, 0o640); // read-only for the group is still readable
+    const seen = await start(dir, { network: "cardano:mainnet", env: { AGENT_TOKENS_FILE: tokens, WALLET_MNEMONIC_FILE: mnemonicFile }, wait: false });
+    check((await seen.exited) === 1 && /mnemonic .* is accessible to group or other \(mode 640\)/.test(seen.stderr()), `a 0640 mnemonic file: refused (${firstLines(seen.stderr(), 1)})`);
+
+    const short = await start(dir, { network: "cardano:mainnet", env: { AGENT_TOKENS_FILE: tokens, SIGNERD_TOKEN: "x".repeat(31) }, wait: false });
+    check((await short.exited) === 1 && /SIGNERD_TOKEN is 31 characters; at least 32 are required/.test(short.stderr()), `a 31-character operator token: refused (${firstLines(short.stderr(), 1)})`);
+  }
+  {
+    // The same files on preprod are warnings: the wallet starts, and preflight carries them.
+    const dir = workdir();
+    writeFileSync(join(dir, "policy.json"), JSON.stringify(POLICY("cardano:preprod")));
+    const tokens = join(dir, "agent-tokens.json");
+    writeFileSync(tokens, JSON.stringify({ [AGENT_TOKEN]: "default" }));
+    chmodSync(tokens, 0o644);
+    const s = await start(dir, { env: { AGENT_TOKENS_FILE: tokens } });
+    const perms = await permissionChecks(s.url);
+    check(noteFor(perms, "agent tokens")?.level === "warn", "a 0644 token file is a warning on preprod");
+    s.child.kill("SIGTERM");
+    await s.exited;
   }
 
   // === 4. the ledger check, added because the cap is computed from it ============================

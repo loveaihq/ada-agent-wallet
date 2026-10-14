@@ -16,7 +16,7 @@ export interface Checkpoint {
   hash: string;
   updatedAt: number;
   /** `tx` and `ttlSlot` are optional so a checkpoint written before they existed, or read by an older signerd, is still one. */
-  spends: Array<{ ts: number; agentId: string; asset: string; amount: string; voucher?: boolean; tx?: string; ttlSlot?: number }>;
+  spends: Array<{ ts: number; agentId: string; asset: string; amount: string; voucher?: boolean; tx?: string; ttlSlot?: number; overhead?: boolean }>;
 }
 
 export interface OpenApproval {
@@ -58,7 +58,7 @@ export const isSlot = (v: unknown): v is number => typeof v === "number" && Numb
  * the daemon over a field whose loss is already the safe direction. A voucher carries neither: it
  * lands in no transaction of its own, so there is nothing for a release to name.
  */
-function readSpend(e: Record<string, unknown>): { agentId: string; asset: string; amount: bigint; voucher?: boolean; tx?: string; ttlSlot?: number } | undefined {
+function readSpend(e: Record<string, unknown>): { agentId: string; asset: string; amount: bigint; voucher?: boolean; tx?: string; ttlSlot?: number; overhead?: boolean } | undefined {
   const { agentId, asset, amount } = e;
   if (typeof agentId !== "string" || !agentId) return undefined;
   if (typeof asset !== "string" || !asset) return undefined;
@@ -71,7 +71,24 @@ function readSpend(e: Record<string, unknown>): { agentId: string; asset: string
     ...(voucher ? { voucher: true } : {}),
     ...(!voucher && isTxHash(e.tx) ? { tx: e.tx } : {}),
     ...(!voucher && isSlot(e.ttlSlot) ? { ttlSlot: e.ttlSlot } : {}),
+    // A flag only a checkpoint carries (a log record states it as `overheadLovelace` instead), and
+    // only on a lovelace spend: it marks a spend that is not a payment of its own. Dropped, the
+    // spend still counts; it would only be counted as a payment too.
+    ...(!voucher && e.overhead === true && asset === "lovelace" ? { overhead: true } : {}),
   };
+}
+
+/**
+ * The ADA a signed payment took with it beyond the payment: fee and min-UTxO ride, written on its
+ * `signed` record as `overheadLovelace`. Absent on a record from before it existed, and then there
+ * is none to rebuild. Present but unreadable is a spend that cannot be read, which the caller
+ * reports rather than skips.
+ */
+function readOverhead(e: Record<string, unknown>): { amount: bigint } | "unreadable" | undefined {
+  if (e.overheadLovelace === undefined) return undefined;
+  if (typeof e.overheadLovelace !== "string" || !/^[0-9]+$/.test(e.overheadLovelace)) return "unreadable";
+  const amount = BigInt(e.overheadLovelace);
+  return amount > 0n ? { amount } : undefined;
 }
 
 /**
@@ -159,7 +176,22 @@ export async function replayAudit(
         // A spend that cannot be read is reported, not skipped: skipping it would hand the agent
         // back its budget.
         if (spend === undefined) out.malformedAt ??= lineNo;
-        else afterCheckpoint.push({ ts: e.ts, ...spend });
+        else {
+          afterCheckpoint.push({ ts: e.ts, ...spend });
+          // A payment's own overhead is a second spend, beside it and released with it.
+          const overhead = event === "signed" ? readOverhead(e) : undefined;
+          if (overhead === "unreadable") out.malformedAt ??= lineNo;
+          else if (overhead)
+            afterCheckpoint.push({
+              ts: e.ts,
+              agentId: spend.agentId,
+              asset: "lovelace",
+              amount: overhead.amount,
+              overhead: true,
+              ...(spend.tx ? { tx: spend.tx } : {}),
+              ...(spend.ttlSlot !== undefined ? { ttlSlot: spend.ttlSlot } : {}),
+            });
+        }
       }
     } else if (event === RELEASE_EVENT) {
       // The opposite of a spend, so the opposite rule for what is unreadable: a release with no
@@ -182,8 +214,9 @@ export async function replayAudit(
   }
   out.spends.push(...afterCheckpoint);
   // After both sources are in, so a release finds its spend wherever it came from. One release
-  // takes one spend: two records with a transaction's hash would be a bug elsewhere, and a
-  // release must never be the thing that hides it by taking both.
+  // takes one spend. A payment and its overhead share a transaction hash and are released by one
+  // record each; any other pair with a hash in common would be a bug elsewhere, and a release must
+  // never be the thing that hides it by taking both.
   for (const tx of released) {
     const i = out.spends.findIndex(s => s.tx === tx && !s.voucher);
     if (i !== -1) out.spends.splice(i, 1);

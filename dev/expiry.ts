@@ -146,6 +146,8 @@ interface Signed {
   ttlSlot: number;
   transaction: string;
   amount: string;
+  /** What left with the payment, beside it: counted and given back as a second spend of the same transaction. */
+  fee: bigint;
 }
 /** A 409 `utxo_busy` is signerd saying "come back", so this does, a few times. */
 async function sign(reason: string, p: { amount: string; ttl: number }): Promise<Signed> {
@@ -167,7 +169,7 @@ async function sign(reason: string, p: { amount: string; ttl: number }): Promise
     if (r.status !== 200 || !body.transaction) throw new Error(`/sign ${r.status}: ${JSON.stringify(body).slice(0, 300)}`);
     const decoded = decodeCardanoTransaction(body.transaction);
     if (decoded.ttlSlot === undefined) throw new Error("the signed transaction has no TTL, so there is nothing to demonstrate");
-    return { tx: decoded.txHash, ttlSlot: Number(decoded.ttlSlot), transaction: body.transaction, amount: p.amount };
+    return { tx: decoded.txHash, ttlSlot: Number(decoded.ttlSlot), transaction: body.transaction, amount: p.amount, fee: decoded.fee };
   }
 }
 
@@ -217,14 +219,16 @@ try {
   console.log("\n1. sign A, which nobody will submit, and B, which we submit ourselves");
   a = await sign("expiry demo: A, signed and never submitted", A);
   note(`A  ${a.tx}  ttl slot ${a.ttlSlot} (${A.ttl}s)`);
-  check((await dailySpent()) === A.amount, `A is counted when signed (dailySpent ${await dailySpent()})`);
+  const aSpent = (BigInt(A.amount) + a.fee).toString(); // the payment, and its fee beside it
+  check((await dailySpent()) === aSpent, `A is counted when signed (dailySpent ${await dailySpent()}, expected ${aSpent})`);
   const signedA = records().find(r => r.event === "signed" && r.tx === a!.tx);
   check(signedA?.ttlSlot === a.ttlSlot, "the audit's `signed` record names A's transaction and TTL slot");
 
   await sleep((NONCE_HOLD_SECONDS + 2) * 1000);
   b = await sign("expiry demo: B, signed and submitted", B);
   note(`B  ${b.tx}  ttl slot ${b.ttlSlot} (${B.ttl}s)`);
-  const both = (BigInt(A.amount) + BigInt(B.amount)).toString();
+  const bSpent = (BigInt(B.amount) + b.fee).toString();
+  const both = (BigInt(aSpent) + BigInt(bSpent)).toString();
   check((await dailySpent()) === both, `both are counted (dailySpent ${await dailySpent()}, expected ${both})`);
 
   const submitted = await submit(b);
@@ -264,8 +268,11 @@ try {
   note(`A was released ${aReleasedAfter} after the run started, ${since(bLandedAt)} after B landed`);
   check(release.agentId === "default" && release.asset === "lovelace" && release.amount === A.amount, "the `spend_released` record names A's agent, asset and amount");
   check(release.ttlSlot === a.ttlSlot && typeof release.signedTs === "number", "and its TTL slot and when it was signed");
-  check(releasesOf(a.tx).length === 1, "and only once");
-  check((await dailySpent()) === B.amount, `A's budget is back and B's is not (dailySpent ${await dailySpent()}, expected ${B.amount})`);
+  // A's payment and its fee are two spends of one transaction, released one record each and together.
+  await until(async () => releasesOf(a!.tx).length >= 2, "A's fee to be given back with it", 2000);
+  check(releasesOf(a.tx).length === 2, "and A's fee is released with it, one record each and no more");
+  check(releasesOf(a.tx).reduce((n, r) => n + BigInt(String(r.amount)), 0n) === BigInt(aSpent), `together they are exactly what A was counted for (${aSpent})`);
+  check((await dailySpent()) === bSpent, `A's budget is back and B's is not (dailySpent ${await dailySpent()}, expected ${bSpent})`);
 
   // === 3. B's is not ============================================================================
   console.log(`\n3. wait past B's own TTL and margin: B is on chain, so it must stay counted`);
@@ -282,15 +289,18 @@ try {
     10_000,
   );
   check(releasesOf(b.tx).length === 0, "B was not released, though its TTL and the margin have passed");
-  check((await dailySpent()) === B.amount, `B is still counted (dailySpent ${await dailySpent()}, expected ${B.amount})`);
+  check((await dailySpent()) === bSpent, `B is still counted (dailySpent ${await dailySpent()}, expected ${bSpent})`);
 
   // === 4. it survives a restart =================================================================
   console.log("\n4. restart signerd: the release is in the audit and the checkpoint, not only in memory");
   await stop();
   await start();
-  check((await dailySpent()) === B.amount, `after a restart A is still not counted and B still is (dailySpent ${await dailySpent()})`);
+  check((await dailySpent()) === bSpent, `after a restart A is still not counted and B still is (dailySpent ${await dailySpent()})`);
   const checkpoint = JSON.parse(readFileSync(ledgerFile, "utf8")) as { spends: Array<{ tx?: string; ttlSlot?: number }> };
-  check(checkpoint.spends.length === 1 && checkpoint.spends[0].tx === b.tx && checkpoint.spends[0].ttlSlot === b.ttlSlot, "the checkpoint holds one spend, B, with its transaction and TTL slot");
+  check(
+    checkpoint.spends.length === 2 && checkpoint.spends.every(s => s.tx === b!.tx && s.ttlSlot === b!.ttlSlot),
+    "the checkpoint holds B's two spends, the payment and its fee, each with its transaction and TTL slot",
+  );
 } catch (e) {
   check(false, String(e instanceof Error ? e.message : e));
   note(`signerd log, last lines: ${tail()}`);
