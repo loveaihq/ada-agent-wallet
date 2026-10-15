@@ -632,8 +632,8 @@ it; the results are under "Verified".
   and `batchexit` passed again (2026-10-07): both channels sat at that validator, and `recover`
   found channels at the build before it as well. Channels opened at that earlier build keep
   working, and a record that names no validator is read as one of them.
-- what the registry serves is what was built: `ada-agent-wallet@0.2.9` on npm is byte for byte the
-  tarball checked before publishing (24 files, shasum `478a9fca…`, the one `npm publish` printed),
+- what the registry serves is what was built: `ada-agent-wallet@0.2.10` on npm is byte for byte the
+  tarball checked before publishing (26 files, shasum `8db51796…`, the one `npm publish` printed),
   and says Node 22 or newer. Its `subbit-x402@0.3.0` is byte for byte the tarball the wallet was
   tested against (shasum `3388ca55…`). Both pin the SDK at 0.5.15, so an install holds one copy of
   it, and neither needs `typescript` or `tsx`, because both packages ship prebuilt.
