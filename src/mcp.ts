@@ -27,6 +27,7 @@ import { BATCH, createBatchProxy, preferBatch } from "./batchProxy.js";
 import { decodePaymentResponseHeader } from "@x402/core/http";
 import { receiptOf, describePayment, type Receipt } from "./receipt.js";
 import { MCP_NO_REDIRECTS, redirectTo, withoutRedirects } from "./redirects.js";
+import { mcpResource, withoutFragment } from "./policy.js";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -150,7 +151,7 @@ server.tool(
   // It spends, it cannot be undone, and the URL is whatever the agent names.
   { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   async ({ url, reason, method, body }) =>
-    callContext.run({ reason, resource: url, batchAllowed: await batchAllowed() }, async () => {
+    callContext.run({ reason, resource: withoutFragment(url), batchAllowed: await batchAllowed() }, async () => {
       try {
         const r = await payingFetch(url, { method, body, headers: body ? { "content-type": "application/json" } : undefined });
         const text = await r.text();
@@ -278,10 +279,9 @@ server.tool(
   // Same as x402_fetch: it spends, and the server is whatever the agent names.
   { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   async ({ server: serverUrl, tool, args, reason, transport }) =>
-    // The resource is the server, not the tool: it is the URL the agent reports it is paying for,
-    // which is what `allowedResources` is written against. Per-tool allowlisting would need a
-    // resource shape the policy file does not have; the tool name is in the audit record instead.
-    callContext.run({ reason: `${reason} [mcp tool ${tool}]`, resource: serverUrl, batchAllowed: await batchAllowed() }, async () => {
+    // The resource is the server's URL with the tool in its fragment (see `mcpResource`), so an
+    // `allowedResources` entry can name one tool or, without a fragment, the whole server.
+    callContext.run({ reason: `${reason} [mcp tool ${tool}]`, resource: mcpResource(serverUrl, tool), batchAllowed: await batchAllowed() }, async () => {
       try {
         const result = await withRemote(serverUrl, transport, paid => paid.callTool(tool, args));
         // `paymentMade` means a payment went out with the retry, not that it settled, and a seller

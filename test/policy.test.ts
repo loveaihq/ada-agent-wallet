@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decide, decideDeposit, decideOverhead, parsePolicy, remaining, LOVELACE_CAPS_DETAIL, type SpendRecord } from "../src/policy.ts";
+import { decide, decideDeposit, decideOverhead, mcpResource, parsePolicy, remaining, withoutFragment, LOVELACE_CAPS_DETAIL, type SpendRecord } from "../src/policy.ts";
 
 const USDM = "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d"; // USDM preprod
 const PAYEE = "addr1q9payee";
@@ -130,6 +130,50 @@ test("resource allowlist: exact, prefix, and fail closed when unreported", () =>
   // a payment that names no resource cannot be checked, so it is refused
   assert.equal(decide(p, [], r({})).rule, "resource");
   assert.equal(decide(p, [], r({ resource: "not a url" })).rule, "resource");
+});
+test("resource allowlist by MCP tool: an entry with #<tool> allows that tool only, one without allows the server", () => {
+  const p = parsePolicy({
+    agents: {
+      a: {
+        perTxMax: { lovelace: "5000000" },
+        allowedPayees: ["*"],
+        allowedResources: ["https://tools.example.com/mcp#quote", "https://tools.example.com/v2/*#report", "https://open.example.com/mcp"],
+      },
+    },
+  });
+  const r = (resource?: string) => ({ agentId: "a", payTo: PAYEE, asset: "lovelace", amount: 1_000_000n, reason: "buy data", now: T0, ...(resource ? { resource } : {}) });
+  assert.equal(decide(p, [], r(mcpResource("https://tools.example.com/mcp", "quote"))).verdict, "allow");
+  const report = decide(p, [], r(mcpResource("https://tools.example.com/mcp", "report")));
+  assert.equal(report.rule, "resource");
+  assert.match(String(report.detail), /mcp#report not in allowlist/);
+  // a prefix entry carries its tool too
+  assert.equal(decide(p, [], r(mcpResource("https://tools.example.com/v2/mcp", "report"))).verdict, "allow");
+  assert.equal(decide(p, [], r(mcpResource("https://tools.example.com/v2/mcp", "quote"))).rule, "resource");
+  // the server named without a tool is not the tool: a tool entry does not let the bare URL through
+  assert.equal(decide(p, [], r("https://tools.example.com/mcp")).rule, "resource");
+  // an entry without a tool still allows every tool on that server, as before
+  assert.equal(decide(p, [], r(mcpResource("https://open.example.com/mcp", "anything"))).verdict, "allow");
+  assert.equal(decide(p, [], r("https://open.example.com/mcp")).verdict, "allow");
+  // tool names are compared whole, after decoding, so neither a longer name nor an escape gets in
+  assert.equal(decide(p, [], r(mcpResource("https://tools.example.com/mcp", "quote2"))).rule, "resource");
+  assert.equal(decide(p, [], r("https://tools.example.com/mcp#%71uote")).verdict, "allow");
+  assert.equal(decide(p, [], r("https://tools.example.com/mcp#%E0%A4%A")).rule, "resource");
+  // a fragment on the server URL is replaced, not stacked
+  assert.equal(mcpResource("https://tools.example.com/mcp#x", "quote"), "https://tools.example.com/mcp#quote");
+  assert.equal(mcpResource("https://tools.example.com/mcp", "a b#c"), "https://tools.example.com/mcp#a%20b%23c");
+  // a plain fetch drops its fragment, so it cannot pass for a tool call
+  assert.equal(withoutFragment("https://tools.example.com/mcp#quote"), "https://tools.example.com/mcp");
+  assert.equal(withoutFragment("https://api.example.com/x?q=1"), "https://api.example.com/x?q=1");
+});
+test("parsePolicy checks the tool part of an allowedResources entry", () => {
+  const withEntry = (entry: string) => () =>
+    parsePolicy({ agents: { a: { perTxMax: { lovelace: "1" }, allowedPayees: ["*"], allowedResources: [entry] } } });
+  assert.doesNotThrow(withEntry("https://tools.example.com/mcp#quote"));
+  assert.doesNotThrow(withEntry("https://tools.example.com/*#quote"));
+  assert.throws(withEntry("https://tools.example.com/mcp#"), /names an MCP tool that is empty/);
+  assert.throws(withEntry("https://tools.example.com/mcp#" + "x".repeat(201)), /longer than 200/);
+  assert.throws(withEntry("quote"), /must be an http\(s\) URL/);
+  assert.throws(withEntry("#quote"), /must be an http\(s\) URL/);
 });
 test("resource allowlist is optional and [\"*\"] means any", () => {
   const any = parsePolicy({ agents: { a: { perTxMax: { lovelace: "5000000" }, allowedPayees: ["*"], allowedResources: ["*"] } } });

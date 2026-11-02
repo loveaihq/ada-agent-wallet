@@ -120,9 +120,13 @@ cannot write, and run signerd as a different user. signerd prints the absolute p
 this is checkable rather than assumed.
 
 The example policy's `allowedResources` names the two local dev sellers — `http://127.0.0.1:7401/*` for
-HTTP, `http://127.0.0.1:7404/*` for MCP — alongside a placeholder, so the round-trips below work from
+HTTP, `http://127.0.0.1:7404/*` for MCP — alongside two placeholders, so the round-trips below work from
 a fresh copy; drop both dev entries before the file governs anything real. The list applies to MCP
-tool calls too: the resource checked is the MCP server's URL.
+tool calls too: the resource checked is the MCP server's URL with the tool after a `#`, so
+`https://tools.example.com/mcp#quote` allows only `quote` on that server, and an entry without a
+`#` allows every tool on it. A payment the list does not cover is refused before anything is signed,
+and the refusal goes into `audit.jsonl` as a `denied` event with `rule: "resource"` and the resource,
+tool included.
 
 Two defaults in `policy.example.json` are deliberately conservative and worth a look before you
 widen them: `allowedPayees: ["*"]` accepts any payee, which is only reasonable while the agent is
@@ -927,7 +931,8 @@ Naming these is the point; none is fixed by more policy code.
 ## Not yet
 - direct `send` (non-x402 transfer) — needs our own submit path; v1 is x402 only
 - Masumi escrow flows (`assetTransferMethod: masumi`) pass through untouched; policy still applies to the amount
-- policy is per-agent, not per-resource; add `allowedResources` if needed
+- per-resource caps: `allowedResources` (URLs and MCP tools) decides whether an agent may pay a
+  resource at all, but the amounts are per-agent; there are no per-resource `perTxMax` or `dailyMax`
 
 ## License
 

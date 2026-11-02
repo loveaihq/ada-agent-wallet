@@ -47,7 +47,9 @@ export interface AgentPolicy {
    */
   allowedAssetTransferMethods?: string[];
   /**
-   * Exact URLs, prefixes ending in `/*`, or ["*"] for any; omitted means any.
+   * Exact URLs, prefixes ending in `/*`, or ["*"] for any; omitted means any. An entry may end in
+   * `#<tool>` to allow only that tool on an MCP server (`https://tools.example.com/mcp#quote`); one
+   * without allows every tool on it. See `mcpResource`.
    *
    * Checked against a URL the agent process reports, not against the transaction, so it constrains
    * a steered agent rather than a replaced one. `allowedPayees` is what binds the transaction.
@@ -273,9 +275,12 @@ export function parsePolicy(raw: unknown): Policy {
         if (typeof r !== "string" || r.length === 0)
           throw new Error(`policy: agent ${id} allowedResources entries must be non-empty strings`);
         if (r === "*") continue;
-        const bare = r.endsWith("/*") ? r.slice(0, -2) : r;
+        const { url, tool } = splitTool(r);
+        const bare = url.endsWith("/*") ? url.slice(0, -2) : url;
         if (!/^https?:\/\/[^\s]+$/.test(bare))
-          throw new Error(`policy: agent ${id} allowedResources entry "${r}" must be an http(s) URL, optionally ending in /*`);
+          throw new Error(`policy: agent ${id} allowedResources entry "${r}" must be an http(s) URL, optionally ending in /* and then #<mcp tool>`);
+        if (tool !== undefined && (tool.length === 0 || tool.length > MAX_TOOL_NAME))
+          throw new Error(`policy: agent ${id} allowedResources entry "${r}" names an MCP tool that is empty or longer than ${MAX_TOOL_NAME} characters`);
       }
     }
     if (p.allowedAssetTransferMethods !== undefined) {
@@ -290,19 +295,58 @@ export function parsePolicy(raw: unknown): Policy {
   return raw as Policy;
 }
 
+/** The same cap the MCP tool schema puts on a tool name. */
+const MAX_TOOL_NAME = 200;
+
+/**
+ * The resource an MCP tool call reports: the server's URL with the tool in its fragment, so one
+ * string carries both and an entry without a tool still matches it as the server's URL. A fragment
+ * never reaches the server, so it cannot be anything else a request means.
+ */
+export function mcpResource(serverUrl: string, tool: string): string {
+  return `${withoutFragment(serverUrl)}#${encodeURIComponent(tool)}`;
+}
+/**
+ * What a plain fetch reports: the fragment is never sent, and left on it would let a fetch pass for
+ * a tool call that an entry allows by name.
+ */
+export function withoutFragment(url: string): string {
+  const at = url.indexOf("#");
+  return at === -1 ? url : url.slice(0, at);
+}
+/** A policy entry's URL and, after the first `#`, the tool it is limited to, as written. */
+function splitTool(entry: string): { url: string; tool?: string } {
+  const at = entry.indexOf("#");
+  return at === -1 ? { url: entry } : { url: entry.slice(0, at), tool: entry.slice(at + 1) };
+}
+
 /**
  * Exact match, or a `/*` suffix matching that path prefix. The prefix keeps its trailing slash so
  * `/v1/*` does not match `/v1evil/x`, and both sides go through `URL` first so `/v1/../admin` does
- * not match either.
+ * not match either. An entry naming a tool also needs the resource to name that same tool; one
+ * naming none matches whatever tool the resource names, or none.
  */
 function resourceMatches(pattern: string, resource: string): boolean {
-  const target = normalizeUrl(resource);
+  const { url, tool } = splitTool(pattern);
+  const target = parseResource(resource);
   if (target === undefined) return false;
-  if (pattern.endsWith("/*")) {
-    const prefix = normalizeUrl(pattern.slice(0, -1)); // keep the trailing slash
-    return prefix !== undefined && target.startsWith(prefix);
+  if (tool !== undefined && target.tool !== tool) return false;
+  if (url.endsWith("/*")) {
+    const prefix = normalizeUrl(url.slice(0, -1)); // keep the trailing slash
+    return prefix !== undefined && target.href.startsWith(prefix);
   }
-  return normalizeUrl(pattern) === target;
+  return normalizeUrl(url) === target.href;
+}
+function parseResource(value: string): { href: string; tool?: string } | undefined {
+  const { url, tool } = splitTool(value);
+  const href = normalizeUrl(url);
+  if (href === undefined) return undefined;
+  if (tool === undefined) return { href };
+  try {
+    return { href, tool: decodeURIComponent(tool) };
+  } catch {
+    return undefined; // malformed escapes name no tool anyone allowed
+  }
 }
 function normalizeUrl(value: string): string | undefined {
   try {

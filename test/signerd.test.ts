@@ -448,3 +448,32 @@ test("mainnet refuses a token payment from an agent with no lovelace caps, with 
   assert.equal(caps("capped").level, "ok");
   await s.stop();
 });
+
+test("a tool outside allowedResources is refused before anything is signed, and the refusal is in audit.jsonl", async () => {
+  const f = await fake();
+  const server = "http://127.0.0.1:7404/mcp";
+  const s = await startSignerd({
+    network: "cardano:preview",
+    koios: f.url,
+    policy: {
+      network: "cardano:preview",
+      agents: { default: { perTxMax: { lovelace: "5000000" }, allowedPayees: ["*"], allowedResources: [`${server}#quote`] } },
+    },
+  });
+  const ask = (tool: string) =>
+    s.call("/sign", { body: signRequest({ network: "cardano:preview", payTo: payee, asset: "lovelace", amount: "1000000", agentId: "default", resource: `${server}#${tool}` }) });
+
+  const no = await ask("premium");
+  assert.equal(no.status, 403);
+  assert.equal(no.data.error, "policy_denied");
+  assert.equal(no.data.rule, "resource");
+  assert.equal(events(s, "signed").length, 0);
+  const denied = events(s, "denied");
+  assert.equal(denied.length, 1);
+  assert.equal(denied[0]!.rule, "resource");
+  assert.equal(denied[0]!.resource, `${server}#premium`);
+
+  const yes = await ask("quote");
+  assert.equal(yes.status, 200, JSON.stringify(yes.data));
+  assert.equal(events(s, "signed").length, 1);
+});
