@@ -880,7 +880,7 @@ Naming these is the point; none is fixed by more policy code.
   confirm.
 - **Before `@evolution-sdk/evolution` 0.5.14, a 402 round-trip could not complete on Koios at
   all.** Fixed upstream in evolution-sdk#544 (reported from here as #540), released in 0.5.14 on
-  2026-09-24, which this package now pins; the `exact` round trip passed on Koios alone the next
+  2026-09-24 (this package now pins 0.5.15, which keeps the fix); the `exact` round trip passed on Koios alone the next
   day. What it was: the facilitator's `verify` resolves each input the buyer's transaction spends,
   and `@evolution-sdk`'s Koios provider failed that lookup for almost all of them. Over one wallet's 19 UTXOs, asked three ways: the Koios provider resolved 3,
   the Blockfrost provider resolved 19, and plain HTTP to the same Koios endpoint returned all 19.
