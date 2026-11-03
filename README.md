@@ -636,17 +636,20 @@ it; the results are under "Verified".
   and `batchexit` passed again (2026-10-07): both channels sat at that validator, and `recover`
   found channels at the build before it as well. Channels opened at that earlier build keep
   working, and a record that names no validator is read as one of them.
-- what the registry serves is what was built: `ada-agent-wallet@0.2.10` on npm is byte for byte the
-  tarball checked before publishing (26 files, shasum `8db51796…`, the one `npm publish` printed),
+- what the registry serves is what was built: `ada-agent-wallet@0.2.11` on npm is byte for byte the
+  tarball checked before publishing (26 files, shasum `1497ef21…`, the one `npm publish` printed),
   and says Node 22 or newer. Its `subbit-x402@0.3.0` is byte for byte the tarball the wallet was
   tested against (shasum `3388ca55…`). Both pin the SDK at 0.5.15, so an install holds one copy of
   it, and neither needs `typescript` or `tsx`, because both packages ship prebuilt.
+  Installed from the registry (2026-11-03):
   - `ada-walletctl` prints its usage, `tidy` included.
   - `ada-wallet-mcp` gets as far as its own "signerd is not answering" check.
-  - `ada-signerd`, from the same bytes installed before publishing, comes up on preprod on Koios
-    with batch-settlement available and the release loop on.
+  - `ada-signerd` was not started on preprod for 0.2.11; for 0.2.10 (`8db51796…`), the same bytes
+    installed before publishing came up on preprod on Koios with batch-settlement available and
+    the release loop on. The MCP tool entries in `allowedResources` are covered by the unit and
+    signerd tests, not yet by a preprod round-trip.
 
-  Earlier releases were checked the same way: 0.2.7 (`94736c62…`), 0.2.6 (`44bfa586…`), 0.2.5
+  Earlier releases were checked the same way: 0.2.10 (`8db51796…`), 0.2.7 (`94736c62…`), 0.2.6 (`44bfa586…`), 0.2.5
   (`43b7f48d…`), 0.2.4 (`87f7ffb1…`), 0.2.3 (`dde3cc15…`), 0.2.2 (`b27996d7…`), 0.2.1
   (`e11f0510…`), 0.2.0 (`6edfe7ba…`) and 0.1.0 (17 files, `a6c269ca…`).
 
