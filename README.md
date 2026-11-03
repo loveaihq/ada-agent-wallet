@@ -11,7 +11,7 @@ been steered can be steered through them. These limits live where the key lives.
 
 Settles on Cardano, through the official `@x402/cardano` and `@x402/mcp` clients — nothing forked.
 
-**Status: 0.2.10. Exact payments may be used on mainnet, at your own risk; batch-settlement stays
+**Status: 0.2.11. Exact payments may be used on mainnet, at your own risk; batch-settlement stays
 on preprod.** It has never run on mainnet and has had no external security review. signerd holds a decrypted mnemonic in memory for as long as it runs — that is what a hot
 wallet is — so keep in it only what you would accept losing outright, and set
 `MAX_HOT_BALANCE_LOVELACE` before pointing it at real funds. Read the [disclaimer](#disclaimer)

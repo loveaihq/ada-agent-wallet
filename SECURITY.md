@@ -81,7 +81,7 @@ Also accepted for now, not findings:
 
 ## Status
 
-`0.2.10`. Verified on preprod, including real on-chain round-trips. Exact payments may be used on
+`0.2.11`. Verified on preprod, including real on-chain round-trips. Exact payments may be used on
 mainnet at your own risk; batch-settlement runs on preprod only. It has never run on mainnet, and
 no part of it has had an external security review. If you are about to point it at real ADA, read
 the **Disclaimer** and **Before mainnet** in the README and run `npm run walletctl -- preflight`
